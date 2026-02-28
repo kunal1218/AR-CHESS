@@ -22,10 +22,5 @@ build/
 **/xcuserdata/
 .swiftpm/
 .build/
-.DS_Store
-DerivedData/
-build/
-*.xcuserstate
-**/xcuserdata/
-.swiftpm/
-.build/
+ios/Pods/
+ios_backup_*/

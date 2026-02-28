@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "scripts": {
     "start": "expo start",
-    "ios": "expo start --ios",
+    "ios": "expo run:ios",
     "lint": "eslint app src app.config.ts --ext .ts,.tsx",
     "test": "node -e \"console.log('No mobile tests configured yet')\"",
     "typecheck": "tsc --noEmit"
