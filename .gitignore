@@ -7,9 +7,10 @@ __pycache__/
 
 server-app/.ruff_cache/
 
-ar-client/.gradle/
-ar-client/local.properties
-ar-client/**/build/
-ar-client/captures/
+legacy/native-client/.gradle/
+legacy/native-client/.kotlin/
+legacy/native-client/local.properties
+legacy/native-client/**/build/
+legacy/native-client/captures/
 
 .idea/

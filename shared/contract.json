@@ -1,8 +1,123 @@
 {
-  "version": "0.1.0",
-  "status": "placeholder",
+  "version": "0.2.0",
+  "status": "draft",
   "description": "Shared API contract and DTO registry for AR Chess.",
-  "endpoints": [],
+  "endpoints": [
+    {
+      "name": "scan_room_marker",
+      "method": "POST",
+      "path": "/v1/rooms/scan",
+      "request": {
+        "marker_id": "string"
+      },
+      "response": {
+        "room_id": "string"
+      }
+    },
+    {
+      "name": "get_room_anchors",
+      "method": "GET",
+      "path": "/v1/rooms/{room_id}/anchors",
+      "response": {
+        "anchors": "Anchor[]"
+      }
+    },
+    {
+      "name": "create_anchor",
+      "method": "POST",
+      "path": "/v1/rooms/{room_id}/anchors",
+      "request": {
+        "cloud_anchor_id": "string",
+        "pose": "Pose"
+      },
+      "response": {
+        "id": "string"
+      }
+    },
+    {
+      "name": "create_board",
+      "method": "POST",
+      "path": "/v1/boards",
+      "request": {
+        "room_id": "string",
+        "initial_fen": "string?"
+      },
+      "response": {
+        "board_id": "string",
+        "fen": "string",
+        "version": "number"
+      }
+    },
+    {
+      "name": "get_board",
+      "method": "GET",
+      "path": "/v1/boards/{board_id}",
+      "response": {
+        "board_id": "string",
+        "fen": "string",
+        "version": "number"
+      }
+    },
+    {
+      "name": "post_move",
+      "method": "POST",
+      "path": "/v1/boards/{board_id}/move",
+      "request": {
+        "uci": "string",
+        "expected_version": "number"
+      },
+      "response": {
+        "fen": "string",
+        "version": "number",
+        "legal": "boolean",
+        "reason": "string?"
+      }
+    },
+    {
+      "name": "dev_ping",
+      "method": "GET",
+      "path": "/openapi.json",
+      "response": {
+        "openapi": "string",
+        "info": "object"
+      },
+      "notes": "Used by the Expo client to verify LAN connectivity from an iPhone."
+    }
+  ],
   "events": [],
-  "dtos": []
+  "dtos": [
+    {
+      "name": "Pose",
+      "fields": {
+        "pos": "Vector3",
+        "rot": "Quaternion"
+      }
+    },
+    {
+      "name": "Vector3",
+      "fields": {
+        "x": "number",
+        "y": "number",
+        "z": "number"
+      }
+    },
+    {
+      "name": "Quaternion",
+      "fields": {
+        "x": "number",
+        "y": "number",
+        "z": "number",
+        "w": "number"
+      }
+    },
+    {
+      "name": "Anchor",
+      "fields": {
+        "id": "string",
+        "cloud_anchor_id": "string",
+        "pose": "Pose",
+        "active": "boolean"
+      }
+    }
+  ]
 }

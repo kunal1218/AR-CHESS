@@ -3,9 +3,10 @@
 ## Ownership
 
 - Person 1 works only inside `server-app/`.
-- Person 2 works only inside `ar-client/`.
+- Person 2 works only inside `mobile/`.
 - `shared/` is the only shared edit area.
 - No cross-folder edits without discussion and explicit agreement first.
+- `legacy/native-client/` is archived reference material and should stay untouched unless there is an explicit migration task.
 
 ## Contract changes
 
@@ -16,7 +17,7 @@
 ## Branch naming
 
 - Server work: `feature/server-*`
-- AR client work: `feature/ar-*`
+- Mobile work: `feature/mobile-*`
 
 ## Collaboration rule
 

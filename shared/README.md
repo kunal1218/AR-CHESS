@@ -1,6 +1,6 @@
 # Shared Integration Boundary
 
-This directory is the only intended shared edit surface between the server and AR client developers.
+This directory is the only intended shared edit surface between the server and mobile client developers.
 
 ## What belongs here
 
@@ -11,7 +11,7 @@ This directory is the only intended shared edit surface between the server and A
 ## What does not belong here
 
 - Backend implementation code
-- Android implementation code
+- Mobile implementation code
 - Infrastructure configuration unrelated to the contract
 
 Changes in this directory should be reviewed as contract changes before they are merged.
