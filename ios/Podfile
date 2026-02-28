@@ -69,5 +69,17 @@ target 'ARChess' do
       :mac_catalyst_enabled => false,
       :ccache_enabled => ccache_enabled?(podfile_properties),
     )
+
+    installer.pods_project.targets.each do |target|
+      next unless target.name == 'EXConstants'
+
+      target.shell_script_build_phases.each do |phase|
+        next unless phase.name == '[CP-User] Generate app.config for prebuilt Constants.manifest'
+
+        phase.shell_script = %(PROJECT_DIR=Pods PROJECT_ROOT="#{app_root}" bash -l "$PODS_TARGET_SRCROOT/../scripts/get-app-config-ios.sh")
+      end
+    end
+
+    installer.pods_project.save
   end
 end
