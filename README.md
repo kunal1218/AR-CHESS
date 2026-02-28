@@ -1,29 +1,28 @@
 # ar-chess
 
-Monorepo for the AR Chess platform with the existing server and an Expo-managed React Native mobile app.
+Monorepo for the AR Chess platform with the existing server and a native iOS app.
 
 ## Ownership boundaries
 
 - `server-app/`: Person 1 owns the backend application.
-- `mobile/`: Person 2 owns the Expo Go mobile client.
+- `mobile/`: archived React Native client kept for reference while the active iOS app runs natively from Xcode.
 - `shared/`: Shared integration boundary for API contracts and DTOs only.
 - `infra/`: Docker Compose, environment templates, and operational scripts.
 - `docs/`: Architecture and workflow documentation.
-- `legacy/old-client/`: archived pre-Expo native client kept only for reference.
+- `legacy/old-client/`: archived Android-native client kept only for reference.
+- `ios/`: active native iOS app with SwiftUI screens and RealityKit/ARKit runtime.
 
 ## Quick start
 
 - Server app: `cd server-app && python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt && python3 main.py`
-- Mobile app: `cd mobile && npm install && npx expo start`
+- Native iOS app: `open ios/ARChess.xcworkspace`
 - Compose stack: `docker-compose up --build` from the repo root, or `docker compose --env-file infra/.env.example -f infra/docker-compose.yml up --build`
 
-## iPhone + Expo Go
+## iPhone + Xcode
 
-- Install Expo Go on your iPhone.
-- Run `cd mobile && npm install && npx expo start`.
-- Scan the Expo QR code from the terminal with Expo Go on the same Wi-Fi network.
-- The landing page includes `Join` and `Create`, then opens a placeholder lobby that says `AR experience opens next (TODO)`.
-- Set `EXPO_PUBLIC_API_BASE_URL` in `mobile/.env.local` to your Railway backend URL if you want to use the `Ping Server + Postgres` button.
-- Use `.env.railway.example` as the repo-level Railway variable template.
+- Open `ios/ARChess.xcworkspace` in Xcode.
+- Run the `ARChess` scheme on an iPhone for native AR.
+- The app now launches native SwiftUI screens for `Join`, `Create`, `Lobby / Loading`, and the native AR sandbox.
+- `mobile/` is no longer the active iOS runtime path.
 
-The mobile UI does not require the server to be running. If you wire networking later, use your Mac's LAN IP instead of `localhost`.
+The native iOS UI does not require the server to be running. If you wire networking later, use your Mac's LAN IP instead of `localhost`.
