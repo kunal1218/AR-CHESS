@@ -39,4 +39,18 @@ EXPO_PUBLIC_API_BASE_URL=https://your-railway-service.up.railway.app
 - Either action opens Lobby, then `Open Game Sandbox` mounts the shared `ar-client` runtime and board.
 - `mobile/` remains the host shell; chess engine + AR board logic live in `../ar-client`.
 - The app works without the server running.
+<<<<<<< HEAD
 - `EXPO_PUBLIC_API_BASE_URL` is used by the landing-screen health ping button.
+=======
+- `EXPO_PUBLIC_API_BASE_URL` is kept as an optional future hook in `.env.example` if you want to prepare later networking.
+
+## Local package resolution
+
+- `ar-client` is linked as a local dependency (`file:../ar-client`).
+- If Metro fails with `Unable to resolve module ar-client`, run:
+
+```bash
+npm install
+npx expo start -c
+```
+>>>>>>> 526739b3458702e95b8b0a072b6127047ec02c89
