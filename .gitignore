@@ -14,3 +14,11 @@ legacy/old-client/**/build/
 legacy/old-client/captures/
 
 .idea/
+
+# Xcode
+DerivedData/
+build/
+*.xcuserstate
+**/xcuserdata/
+.swiftpm/
+.build/
