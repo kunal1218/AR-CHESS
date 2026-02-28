@@ -1,24 +1,14 @@
 # mobile
 
-Expo-managed React Native client for AR Chess. iOS + Expo Go is the primary development path.
+Archived React Native client for AR Chess. The active iOS app now runs natively from `../ios/ARChess.xcworkspace`.
 
-## Local setup
+## Status
 
-1. Install dependencies.
+- `mobile/` is no longer the primary iOS runtime.
+- Native screens and the AR experience now live in `../ios/`.
+- Keep this folder only as historical/reference code unless you explicitly want to revive the React Native shell.
 
-```bash
-npm install
-```
-
-2. Start Expo.
-
-```bash
-npx expo start
-```
-
-3. Open Expo Go on your iPhone and scan the QR code from the terminal.
-
-## Railway ping setup
+## Historical notes
 
 1. Copy `.env.example` to `.env.local`.
 2. Set `EXPO_PUBLIC_API_BASE_URL` to your Railway backend URL.
@@ -27,33 +17,7 @@ npx expo start
 EXPO_PUBLIC_API_BASE_URL=https://your-railway-service.up.railway.app
 ```
 
-3. Tap `Ping Server + Postgres` on the landing screen.
+3. The old React landing screen used `Ping Server + Postgres`.
 4. If both checks succeed, the app shows:
    - `Server ping successful`
    - `Postgres ping successful`
-
-## Notes
-
-- The phone and your Mac must be on the same Wi-Fi network.
-- The landing screen shows a chessboard-themed background with `Join` and `Create`.
-- Either action opens Lobby, then `Open Game Sandbox` opens live camera mode with AR board overlay.
-- `mobile/` remains the host shell; chess engine + AR board logic live in `../ar-client`.
-- The app works without the server running.
-- `EXPO_PUBLIC_API_BASE_URL` is used by the landing-screen health ping button.
-
-## Local package resolution
-
-- `ar-client` is linked as a local dependency (`file:../ar-client`).
-- If Metro fails with `Unable to resolve module ar-client`, run:
-
-```bash
-npm install
-npx expo start -c
-```
-
-## AR camera mode
-
-- `mobile/app/game.tsx` uses `expo-camera` for live camera preview.
-- First launch asks for camera permission on-device.
-- Board appears after you tap once on the scene to place it. Use `Reposition Board` to place again.
-- This is camera-overlay AR for Expo Go testing. Full ARKit/ARCore plane tracking + native cloud-anchor resolve needs a dev build/native module phase.
