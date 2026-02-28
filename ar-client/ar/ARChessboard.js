@@ -38,21 +38,24 @@ function pickPreferredMove(moves, destinationSquare) {
 
 export function ARChessboard({
   initialFen = STARTING_FEN,
+  fen: controlledFen,
+  onMove,
   cloudAnchorIds = [],
   onFenChange,
   onAnchorHosted,
   anchorResolver,
   submitHostedAnchorFn = submitHostedAnchor,
 }) {
-  const [fen, setFen] = useState(initialFen);
+  const [internalFen, setInternalFen] = useState(initialFen);
   const [selectedSquare, setSelectedSquare] = useState(null);
   const [legalTargets, setLegalTargets] = useState([]);
   const [placementMode, setPlacementMode] = useState('resolving');
   const [anchorState, setAnchorState] = useState(null);
   const [status, setStatus] = useState('Resolving cloud anchors...');
+  const fen = controlledFen ?? internalFen;
 
   useEffect(() => {
-    setFen(initialFen);
+    setInternalFen(initialFen);
     setSelectedSquare(null);
     setLegalTargets([]);
   }, [initialFen]);
@@ -122,9 +125,17 @@ export function ARChessboard({
       const candidateMoves = generateLegalMoves(fen, selectedSquare);
       const chosenMove = pickPreferredMove(candidateMoves, square);
       if (chosenMove) {
+        if (onMove) {
+          onMove(chosenMove);
+          setStatus(`Move requested: ${chosenMove}`);
+          setSelectedSquare(null);
+          setLegalTargets([]);
+          return;
+        }
+
         const result = applyLegalMove(fen, chosenMove);
         if (result.legal) {
-          setFen(result.fen);
+          setInternalFen(result.fen);
           onFenChange?.(result.fen, result.uci);
           setStatus(`Move played: ${result.uci}`);
         } else {

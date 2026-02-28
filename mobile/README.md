@@ -22,6 +22,7 @@ npx expo start
 
 - The phone and your Mac must be on the same Wi-Fi network.
 - The landing screen shows a chessboard-themed background with `Join` and `Create`.
-- Either action opens the lobby placeholder and shows `AR experience opens next (TODO)`.
+- Either action opens Lobby, then `Open Game Sandbox` mounts the shared `ar-client` runtime and board.
+- `mobile/` remains the host shell; chess engine + AR board logic live in `../ar-client`.
 - The app works without the server running.
 - `EXPO_PUBLIC_API_BASE_URL` is kept as an optional future hook in `.env.example` if you want to prepare later networking.

@@ -33,6 +33,12 @@ Person 2 AR client module for local chess state, anchor placement flow, and serv
   - `getAnchors(roomId)`
   - `getBoard(boardId)`
   - `postMove(boardId, uci, expectedVersion)`
+- Runtime orchestrator:
+  - `createGameRuntime({ api, evaluator, boardId, initialFen })`
+  - `dispatch(command)`
+  - `subscribe(listener)`
+  - `getSnapshot()`
+  - emits `GameEvent`s such as `RoomScanned`, `AnchorsLoaded`, `BoardLoaded`, `MoveApplied`, `IllegalMove`, `EvalReady`
 
 ## Run tests
 
@@ -59,6 +65,26 @@ Minimal usage:
     console.log('move', moveUci, 'fen', nextFen);
   }}
 />
+```
+
+Runtime-first usage:
+
+```js
+import { createGameRuntime, createStockfishStubEvaluator, createStubApi } from 'ar-client';
+
+const runtime = createGameRuntime({
+  api: createStubApi(),
+  evaluator: createStockfishStubEvaluator(),
+  boardId: 'demo-board',
+});
+
+const unsubscribe = runtime.subscribe((event, snapshot) => {
+  console.log(event.type, snapshot.fen);
+});
+
+await runtime.dispatch({ type: 'bootstrap', markerId: 'JOIN-ROOM-001' });
+await runtime.dispatch({ type: 'move', uci: 'e2e4' });
+unsubscribe();
 ```
 
 ## Server integration mapping (later)

@@ -22,6 +22,14 @@ export default function RootLayout() {
             contentStyle: { backgroundColor: '#0e1319' },
           }}
         />
+        <Stack.Screen
+          name="game"
+          options={{
+            headerShown: false,
+            headerShadowVisible: false,
+            contentStyle: { backgroundColor: '#0e1319' },
+          }}
+        />
       </Stack>
     </SafeAreaProvider>
   );

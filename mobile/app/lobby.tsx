@@ -28,12 +28,17 @@ export default function LobbyScreen() {
         <View style={styles.card}>
           <Text style={styles.label}>{selectedMode} selected</Text>
           <Text style={styles.title}>Lobby / Loading</Text>
-          <Text style={styles.todo}>AR experience opens next (TODO)</Text>
+          <Text style={styles.todo}>AR experience ready for sandbox testing</Text>
           <Text style={styles.helper}>
-            This screen is intentionally server-optional. It keeps the Join/Create flow ready while
-            AR and networking are added later.
+            This keeps the Join/Create flow from the host shell while mounting the shared runtime
+            beneath it for legal moves, event emission, and evaluation.
           </Text>
 
+          <PrimaryButton
+            label="Open Game Sandbox"
+            onPress={() => router.push(`/game?mode=${selectedMode.toLowerCase()}`)}
+            variant="outline"
+          />
           <PrimaryButton label="Back" onPress={() => router.replace('/')} variant="solid" />
         </View>
       </View>
