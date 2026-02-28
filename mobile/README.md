@@ -55,5 +55,5 @@ npx expo start -c
 
 - `mobile/app/game.tsx` uses `expo-camera` for live camera preview.
 - First launch asks for camera permission on-device.
-- Tap once on the scene to place the board. Use `Reposition Board` to place again.
+- Board appears after you tap once on the scene to place it. Use `Reposition Board` to place again.
 - This is camera-overlay AR for Expo Go testing. Full ARKit/ARCore plane tracking + native cloud-anchor resolve needs a dev build/native module phase.

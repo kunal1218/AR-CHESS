@@ -43,6 +43,7 @@ export function ARChessboard({
   cloudAnchorIds = [],
   visualMode = 'panel',
   boardSize = 320,
+  useAnchorTransform = true,
   onFenChange,
   onAnchorHosted,
   anchorResolver,
@@ -160,7 +161,7 @@ export function ARChessboard({
     }
   }
 
-  const boardTranslation = anchorState
+  const boardTranslation = useAnchorTransform && anchorState
     ? {
         transform: [
           { translateX: anchorState.pose.pos.x * 140 },

@@ -119,6 +119,7 @@ export type ARChessboardProps = {
   cloudAnchorIds?: string[];
   visualMode?: 'panel' | 'overlay';
   boardSize?: number;
+  useAnchorTransform?: boolean;
   onFenChange?: (fen: string, uci: string) => void;
   onAnchorHosted?: (hosted: {
     cloud_anchor_id: string;

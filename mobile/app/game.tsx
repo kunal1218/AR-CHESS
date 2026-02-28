@@ -24,6 +24,7 @@ export default function GameScreen() {
   const mode = normalizeMode(modeParam);
   const [permission, requestPermission] = useCameraPermissions();
   const [placementMode, setPlacementMode] = useState(true);
+  const [boardPlaced, setBoardPlaced] = useState(false);
   const [surfaceSize, setSurfaceSize] = useState({ width: 0, height: 0 });
   const [boardCenter, setBoardCenter] = useState({ xRatio: 0.5, yRatio: 0.64 });
   const { snapshot, events, dispatch, isBootstrapping, error } = useGameRuntime(mode);
@@ -47,6 +48,7 @@ export default function GameScreen() {
       xRatio: clamp(locationX / surfaceSize.width, 0.2, 0.8),
       yRatio: clamp(locationY / surfaceSize.height, 0.2, 0.86),
     });
+    setBoardPlaced(true);
     setPlacementMode(false);
   }
 
@@ -101,11 +103,12 @@ export default function GameScreen() {
           </Pressable>
         ) : null}
 
-        {canRenderBoard ? (
+        {canRenderBoard && boardPlaced ? (
           <View style={[styles.boardLayer, { left: boardLeft, top: boardTop }]}>
             <ARChessboard
               visualMode="overlay"
               boardSize={BOARD_SIZE}
+              useAnchorTransform={false}
               fen={snapshot.fen}
               cloudAnchorIds={snapshot.anchorIds}
               onMove={(uci: string) => {
@@ -130,7 +133,7 @@ export default function GameScreen() {
           </View>
 
           <PrimaryButton
-            label={placementMode ? 'Placement Mode Active' : 'Reposition Board'}
+            label={placementMode ? 'Tap Scene To Place' : 'Reposition Board'}
             onPress={() => setPlacementMode(true)}
             variant="outline"
           />
