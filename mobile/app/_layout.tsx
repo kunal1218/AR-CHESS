@@ -5,38 +5,21 @@ import { SafeAreaProvider } from 'react-native-safe-area-context';
 export default function RootLayout() {
   return (
     <SafeAreaProvider>
-      <StatusBar style="dark" />
+      <StatusBar style="light" />
       <Stack>
         <Stack.Screen
           name="index"
           options={{
-            title: 'AR Chess',
-            headerShadowVisible: false,
-            headerStyle: { backgroundColor: '#f4efe6' },
-            headerTitleStyle: { color: '#153248', fontSize: 20, fontWeight: '700' },
-            contentStyle: { backgroundColor: '#f4efe6' },
+            headerShown: false,
+            contentStyle: { backgroundColor: '#0e1319' },
           }}
         />
         <Stack.Screen
-          name="scan"
+          name="lobby"
           options={{
-            title: 'Scan Room Marker',
+            headerShown: false,
             headerShadowVisible: false,
-            headerStyle: { backgroundColor: '#f4efe6' },
-            headerTitleStyle: { color: '#153248', fontSize: 18, fontWeight: '600' },
-            headerTintColor: '#153248',
-            contentStyle: { backgroundColor: '#f4efe6' },
-          }}
-        />
-        <Stack.Screen
-          name="board"
-          options={{
-            title: 'Board',
-            headerShadowVisible: false,
-            headerStyle: { backgroundColor: '#f4efe6' },
-            headerTitleStyle: { color: '#153248', fontSize: 18, fontWeight: '600' },
-            headerTintColor: '#153248',
-            contentStyle: { backgroundColor: '#f4efe6' },
+            contentStyle: { backgroundColor: '#0e1319' },
           }}
         />
       </Stack>

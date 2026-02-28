@@ -1,6 +1,6 @@
-# native-client
+# old-client
 
-Archived Android-native scaffold kept only for reference during the Expo migration.
+Archived non-Expo native client kept only for reference during the Expo migration.
 
 ## Status
 

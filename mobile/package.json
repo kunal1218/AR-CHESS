@@ -6,14 +6,12 @@
     "start": "expo start",
     "ios": "expo start --ios",
     "lint": "eslint app src app.config.ts --ext .ts,.tsx",
-    "test": "node -e \"console.log('No mobile tests configured yet')\""
+    "test": "node -e \"console.log('No mobile tests configured yet')\"",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@react-native-async-storage/async-storage": "2.2.0",
     "@react-navigation/native": "^7.1.8",
     "expo": "~54.0.33",
-    "expo-camera": "~17.0.10",
-    "expo-constants": "~18.0.13",
     "expo-linking": "~8.0.11",
     "expo-router": "~6.0.23",
     "expo-splash-screen": "~31.0.13",
