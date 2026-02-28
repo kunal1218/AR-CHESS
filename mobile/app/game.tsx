@@ -1,4 +1,4 @@
-import { ARChessboard } from 'ar-client';
+import { ARChessboard, type ARChessboardProps } from 'ar-client';
 import { router, useLocalSearchParams } from 'expo-router';
 import { ScrollView, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
@@ -44,10 +44,12 @@ export default function GameScreen() {
             <ARChessboard
               fen={snapshot.fen}
               cloudAnchorIds={snapshot.anchorIds}
-              onMove={(uci) => {
+              onMove={(uci: string) => {
                 void dispatch({ type: 'move', uci });
               }}
-              onAnchorHosted={(hosted) => {
+              onAnchorHosted={(
+                hosted: Parameters<NonNullable<ARChessboardProps['onAnchorHosted']>>[0]
+              ) => {
                 void dispatch({ type: 'anchorHosted', cloudAnchorId: hosted.cloud_anchor_id });
               }}
             />

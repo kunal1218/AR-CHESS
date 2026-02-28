@@ -23,5 +23,7 @@ Monorepo for the AR Chess platform with the existing server and an Expo-managed 
 - Run `cd mobile && npm install && npx expo start`.
 - Scan the Expo QR code from the terminal with Expo Go on the same Wi-Fi network.
 - The landing page includes `Join` and `Create`, then opens a placeholder lobby that says `AR experience opens next (TODO)`.
+- Set `EXPO_PUBLIC_API_BASE_URL` in `mobile/.env.local` to your Railway backend URL if you want to use the `Ping Server + Postgres` button.
+- Use `.env.railway.example` as the repo-level Railway variable template.
 
 The mobile UI does not require the server to be running. If you wire networking later, use your Mac's LAN IP instead of `localhost`.
