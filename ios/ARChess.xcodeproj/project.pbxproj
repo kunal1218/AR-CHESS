@@ -241,7 +241,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "# This script configures Expo modules and generates the modules provider file.\nbash -l -c \"./Pods/Target\\ Support\\ Files/Pods-ARChess/expo-configure-project.sh\"\n";
+			shellScript = "# This script configures Expo modules and generates the modules provider file.\nEXPO_CONFIGURE_PROJECT_SCRIPT=\"$SRCROOT/Pods/Target Support Files/Pods-ARChess/expo-configure-project.sh\"\nbash -l \"$EXPO_CONFIGURE_PROJECT_SCRIPT\"\n";
 		};
 		08A4A3CD28434E44B6B9DE2E /* [CP] Check Pods Manifest.lock */ = {
 			isa = PBXShellScriptBuildPhase;

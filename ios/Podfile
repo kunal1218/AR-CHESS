@@ -80,6 +80,26 @@ target 'ARChess' do
       end
     end
 
+    expo_configure_project_script = File.join(
+      __dir__,
+      'Pods',
+      'Target Support Files',
+      'Pods-ARChess',
+      'expo-configure-project.sh'
+    )
+
+    if File.exist?(expo_configure_project_script)
+      support_script = File.read(expo_configure_project_script)
+      fixed_script = support_script.sub(
+        "generate-modules-provider  \\\n",
+        "generate-modules-provider  \\\n  --project-root \"#{app_root}\" \\\n"
+      )
+
+      if fixed_script != support_script
+        File.write(expo_configure_project_script, fixed_script)
+      end
+    end
+
     installer.pods_project.save
   end
 end
