@@ -117,6 +117,8 @@ export type ARChessboardProps = {
   fen?: string;
   onMove?: (uci: string) => void;
   cloudAnchorIds?: string[];
+  visualMode?: 'panel' | 'overlay';
+  boardSize?: number;
   onFenChange?: (fen: string, uci: string) => void;
   onAnchorHosted?: (hosted: {
     cloud_anchor_id: string;

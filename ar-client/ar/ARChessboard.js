@@ -41,6 +41,8 @@ export function ARChessboard({
   fen: controlledFen,
   onMove,
   cloudAnchorIds = [],
+  visualMode = 'panel',
+  boardSize = 320,
   onFenChange,
   onAnchorHosted,
   anchorResolver,
@@ -53,6 +55,7 @@ export function ARChessboard({
   const [anchorState, setAnchorState] = useState(null);
   const [status, setStatus] = useState('Resolving cloud anchors...');
   const fen = controlledFen ?? internalFen;
+  const isOverlayMode = visualMode === 'overlay';
 
   useEffect(() => {
     setInternalFen(initialFen);
@@ -167,16 +170,18 @@ export function ARChessboard({
     : undefined;
 
   return (
-    <View style={styles.container}>
-      <View style={styles.statusCard}>
-        <Text style={styles.statusHeading}>Anchor State</Text>
-        <Text style={styles.statusText}>{status}</Text>
-        <Text style={styles.statusMeta}>
-          {anchorState
-            ? `Anchor: ${anchorState.cloud_anchor_id}`
-            : 'No active anchor. Waiting for resolve or manual placement.'}
-        </Text>
-      </View>
+    <View style={[styles.container, isOverlayMode ? styles.overlayContainer : null]}>
+      {isOverlayMode ? null : (
+        <View style={styles.statusCard}>
+          <Text style={styles.statusHeading}>Anchor State</Text>
+          <Text style={styles.statusText}>{status}</Text>
+          <Text style={styles.statusMeta}>
+            {anchorState
+              ? `Anchor: ${anchorState.cloud_anchor_id}`
+              : 'No active anchor. Waiting for resolve or manual placement.'}
+          </Text>
+        </View>
+      )}
 
       {placementMode !== 'anchored' ? (
         <Pressable onPress={() => void handleManualPlacement()} style={styles.manualButton}>
@@ -184,8 +189,15 @@ export function ARChessboard({
         </Pressable>
       ) : null}
 
-      <View style={styles.scene}>
-        <View style={[styles.board, boardTranslation, placementMode !== 'anchored' ? styles.boardDisabled : null]}>
+      <View style={[styles.scene, isOverlayMode ? styles.sceneOverlay : null]}>
+        <View
+          style={[
+            styles.board,
+            { width: boardSize, height: boardSize },
+            boardTranslation,
+            isOverlayMode ? styles.boardOverlay : null,
+            placementMode !== 'anchored' ? styles.boardDisabled : null,
+          ]}>
           {Array.from({ length: 8 }, (_, visualRank) => 7 - visualRank).map((rank) => (
             <View key={`rank-${rank}`} style={styles.row}>
               {Array.from({ length: 8 }, (_, file) => {
@@ -217,11 +229,13 @@ export function ARChessboard({
         </View>
       </View>
 
-      <View style={styles.infoCard}>
-        <Text style={styles.turnLabel}>Turn: {parsed.activeColor === 'w' ? 'White' : 'Black'}</Text>
-        <Text style={styles.fenLabel}>FEN</Text>
-        <Text style={styles.fenValue}>{fen}</Text>
-      </View>
+      {isOverlayMode ? null : (
+        <View style={styles.infoCard}>
+          <Text style={styles.turnLabel}>Turn: {parsed.activeColor === 'w' ? 'White' : 'Black'}</Text>
+          <Text style={styles.fenLabel}>FEN</Text>
+          <Text style={styles.fenValue}>{fen}</Text>
+        </View>
+      )}
     </View>
   );
 }
@@ -229,6 +243,9 @@ export function ARChessboard({
 const styles = StyleSheet.create({
   container: {
     gap: 14,
+  },
+  overlayContainer: {
+    gap: 8,
   },
   statusCard: {
     borderRadius: 18,
@@ -276,6 +293,13 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     alignItems: 'center',
   },
+  sceneOverlay: {
+    minHeight: 0,
+    padding: 0,
+    backgroundColor: 'transparent',
+    borderWidth: 0,
+    borderColor: 'transparent',
+  },
   board: {
     width: 320,
     height: 320,
@@ -283,6 +307,14 @@ const styles = StyleSheet.create({
     borderWidth: 2,
     borderColor: '#2b3f4a',
     overflow: 'hidden',
+  },
+  boardOverlay: {
+    backgroundColor: 'rgba(255, 255, 255, 0.05)',
+    shadowColor: '#000000',
+    shadowOpacity: 0.4,
+    shadowRadius: 18,
+    shadowOffset: { width: 0, height: 10 },
+    elevation: 8,
   },
   boardDisabled: {
     opacity: 0.45,

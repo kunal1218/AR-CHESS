@@ -36,13 +36,10 @@ EXPO_PUBLIC_API_BASE_URL=https://your-railway-service.up.railway.app
 
 - The phone and your Mac must be on the same Wi-Fi network.
 - The landing screen shows a chessboard-themed background with `Join` and `Create`.
-- Either action opens Lobby, then `Open Game Sandbox` mounts the shared `ar-client` runtime and board.
+- Either action opens Lobby, then `Open Game Sandbox` opens live camera mode with AR board overlay.
 - `mobile/` remains the host shell; chess engine + AR board logic live in `../ar-client`.
 - The app works without the server running.
-<<<<<<< HEAD
 - `EXPO_PUBLIC_API_BASE_URL` is used by the landing-screen health ping button.
-=======
-- `EXPO_PUBLIC_API_BASE_URL` is kept as an optional future hook in `.env.example` if you want to prepare later networking.
 
 ## Local package resolution
 
@@ -53,4 +50,10 @@ EXPO_PUBLIC_API_BASE_URL=https://your-railway-service.up.railway.app
 npm install
 npx expo start -c
 ```
->>>>>>> 526739b3458702e95b8b0a072b6127047ec02c89
+
+## AR camera mode
+
+- `mobile/app/game.tsx` uses `expo-camera` for live camera preview.
+- First launch asks for camera permission on-device.
+- Tap once on the scene to place the board. Use `Reposition Board` to place again.
+- This is camera-overlay AR for Expo Go testing. Full ARKit/ARCore plane tracking + native cloud-anchor resolve needs a dev build/native module phase.

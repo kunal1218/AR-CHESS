@@ -1,11 +1,18 @@
 import { ARChessboard, type ARChessboardProps } from 'ar-client';
+import { CameraView, useCameraPermissions } from 'expo-camera';
 import { router, useLocalSearchParams } from 'expo-router';
-import { ScrollView, StyleSheet, Text, View } from 'react-native';
+import { useState } from 'react';
+import { Pressable, StyleSheet, Text, View, type GestureResponderEvent, type LayoutChangeEvent } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
-import { ChessboardBackground } from '@/src/components/chessboard-background';
 import { PrimaryButton } from '@/src/components/primary-button';
 import { useGameRuntime } from '@/src/integration/use-game-runtime';
+
+const BOARD_SIZE = 252;
+
+function clamp(value: number, min: number, max: number) {
+  return Math.min(max, Math.max(min, value));
+}
 
 function normalizeMode(raw?: string | string[]): 'join' | 'create' {
   const resolved = Array.isArray(raw) ? raw[0] : raw;
@@ -15,33 +22,90 @@ function normalizeMode(raw?: string | string[]): 'join' | 'create' {
 export default function GameScreen() {
   const { mode: modeParam } = useLocalSearchParams<{ mode?: string }>();
   const mode = normalizeMode(modeParam);
+  const [permission, requestPermission] = useCameraPermissions();
+  const [placementMode, setPlacementMode] = useState(true);
+  const [surfaceSize, setSurfaceSize] = useState({ width: 0, height: 0 });
+  const [boardCenter, setBoardCenter] = useState({ xRatio: 0.5, yRatio: 0.64 });
   const { snapshot, events, dispatch, isBootstrapping, error } = useGameRuntime(mode);
+  const latestEvent = events[0];
 
   const headline = mode === 'create' ? 'Create Room Game' : 'Join Room Game';
+  const canRenderBoard = permission?.granted && surfaceSize.width > 0 && surfaceSize.height > 0;
+
+  function handleSurfaceLayout(event: LayoutChangeEvent) {
+    const { width, height } = event.nativeEvent.layout;
+    setSurfaceSize({ width, height });
+  }
+
+  function handleSceneTap(event: GestureResponderEvent) {
+    if (!placementMode || !surfaceSize.width || !surfaceSize.height) {
+      return;
+    }
+
+    const { locationX, locationY } = event.nativeEvent;
+    setBoardCenter({
+      xRatio: clamp(locationX / surfaceSize.width, 0.2, 0.8),
+      yRatio: clamp(locationY / surfaceSize.height, 0.2, 0.86),
+    });
+    setPlacementMode(false);
+  }
+
+  const maxLeft = Math.max(8, surfaceSize.width - BOARD_SIZE - 8);
+  const maxTop = Math.max(100, surfaceSize.height - BOARD_SIZE - 140);
+  const boardLeft = clamp(surfaceSize.width * boardCenter.xRatio - BOARD_SIZE / 2, 8, maxLeft);
+  const boardTop = clamp(surfaceSize.height * boardCenter.yRatio - BOARD_SIZE / 2, 100, maxTop);
 
   return (
     <SafeAreaView style={styles.safeArea}>
-      <View style={styles.container}>
-        <ChessboardBackground />
+      <View style={styles.container} onLayout={handleSurfaceLayout}>
+        {permission?.granted ? <CameraView style={StyleSheet.absoluteFill} facing="back" /> : null}
         <View style={styles.overlay} />
 
-        <ScrollView contentContainerStyle={styles.content}>
-          <View style={styles.headerCard}>
-            <Text style={styles.modeLabel}>{headline}</Text>
-            <Text style={styles.title}>AR + Engine Sandbox</Text>
-            <Text style={styles.subtitle}>
-              Host UI remains in Expo shell. Game runtime, legal engine, events, and eval run underneath.
-            </Text>
-            <Text style={styles.meta}>
-              {isBootstrapping
-                ? 'Bootstrapping room + anchors + board...'
-                : `Room ${snapshot.roomId ?? 'n/a'} • Board ${snapshot.boardId} • v${snapshot.version}`}
-            </Text>
-            {error ? <Text style={styles.error}>{error}</Text> : null}
-          </View>
+        <View style={styles.headerCard}>
+          <Text style={styles.modeLabel}>{headline}</Text>
+          <Text style={styles.title}>AR Camera Mode</Text>
+          <Text style={styles.subtitle}>
+            Camera feed is live. Tap scene to place the board, then tap pieces to play legal moves.
+          </Text>
+          <Text style={styles.meta}>
+            {isBootstrapping
+              ? 'Bootstrapping room + anchors + board...'
+              : `Room ${snapshot.roomId ?? 'n/a'} • Board ${snapshot.boardId} • v${snapshot.version}`}
+          </Text>
+          {latestEvent ? <Text style={styles.meta}>Latest event: {latestEvent.type}</Text> : null}
+          {error ? <Text style={styles.error}>{error}</Text> : null}
+        </View>
 
-          <View style={styles.boardCard}>
+        {permission?.granted ? null : (
+          <View style={styles.permissionCard}>
+            <Text style={styles.permissionTitle}>Camera permission required</Text>
+            <Text style={styles.permissionBody}>
+              AR mode needs live camera access. Allow camera permissions, then place the board in your scene.
+            </Text>
+            <PrimaryButton
+              label="Enable Camera"
+              onPress={() => {
+                void requestPermission();
+              }}
+              variant="solid"
+            />
+          </View>
+        )}
+
+        {permission?.granted && placementMode ? (
+          <Pressable onPress={handleSceneTap} style={styles.placementLayer}>
+            <View style={styles.placementHint}>
+              <Text style={styles.placementHintTitle}>Tap to place board</Text>
+              <Text style={styles.placementHintBody}>Aim at the floor/table and tap where board center should be.</Text>
+            </View>
+          </Pressable>
+        ) : null}
+
+        {canRenderBoard ? (
+          <View style={[styles.boardLayer, { left: boardLeft, top: boardTop }]}>
             <ARChessboard
+              visualMode="overlay"
+              boardSize={BOARD_SIZE}
               fen={snapshot.fen}
               cloudAnchorIds={snapshot.anchorIds}
               onMove={(uci: string) => {
@@ -54,32 +118,24 @@ export default function GameScreen() {
               }}
             />
           </View>
+        ) : null}
 
-          <View style={styles.runtimeCard}>
-            <Text style={styles.cardTitle}>Runtime state</Text>
+        <View style={styles.bottomPanel}>
+          <View style={styles.runtimeRow}>
             <Text style={styles.runtimeLine}>Turn: {snapshot.activeColor === 'w' ? 'White' : 'Black'}</Text>
-            <Text style={styles.runtimeLine}>In check: {snapshot.inCheck ? 'Yes' : 'No'}</Text>
+            <Text style={styles.runtimeLine}>Check: {snapshot.inCheck ? 'Yes' : 'No'}</Text>
             <Text style={styles.runtimeLine}>
-              Eval: {snapshot.evaluation ? `${snapshot.evaluation.centipawns} cp (${snapshot.evaluation.source})` : 'Pending'}
+              Eval: {snapshot.evaluation ? `${snapshot.evaluation.centipawns} cp` : 'Pending'}
             </Text>
-            <Text style={styles.runtimeLine}>Anchors: {snapshot.anchorIds.length}</Text>
           </View>
 
-          <View style={styles.runtimeCard}>
-            <Text style={styles.cardTitle}>Game events</Text>
-            {events.length === 0 ? (
-              <Text style={styles.runtimeLine}>No events yet.</Text>
-            ) : (
-              events.map((event) => (
-                <Text key={`${event.id}-${event.type}`} style={styles.eventLine}>
-                  {event.type} @ {event.timestamp}
-                </Text>
-              ))
-            )}
-          </View>
-
-          <PrimaryButton label="Back to Lobby" onPress={() => router.replace(`/lobby?mode=${mode}`)} variant="outline" />
-        </ScrollView>
+          <PrimaryButton
+            label={placementMode ? 'Placement Mode Active' : 'Reposition Board'}
+            onPress={() => setPlacementMode(true)}
+            variant="outline"
+          />
+          <PrimaryButton label="Back to Lobby" onPress={() => router.replace(`/lobby?mode=${mode}`)} variant="solid" />
+        </View>
       </View>
     </SafeAreaView>
   );
@@ -88,26 +144,22 @@ export default function GameScreen() {
 const styles = StyleSheet.create({
   safeArea: {
     flex: 1,
-    backgroundColor: '#0e1319',
+    backgroundColor: '#000000',
   },
   container: {
     flex: 1,
-    backgroundColor: '#0e1319',
+    backgroundColor: '#000000',
   },
   overlay: {
     ...StyleSheet.absoluteFillObject,
-    backgroundColor: 'rgba(8, 12, 18, 0.72)',
-  },
-  content: {
-    paddingHorizontal: 20,
-    paddingTop: 22,
-    paddingBottom: 30,
-    gap: 16,
+    backgroundColor: 'rgba(7, 10, 14, 0.34)',
   },
   headerCard: {
+    marginTop: 10,
+    marginHorizontal: 16,
     borderRadius: 26,
-    paddingHorizontal: 20,
-    paddingVertical: 20,
+    paddingHorizontal: 16,
+    paddingVertical: 14,
     gap: 8,
     backgroundColor: 'rgba(17, 25, 34, 0.88)',
     borderWidth: 1,
@@ -122,7 +174,7 @@ const styles = StyleSheet.create({
   },
   title: {
     color: '#f8f3e7',
-    fontSize: 30,
+    fontSize: 28,
     fontWeight: '800',
     letterSpacing: -0.5,
   },
@@ -141,36 +193,82 @@ const styles = StyleSheet.create({
     fontSize: 13,
     lineHeight: 19,
   },
-  boardCard: {
-    borderRadius: 26,
-    padding: 14,
-    backgroundColor: 'rgba(248, 243, 231, 0.92)',
+  permissionCard: {
+    marginTop: 14,
+    marginHorizontal: 16,
+    borderRadius: 22,
+    paddingHorizontal: 16,
+    paddingVertical: 16,
+    backgroundColor: 'rgba(17, 25, 34, 0.92)',
     borderWidth: 1,
-    borderColor: 'rgba(248, 243, 231, 0.9)',
+    borderColor: 'rgba(248, 243, 231, 0.15)',
+    gap: 10,
   },
-  runtimeCard: {
-    borderRadius: 20,
+  permissionTitle: {
+    color: '#f8f3e7',
+    fontSize: 17,
+    fontWeight: '700',
+  },
+  permissionBody: {
+    color: '#d0d8e0',
+    fontSize: 14,
+    lineHeight: 21,
+  },
+  placementLayer: {
+    position: 'absolute',
+    top: 120,
+    left: 0,
+    right: 0,
+    bottom: 130,
+    justifyContent: 'center',
+    alignItems: 'center',
+    paddingHorizontal: 20,
+  },
+  placementHint: {
+    borderRadius: 18,
+    backgroundColor: 'rgba(10, 15, 22, 0.78)',
+    borderWidth: 1,
+    borderColor: 'rgba(248, 243, 231, 0.2)',
     paddingHorizontal: 16,
     paddingVertical: 14,
-    backgroundColor: 'rgba(17, 25, 34, 0.84)',
-    borderWidth: 1,
-    borderColor: 'rgba(248, 243, 231, 0.12)',
-    gap: 5,
+    gap: 6,
+    maxWidth: 320,
   },
-  cardTitle: {
+  placementHintTitle: {
     color: '#f8f3e7',
-    fontSize: 14,
+    fontSize: 16,
     fontWeight: '700',
-    marginBottom: 4,
+    textAlign: 'center',
+  },
+  placementHintBody: {
+    color: '#d0d8e0',
+    fontSize: 13,
+    lineHeight: 19,
+    textAlign: 'center',
+  },
+  boardLayer: {
+    position: 'absolute',
+  },
+  bottomPanel: {
+    marginTop: 'auto',
+    marginBottom: 12,
+    marginHorizontal: 16,
+    borderRadius: 20,
+    padding: 12,
+    backgroundColor: 'rgba(12, 18, 25, 0.78)',
+    borderWidth: 1,
+    borderColor: 'rgba(248, 243, 231, 0.16)',
+    gap: 10,
+  },
+  runtimeRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    gap: 12,
+    flexWrap: 'wrap',
   },
   runtimeLine: {
     color: '#d0d8e0',
-    fontSize: 13,
-    lineHeight: 20,
-  },
-  eventLine: {
-    color: '#bdc7d0',
-    fontSize: 12,
+    fontSize: 14,
     lineHeight: 18,
   },
 });
