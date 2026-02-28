@@ -1,0 +1,15 @@
+.DS_Store
+.pytest_cache/
+__pycache__/
+*.pyc
+.venv/
+.env
+
+server-app/.ruff_cache/
+
+ar-client/.gradle/
+ar-client/local.properties
+ar-client/**/build/
+ar-client/captures/
+
+.idea/

@@ -1,0 +1,8 @@
+{
+  "version": "0.1.0",
+  "status": "placeholder",
+  "description": "Shared API contract and DTO registry for AR Chess.",
+  "endpoints": [],
+  "events": [],
+  "dtos": []
+}
