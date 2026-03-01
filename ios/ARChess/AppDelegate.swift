@@ -854,6 +854,7 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
 @MainActor
 private final class PiecePersonalityDirector: NSObject, ObservableObject, @preconcurrency AVSpeechSynthesizerDelegate {
   private static let preferredAnalysisDepth = 5
+  private static let commentaryIntervalRange = 3...4
 
   struct Caption {
     let speaker: String
@@ -869,6 +870,8 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   private let synthesizer = AVSpeechSynthesizer()
   private var utteranceCaptions: [ObjectIdentifier: Caption] = [:]
   private var cachedAnalysis: CachedAnalysis?
+  private var completedPlyCount = 0
+  private var nextCommentaryPly = Int.random(in: commentaryIntervalRange)
 
   override init() {
     super.init()
@@ -900,6 +903,8 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     utteranceCaptions.removeAll()
     caption = nil
     cachedAnalysis = nil
+    completedPlyCount = 0
+    nextCommentaryPly = Int.random(in: Self.commentaryIntervalRange)
     analyzer.reset()
     analysisStatus = "Stockfish depth \(Self.preferredAnalysisDepth) warming up..."
     latestAssessment = "Waiting for initial analysis."
@@ -911,6 +916,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     before beforeState: ChessGameState,
     after afterState: ChessGameState
   ) async {
+    completedPlyCount += 1
     let beforeAnalysis = await analysisForCurrentTurn(state: beforeState)
     let afterAnalysis = await analysisForCurrentTurn(state: afterState)
 
@@ -941,23 +947,37 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       }
     }
 
-    if let assessment {
-      speak(lines: lines(for: assessment), priority: .normal)
-    }
-
-    if let captured = move.captured {
-      speak(lines: captureLines(for: captured.kind), priority: .urgent)
-    }
-
     if afterState.isCheckmate(for: afterState.turn) {
       latestAssessment = "Checkmate."
-      speak(lines: checkmateLines(), priority: .urgent)
+      if speakRandomLine(from: checkmateLines(), priority: .urgent) {
+        scheduleNextCommentaryWindow()
+      }
       return
     }
 
+    guard completedPlyCount >= nextCommentaryPly else {
+      return
+    }
+
+    let dialogueLines: [SpokenLine]
+    let priority: SpeechPriority
     if afterState.isInCheck(for: afterState.turn) {
       latestAssessment = "Check."
-      speak(lines: checkLines(), priority: .urgent)
+      dialogueLines = checkLines()
+      priority = .urgent
+    } else if let captured = move.captured {
+      dialogueLines = captureLines(for: captured.kind)
+      priority = .normal
+    } else if let assessment {
+      dialogueLines = lines(for: assessment)
+      priority = .normal
+    } else {
+      dialogueLines = moveFlavorLines(for: move.piece.kind)
+      priority = .normal
+    }
+
+    if speakRandomLine(from: dialogueLines, priority: priority) {
+      scheduleNextCommentaryWindow()
     }
   }
 
@@ -1099,33 +1119,38 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     return "\(from) to \(to), promoting to \(promotionName)"
   }
 
+  private func scheduleNextCommentaryWindow() {
+    nextCommentaryPly = completedPlyCount + Int.random(in: Self.commentaryIntervalRange)
+  }
+
   private func lines(for classification: MoveClassification) -> [SpokenLine] {
     switch classification {
     case .brilliant:
       return [
-        SpokenLine(speaker: .knight, text: "THAT was disgusting. I am unreal.", pitch: 1.52, rate: 0.64, volume: 0.98),
-        SpokenLine(speaker: .queen, text: "Yes. Naturally. My influence.", pitch: 0.62, rate: 0.28, volume: 0.95),
+        SpokenLine(speaker: .knight, text: "That line was savage. I hunt, I strike, I feast.", pitch: 1.56, rate: 0.63, volume: 0.98),
+        SpokenLine(speaker: .queen, text: "A gorgeous move. Power suits me, does it suit you?", pitch: 0.72, rate: 0.30, volume: 0.94),
       ]
     case .good:
       return [
-        SpokenLine(speaker: .knight, text: "We are so back. That move was clean.", pitch: 1.42, rate: 0.60, volume: 0.96),
-        SpokenLine(speaker: .queen, text: "A good move. Exactly as I intended.", pitch: 0.68, rate: 0.30, volume: 0.92),
+        SpokenLine(speaker: .knight, text: "Clean kill. I like where this trail is going.", pitch: 1.46, rate: 0.60, volume: 0.96),
+        SpokenLine(speaker: .queen, text: "Naturally. The board bends when I arrive.", pitch: 0.70, rate: 0.29, volume: 0.92),
       ]
     case .ok:
       return [
-        SpokenLine(speaker: .pawn, text: "solid enough. we move.", pitch: 0.96, rate: 0.45, volume: 0.82),
+        SpokenLine(speaker: .pawn, text: "Forward. Hold the line and draw blood later.", pitch: 0.98, rate: 0.44, volume: 0.84),
+        SpokenLine(speaker: .rook, text: "Slow hunt. Strong walls.", pitch: 1.34, rate: 0.46, volume: 0.96),
       ]
     case .inaccuracy:
       return [
-        SpokenLine(speaker: .bishop, text: "mmm. not ideal. but continue.", pitch: 0.84, rate: 0.38, volume: 0.88),
+        SpokenLine(speaker: .bishop, text: "Only Christ can save sloppy plans like that.", pitch: 0.82, rate: 0.35, volume: 0.90),
       ]
     case .mistake:
       return [
-        SpokenLine(speaker: .bishop, text: "did you even look at the board", pitch: 0.74, rate: 0.31, volume: 0.92),
+        SpokenLine(speaker: .bishop, text: "Did you even study the board? Repent and recalculate.", pitch: 0.74, rate: 0.31, volume: 0.92),
       ]
     case .blunder:
       return [
-        SpokenLine(speaker: .bishop, text: "did you even look at the board", pitch: 0.70, rate: 0.27, volume: 0.96),
+        SpokenLine(speaker: .bishop, text: "That was heresy. Only prayer explains this blunder.", pitch: 0.70, rate: 0.27, volume: 0.96),
       ]
     }
   }
@@ -1133,57 +1158,111 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   private func captureLines(for kind: ChessPieceKind) -> [SpokenLine] {
     switch kind {
     case .rook:
-      return [SpokenLine(speaker: .rook, text: "NOOOOO WHY", pitch: 1.85, rate: 0.64, volume: 1.0)]
+      return [
+        SpokenLine(speaker: .rook, text: "This beast was not ready to fall.", pitch: 1.52, rate: 0.52, volume: 1.0),
+        SpokenLine(speaker: .rook, text: "You do not cage a hunter for long.", pitch: 1.44, rate: 0.50, volume: 1.0),
+      ]
     case .queen:
-      return [SpokenLine(speaker: .queen, text: "how... dare... you", pitch: 0.62, rate: 0.22, volume: 0.95)]
+      return [
+        SpokenLine(speaker: .queen, text: "Can I leave this king and be your queen instead?", pitch: 0.74, rate: 0.27, volume: 0.95),
+        SpokenLine(speaker: .queen, text: "How cruel. I had so much more to offer.", pitch: 0.70, rate: 0.24, volume: 0.94),
+      ]
     case .bishop:
-      return [SpokenLine(speaker: .bishop, text: "well. I suppose that is what happens", pitch: 0.88, rate: 0.38, volume: 0.88)]
+      return [
+        SpokenLine(speaker: .bishop, text: "I go now to Christ. Remember the lesson.", pitch: 0.88, rate: 0.35, volume: 0.88),
+        SpokenLine(speaker: .bishop, text: "The heavens witness this capture.", pitch: 0.86, rate: 0.36, volume: 0.88),
+      ]
     case .knight:
-      return [SpokenLine(speaker: .knight, text: "bruh bruh bruh BRUH", pitch: 1.48, rate: 0.66, volume: 0.96)]
+      return [
+        SpokenLine(speaker: .knight, text: "I would have killed you first.", pitch: 1.50, rate: 0.64, volume: 0.98),
+        SpokenLine(speaker: .knight, text: "The wolf bleeds, but the hunt remembers.", pitch: 1.44, rate: 0.58, volume: 0.96),
+      ]
     case .pawn:
-      return [SpokenLine(speaker: .pawn, text: "tell them I pushed with honor", pitch: 0.96, rate: 0.43, volume: 0.86)]
+      return [
+        SpokenLine(speaker: .pawn, text: "I would have taken blood with me.", pitch: 0.98, rate: 0.42, volume: 0.86),
+        SpokenLine(speaker: .pawn, text: "A soldier falls. The file stays thirsty.", pitch: 0.96, rate: 0.40, volume: 0.84),
+      ]
     case .king:
-      return [SpokenLine(speaker: .king, text: "i should not be capturable. this is concerning.", pitch: 1.10, rate: 0.36, volume: 0.94)]
+      return [
+        SpokenLine(speaker: .king, text: "This outcome was never approved by the crown.", pitch: 1.16, rate: 0.36, volume: 0.96),
+      ]
     }
   }
 
   private func checkLines() -> [SpokenLine] {
     [
-      SpokenLine(speaker: .king, text: "WAIT WAIT WAIT IM IN CHECK", pitch: 1.66, rate: 0.60, volume: 1.0),
+      SpokenLine(speaker: .king, text: "Wait. Wait. Leave me one pawn and we can make a deal.", pitch: 1.46, rate: 0.48, volume: 1.0),
+      SpokenLine(speaker: .king, text: "Can we take this to a back room and negotiate?", pitch: 1.42, rate: 0.46, volume: 1.0),
     ]
   }
 
   private func checkmateLines() -> [SpokenLine] {
     [
-      SpokenLine(speaker: .king, text: "no. no no no.", pitch: 1.22, rate: 0.34, volume: 1.0),
-      SpokenLine(speaker: .king, text: "so this... is how my kingdom ends.", pitch: 0.96, rate: 0.28, volume: 0.94),
-      SpokenLine(speaker: .king, text: "remember me as majestic.", pitch: 0.72, rate: 0.22, volume: 0.88),
+      SpokenLine(speaker: .king, text: "No. No, no, this is not the official result.", pitch: 1.16, rate: 0.33, volume: 1.0),
+      SpokenLine(speaker: .king, text: "My office collapses... and no deal saved it.", pitch: 0.96, rate: 0.26, volume: 0.92),
+      SpokenLine(speaker: .king, text: "Tell history I was cornered, not weak.", pitch: 0.82, rate: 0.22, volume: 0.88),
     ]
   }
 
-  private func speak(lines: [SpokenLine], priority: SpeechPriority) {
-    guard !lines.isEmpty else {
-      return
+  private func moveFlavorLines(for kind: ChessPieceKind) -> [SpokenLine] {
+    switch kind {
+    case .king:
+      return [
+        SpokenLine(speaker: .king, text: "Keep this quiet and I may still survive the headlines.", pitch: 1.20, rate: 0.38, volume: 0.96),
+        SpokenLine(speaker: .king, text: "Stay calm. We can still broker a deal.", pitch: 1.16, rate: 0.36, volume: 0.94),
+      ]
+    case .queen:
+      return [
+        SpokenLine(speaker: .queen, text: "Power looks better on me, do you not think?", pitch: 0.72, rate: 0.28, volume: 0.94),
+        SpokenLine(speaker: .queen, text: "I could rule either side, but this one wears me well.", pitch: 0.70, rate: 0.27, volume: 0.92),
+      ]
+    case .bishop:
+      return [
+        SpokenLine(speaker: .bishop, text: "Only Christ can save us, so move with purpose.", pitch: 0.84, rate: 0.34, volume: 0.90),
+        SpokenLine(speaker: .bishop, text: "This diagonal is scripture. Read it carefully.", pitch: 0.86, rate: 0.35, volume: 0.88),
+      ]
+    case .knight:
+      return [
+        SpokenLine(speaker: .knight, text: "I smell panic. Let me off the leash.", pitch: 1.48, rate: 0.60, volume: 0.98),
+        SpokenLine(speaker: .knight, text: "I hunt crooked and strike hard.", pitch: 1.44, rate: 0.58, volume: 0.96),
+      ]
+    case .rook:
+      return [
+        SpokenLine(speaker: .rook, text: "This beast guards the file. Nothing escapes.", pitch: 1.34, rate: 0.48, volume: 1.0),
+        SpokenLine(speaker: .rook, text: "A wall with teeth still counts as a wall.", pitch: 1.30, rate: 0.46, volume: 0.98),
+      ]
+    case .pawn:
+      return [
+        SpokenLine(speaker: .pawn, text: "Forward. I was born for blood and promotion.", pitch: 0.98, rate: 0.43, volume: 0.86),
+        SpokenLine(speaker: .pawn, text: "I march first and I taste the danger first.", pitch: 0.96, rate: 0.41, volume: 0.84),
+      ]
+    }
+  }
+
+  private func speakRandomLine(from lines: [SpokenLine], priority: SpeechPriority) -> Bool {
+    guard let line = lines.randomElement() else {
+      return false
     }
 
     if priority == .urgent {
       _ = synthesizer.stopSpeaking(at: .immediate)
       utteranceCaptions.removeAll()
+    } else if synthesizer.isSpeaking {
+      return false
     }
 
-    for line in lines {
-      let utterance = AVSpeechUtterance(string: line.text)
-      utterance.voice = AVSpeechSynthesisVoice(language: "en-US")
-      utterance.pitchMultiplier = min(max(line.pitch ?? line.speaker.defaultPitch, 0.5), 2.0)
-      utterance.rate = min(max(line.rate ?? line.speaker.defaultRate, 0.1), 0.65)
-      utterance.volume = min(max(line.volume ?? line.speaker.defaultVolume, 0.0), 1.0)
-      utterance.preUtteranceDelay = 0.02
-      utteranceCaptions[ObjectIdentifier(utterance)] = Caption(
-        speaker: line.speaker.displayName,
-        line: line.text
-      )
-      synthesizer.speak(utterance)
-    }
+    let utterance = AVSpeechUtterance(string: line.text)
+    utterance.voice = AVSpeechSynthesisVoice(language: "en-US")
+    utterance.pitchMultiplier = min(max(line.pitch ?? line.speaker.defaultPitch, 0.5), 2.0)
+    utterance.rate = min(max(line.rate ?? line.speaker.defaultRate, 0.1), 0.65)
+    utterance.volume = min(max(line.volume ?? line.speaker.defaultVolume, 0.0), 1.0)
+    utterance.preUtteranceDelay = 0.02
+    utteranceCaptions[ObjectIdentifier(utterance)] = Caption(
+      speaker: line.speaker.displayName,
+      line: line.text
+    )
+    synthesizer.speak(utterance)
+    return true
   }
 }
 
