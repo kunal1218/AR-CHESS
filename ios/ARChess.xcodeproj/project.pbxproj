@@ -14,6 +14,8 @@
 		E2EE8B124FC651636B8420AF /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = FC383873315208CC48E623AB /* PrivacyInfo.xcprivacy */; };
 		F11748422D0307B40044C1D9 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = F11748412D0307B40044C1D9 /* AppDelegate.swift */; };
 		F84ACDC8CD493E1B02A2E598 /* ExpoModulesProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2877FCB4D0AD12C0BEB325CC /* ExpoModulesProvider.swift */; };
+		F9C6574201C748B4B3B30901 /* stockfish-nnue-16-single.js in Resources */ = {isa = PBXBuildFile; fileRef = F9C6574001C748B4B3B30901 /* stockfish-nnue-16-single.js */; };
+		F9C6574301C748B4B3B30901 /* stockfish-nnue-16-single.wasm in Resources */ = {isa = PBXBuildFile; fileRef = F9C6574101C748B4B3B30901 /* stockfish-nnue-16-single.wasm */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -29,6 +31,8 @@
 		ED297162215061F000B7C4FE /* JavaScriptCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = JavaScriptCore.framework; path = System/Library/Frameworks/JavaScriptCore.framework; sourceTree = SDKROOT; };
 		F11748412D0307B40044C1D9 /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = AppDelegate.swift; path = ARChess/AppDelegate.swift; sourceTree = "<group>"; };
 		F11748442D0722820044C1D9 /* ARChess-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = "ARChess-Bridging-Header.h"; path = "ARChess/ARChess-Bridging-Header.h"; sourceTree = "<group>"; };
+		F9C6574001C748B4B3B30901 /* stockfish-nnue-16-single.js */ = {isa = PBXFileReference; lastKnownFileType = text.javascript; path = "stockfish-nnue-16-single.js"; sourceTree = "<group>"; };
+		F9C6574101C748B4B3B30901 /* stockfish-nnue-16-single.wasm */ = {isa = PBXFileReference; lastKnownFileType = file; path = "stockfish-nnue-16-single.wasm"; sourceTree = "<group>"; };
 		FC383873315208CC48E623AB /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xml; name = PrivacyInfo.xcprivacy; path = ARChess/PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
@@ -50,6 +54,7 @@
 				F11748412D0307B40044C1D9 /* AppDelegate.swift */,
 				F11748442D0722820044C1D9 /* ARChess-Bridging-Header.h */,
 				BB2F792B24A3F905000567C9 /* Supporting */,
+				F9C6573F01C748B4B3B30901 /* Stockfish */,
 				13B07FB51A68108700A75B9A /* Images.xcassets */,
 				13B07FB61A68108700A75B9A /* Info.plist */,
 				AA286B85B6C04FC6940260E9 /* SplashScreen.storyboard */,
@@ -131,6 +136,16 @@
 			path = ARChess/Supporting;
 			sourceTree = "<group>";
 		};
+		F9C6573F01C748B4B3B30901 /* Stockfish */ = {
+			isa = PBXGroup;
+			children = (
+				F9C6574001C748B4B3B30901 /* stockfish-nnue-16-single.js */,
+				F9C6574101C748B4B3B30901 /* stockfish-nnue-16-single.wasm */,
+			);
+			name = Stockfish;
+			path = ARChess/Stockfish;
+			sourceTree = "<group>";
+		};
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
@@ -196,6 +211,8 @@
 				13B07FBF1A68108700A75B9A /* Images.xcassets in Resources */,
 				3E461D99554A48A4959DE609 /* SplashScreen.storyboard in Resources */,
 				E2EE8B124FC651636B8420AF /* PrivacyInfo.xcprivacy in Resources */,
+				F9C6574201C748B4B3B30901 /* stockfish-nnue-16-single.js in Resources */,
+				F9C6574301C748B4B3B30901 /* stockfish-nnue-16-single.wasm in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

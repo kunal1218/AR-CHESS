@@ -401,6 +401,14 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler {
   func analyze(fen: String, depth: Int = 10) async throws -> StockfishAnalysis {
     ensureWebView()
 
+    guard webView != nil else {
+      throw NSError(
+        domain: "ARChess.Stockfish",
+        code: -2,
+        userInfo: [NSLocalizedDescriptionKey: lastError ?? "Bundled Stockfish assets are unavailable."]
+      )
+    }
+
     let requestID = UUID().uuidString
     let requestScript = """
     window.__archessAnalyze(\(javaScriptStringLiteral(requestID)), \(javaScriptStringLiteral(fen)), \(depth));
@@ -492,6 +500,11 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler {
       return
     }
 
+    guard let stockfishDirectory = Self.stockfishDirectoryURL() else {
+      lastError = "Bundled Stockfish assets are missing from the app bundle."
+      return
+    }
+
     let userContentController = WKUserContentController()
     userContentController.add(self, name: messageHandlerName)
 
@@ -503,9 +516,13 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler {
     webView.isHidden = true
     webView.loadHTMLString(
       Self.stockfishBridgeHTML(messageHandlerName: messageHandlerName),
-      baseURL: URL(string: "https://unpkg.com")
+      baseURL: stockfishDirectory
     )
     self.webView = webView
+  }
+
+  private static func stockfishDirectoryURL() -> URL? {
+    Bundle.main.url(forResource: "stockfish-nnue-16-single", withExtension: "js")?.deletingLastPathComponent()
   }
 
   private func javaScriptStringLiteral(_ value: String) -> String {
@@ -537,7 +554,7 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler {
 
           function bootStockfish() {
             const script = document.createElement('script');
-            script.src = 'https://unpkg.com/stockfish@16.0.0/src/stockfish-nnue-16-single.js';
+            script.src = 'stockfish-nnue-16-single.js';
             script.async = true;
             script.onload = async () => {
               try {
