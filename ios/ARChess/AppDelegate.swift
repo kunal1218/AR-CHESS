@@ -1074,12 +1074,14 @@ private enum StockfishControllerState: String {
 private struct StockfishEngineConfig {
   var defaultMovetimeMs = 80
   var hardTimeoutMs = 600
-  // Cold boot inside a hidden WKWebView is slower than a normal search and should not share the same budget.
+  // Cold boot inside a WKWebView while ARKit is stabilizing is slower than a normal search
+  // and should not share the same budget.
   var startupTimeoutMs = 6_000
   var readyTimeoutMs = 1_500
   var threads = 1
   var hashMB = 16
   var strictFENValidation = false
+  var maxStartupRetries = 1
 }
 
 private struct StockfishSearchOptions {
@@ -1520,6 +1522,7 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
   private let config: StockfishEngineConfig
   private var webView: WKWebView?
   private var schemeHandler: StockfishAssetSchemeHandler?
+  private weak var hostView: UIView?
   private var engineState: StockfishControllerState = .initialize
   private var readyWaiters: [UUID: CheckedContinuation<Void, Error>] = [:]
   private var currentSearch: PendingSearch?
@@ -1527,6 +1530,7 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
   private var commandBuffer = FixedRingBuffer<String>(capacity: 50)
   private var lineBuffer = FixedRingBuffer<String>(capacity: 300)
   private var requestCounter = 0
+  private var startupRetryCount = 0
   private(set) var lastError: String?
   private(set) var lastStatus = "Stockfish idle."
 
@@ -1619,6 +1623,15 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
     evaluate(script: "window.__archessNewGame && window.__archessNewGame();") { _ in }
   }
 
+  func attach(to hostView: UIView) {
+    self.hostView = hostView
+    guard let webView else {
+      return
+    }
+
+    attachWebViewIfNeeded(webView, to: hostView)
+  }
+
   func reset() {
     timeoutTask?.cancel()
     timeoutTask = nil
@@ -1632,11 +1645,13 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
     lastError = nil
     lastStatus = "Stockfish idle."
     engineState = .initialize
+    startupRetryCount = 0
 
     if let webView {
       webView.configuration.userContentController.removeScriptMessageHandler(forName: messageHandlerName)
       webView.navigationDelegate = nil
       webView.stopLoading()
+      webView.removeFromSuperview()
     }
 
     webView = nil
@@ -1733,7 +1748,18 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
       throw makeError(lastError ?? "Bundled Stockfish assets are unavailable.", requestID: nil, fen: nil)
     }
 
-    try await waitUntilReady(timeoutMs: config.startupTimeoutMs)
+    do {
+      try await waitUntilReady(timeoutMs: config.startupTimeoutMs)
+    } catch {
+      guard startupRetryCount < config.maxStartupRetries else {
+        throw error
+      }
+
+      startupRetryCount += 1
+      Self.logger.error("Stockfish startup retry \(self.startupRetryCount, privacy: .public) after failure: \(self.lastStatus, privacy: .public)")
+      rebuildWebView(reason: "Retrying Stockfish startup...")
+      try await waitUntilReady(timeoutMs: config.startupTimeoutMs)
+    }
   }
 
   private func ensureWebView() {
@@ -1767,7 +1793,11 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
     configuration.setURLSchemeHandler(schemeHandler, forURLScheme: Self.scheme)
 
     let webView = WKWebView(frame: .zero, configuration: configuration)
-    webView.isHidden = true
+    webView.isOpaque = false
+    webView.backgroundColor = .clear
+    webView.scrollView.isScrollEnabled = false
+    webView.isUserInteractionEnabled = false
+    webView.alpha = 0.015
     webView.navigationDelegate = self
 
     self.webView = webView
@@ -1780,6 +1810,10 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
       lastError = "Could not form Stockfish bridge URL."
       engineState = .failed
       return
+    }
+
+    if let hostView {
+      attachWebViewIfNeeded(webView, to: hostView)
     }
 
     webView.load(URLRequest(url: indexURL))
@@ -1806,6 +1840,8 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
           let message = "Timed out waiting for readyok."
           self.lastError = message
           self.lastStatus = "Stockfish did not reach READY in \(timeoutMs)ms."
+          self.engineState = .failed
+          Self.logger.error("Stockfish ready timeout after \(timeoutMs, privacy: .public)ms. Diagnostics:\n\(self.dumpDiagnostics(), privacy: .public)")
           continuation.resume(
             throwing: self.makeError(message, requestID: self.currentSearch?.id, fen: self.currentSearch?.fen)
           )
@@ -1950,6 +1986,42 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
         completion(.success(()))
       }
     }
+  }
+
+  private func attachWebViewIfNeeded(_ webView: WKWebView, to hostView: UIView) {
+    guard webView.superview !== hostView else {
+      return
+    }
+
+    webView.removeFromSuperview()
+    webView.translatesAutoresizingMaskIntoConstraints = false
+    hostView.addSubview(webView)
+    NSLayoutConstraint.activate([
+      webView.widthAnchor.constraint(equalToConstant: 2),
+      webView.heightAnchor.constraint(equalToConstant: 2),
+      webView.trailingAnchor.constraint(equalTo: hostView.trailingAnchor, constant: -2),
+      webView.bottomAnchor.constraint(equalTo: hostView.bottomAnchor, constant: -2),
+    ])
+  }
+
+  private func rebuildWebView(reason: String) {
+    if let webView {
+      webView.configuration.userContentController.removeScriptMessageHandler(forName: messageHandlerName)
+      webView.navigationDelegate = nil
+      webView.stopLoading()
+      webView.removeFromSuperview()
+    }
+
+    webView = nil
+    schemeHandler = nil
+    readyWaiters.removeAll()
+    currentSearch = nil
+    timeoutTask?.cancel()
+    timeoutTask = nil
+    engineState = .initialize
+    lastError = nil
+    lastStatus = reason
+    ensureWebView()
   }
 
   private func jsonLiteral(_ payload: Any) -> String {
@@ -2338,6 +2410,10 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   override init() {
     super.init()
     synthesizer.delegate = self
+  }
+
+  func attachEngineHost(to view: UIView) {
+    analyzer.attach(to: view)
   }
 
   func prepare(with state: ChessGameState, force: Bool = false) async {
@@ -4409,6 +4485,9 @@ private struct NativeARView: UIViewRepresentable {
       arView.automaticallyConfigureSession = false
       arView.environment.background = .cameraFeed()
       arView.renderOptions.insert(.disableMotionBlur)
+      Task { @MainActor [weak self] in
+        self?.commentary.attachEngineHost(to: arView)
+      }
       noteWarmupStatus("Waiting for board placement before warming Stockfish...")
 
       let tapRecognizer = UITapGestureRecognizer(target: self, action: #selector(handleTap(_:)))
@@ -4420,12 +4499,9 @@ private struct NativeARView: UIViewRepresentable {
 
       let configuration = ARWorldTrackingConfiguration()
       configuration.planeDetection = [.horizontal]
-      configuration.environmentTexturing = .automatic
+      configuration.environmentTexturing = .none
 
-      if ARWorldTrackingConfiguration.supportsSceneReconstruction(.meshWithClassification) {
-        configuration.sceneReconstruction = .meshWithClassification
-        arView.environment.sceneUnderstanding.options.insert(.occlusion)
-      } else if ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh) {
+      if ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh) {
         configuration.sceneReconstruction = .mesh
         arView.environment.sceneUnderstanding.options.insert(.occlusion)
       }
@@ -4888,7 +4964,7 @@ private struct NativeARView: UIViewRepresentable {
 
       if boardAnchor == nil {
         noteWarmupStatus("Waiting for board placement before warming Stockfish...")
-      } else if stableTrackingFrames < 30 {
+      } else if stableTrackingFrames < 60 {
         noteWarmupStatus("Waiting for AR tracking to stabilize before warming Stockfish...")
       } else {
         maybeScheduleInitialAnalysis()
@@ -4904,7 +4980,7 @@ private struct NativeARView: UIViewRepresentable {
         return
       }
 
-      guard stableTrackingFrames >= 30 else {
+      guard stableTrackingFrames >= 60 else {
         return
       }
 
@@ -4912,12 +4988,12 @@ private struct NativeARView: UIViewRepresentable {
       noteWarmupStatus("Tracking stable. Warming local Stockfish...")
       initialAnalysisTask?.cancel()
       initialAnalysisTask = Task { @MainActor [weak self] in
-        try? await Task.sleep(nanoseconds: 1_500_000_000)
+        try? await Task.sleep(nanoseconds: 2_500_000_000)
         guard let self else {
           return
         }
 
-        guard self.boardAnchor != nil, self.stableTrackingFrames >= 30 else {
+        guard self.boardAnchor != nil, self.stableTrackingFrames >= 60 else {
           self.hasScheduledInitialAnalysis = false
           self.noteWarmupStatus("AR tracking slipped. Waiting to warm Stockfish again...")
           return
