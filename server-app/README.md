@@ -1,12 +1,12 @@
 # server-app
 
-Backend skeleton owned by Person 1.
+Backend owned by Person 1.
 
 ## Scope
 
-- FastAPI service scaffold only
-- Health ping endpoint for app/server/Postgres verification
-- No business logic yet
+- FastAPI service for health checks and match move logging
+- Postgres-backed `games` and `game_moves` tables
+- UCI move notation for Stockfish-compatible consumers
 
 ## Local run
 
@@ -26,3 +26,17 @@ Backend skeleton owned by Person 1.
 - Returns:
   - `Server ping successful`
   - `Postgres ping successful`
+
+## Match move log
+
+- `POST /v1/games`
+  - Creates a new server-backed game log and returns `game_id`
+- `POST /v1/games/{game_id}/moves`
+  - Request body:
+    - `ply`
+    - `move_uci`
+  - `move_uci` must use UCI notation like `e2e4`, `e1g1`, or `e7e8q`
+- `GET /v1/games/{game_id}/moves`
+  - Returns the ordered move log for that game
+
+Moves are stored in Postgres table `game_moves`, keyed by `game_id` and `ply`.

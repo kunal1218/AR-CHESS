@@ -82,6 +82,40 @@
         "info": "object"
       },
       "notes": "Used by the Expo client to verify LAN connectivity from an iPhone."
+    },
+    {
+      "name": "create_game_log",
+      "method": "POST",
+      "path": "/v1/games",
+      "response": {
+        "game_id": "string"
+      },
+      "notes": "Creates a server-backed match log. Move notation uses UCI for Stockfish compatibility."
+    },
+    {
+      "name": "record_game_move",
+      "method": "POST",
+      "path": "/v1/games/{game_id}/moves",
+      "request": {
+        "ply": "number",
+        "move_uci": "string"
+      },
+      "response": {
+        "game_id": "string",
+        "ply": "number",
+        "move_uci": "string",
+        "created_at": "string"
+      },
+      "notes": "Accepts UCI moves like e2e4, e1g1, and e7e8q."
+    },
+    {
+      "name": "get_game_moves",
+      "method": "GET",
+      "path": "/v1/games/{game_id}/moves",
+      "response": {
+        "game_id": "string",
+        "moves": "GameMove[]"
+      }
     }
   ],
   "events": [],
@@ -117,6 +151,15 @@
         "cloud_anchor_id": "string",
         "pose": "Pose",
         "active": "boolean"
+      }
+    },
+    {
+      "name": "GameMove",
+      "fields": {
+        "game_id": "string",
+        "ply": "number",
+        "move_uci": "string",
+        "created_at": "string"
       }
     }
   ]

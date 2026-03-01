@@ -1,4 +1,5 @@
 import ARKit
+import Foundation
 import RealityKit
 import SwiftUI
 import UIKit
@@ -51,6 +52,216 @@ private enum NativeScreen {
   case landing
   case lobby(PlayerMode)
   case experience(PlayerMode)
+}
+
+private struct AppRuntimeConfig {
+  let apiBaseURL: URL?
+
+  static let current = AppRuntimeConfig()
+
+  init() {
+    let sources = [
+      Bundle.main.object(forInfoDictionaryKey: "ARChessAPIBaseURL") as? String,
+      ProcessInfo.processInfo.environment["AR_CHESS_API_BASE_URL"],
+    ]
+
+    for candidate in sources {
+      guard let candidate else {
+        continue
+      }
+
+      let trimmed = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+      guard !trimmed.isEmpty, let url = URL(string: trimmed) else {
+        continue
+      }
+
+      apiBaseURL = url.deletingTrailingSlash()
+      return
+    }
+
+    apiBaseURL = nil
+  }
+}
+
+private struct RemoteGameResponse: Decodable {
+  let game_id: String
+}
+
+private struct RemoteMoveRequest: Encodable {
+  let ply: Int
+  let move_uci: String
+}
+
+@MainActor
+private final class MatchLogStore: ObservableObject {
+  struct Entry: Identifiable {
+    let id = UUID()
+    let ply: Int
+    let color: ChessColor
+    let moveUCI: String
+    var isSynced = false
+    var syncError: String?
+
+    var label: String {
+      let moveNumber = (ply + 1) / 2
+      switch color {
+      case .white:
+        return "\(moveNumber). \(moveUCI)"
+      case .black:
+        return "\(moveNumber)... \(moveUCI)"
+      }
+    }
+
+    var statusLabel: String {
+      if isSynced {
+        return "saved"
+      }
+
+      if syncError != nil {
+        return "retrying"
+      }
+
+      return "pending"
+    }
+  }
+
+  @Published private(set) var entries: [Entry] = []
+  @Published private(set) var syncStatus = "Moves stay local until ARChessAPIBaseURL is set."
+  @Published private(set) var remoteGameID: String?
+
+  private let apiBaseURL: URL?
+
+  init(apiBaseURL: URL? = AppRuntimeConfig.current.apiBaseURL) {
+    self.apiBaseURL = apiBaseURL
+  }
+
+  func prepareRemoteGameIfNeeded() async {
+    guard remoteGameID == nil else {
+      return
+    }
+
+    guard let apiBaseURL else {
+      syncStatus = "Moves are logging locally only. Set ARChessAPIBaseURL to sync to Railway."
+      return
+    }
+
+    do {
+      let game = try await createRemoteGame(baseURL: apiBaseURL)
+      remoteGameID = game.game_id
+      syncStatus = "Connected to Railway game log \(game.game_id.prefix(8))."
+    } catch {
+      syncStatus = "Railway sync unavailable: \(error.localizedDescription)"
+    }
+  }
+
+  func recordMove(_ moveUCI: String, color: ChessColor) {
+    let entry = Entry(ply: entries.count + 1, color: color, moveUCI: moveUCI)
+    entries.append(entry)
+
+    Task {
+      await persistEntry(withID: entry.id)
+    }
+  }
+
+  func resetSession() {
+    entries = []
+    remoteGameID = nil
+    syncStatus = "Moves stay local until ARChessAPIBaseURL is set."
+  }
+
+  private func persistEntry(withID entryID: UUID) async {
+    guard let entryIndex = entries.firstIndex(where: { $0.id == entryID }) else {
+      return
+    }
+
+    guard let apiBaseURL else {
+      return
+    }
+
+    await prepareRemoteGameIfNeeded()
+
+    guard let remoteGameID else {
+      entries[entryIndex].syncError = "No remote game ID"
+      return
+    }
+
+    do {
+      try await saveMove(
+        baseURL: apiBaseURL,
+        gameID: remoteGameID,
+        entry: entries[entryIndex]
+      )
+      entries[entryIndex].isSynced = true
+      entries[entryIndex].syncError = nil
+      syncStatus = "Saved \(entries[entryIndex].moveUCI) to Railway and Postgres."
+    } catch {
+      entries[entryIndex].syncError = error.localizedDescription
+      syncStatus = "Move log sync failed: \(error.localizedDescription)"
+    }
+  }
+
+  private func createRemoteGame(baseURL: URL) async throws -> RemoteGameResponse {
+    var request = URLRequest(
+      url: baseURL
+        .appendingPathComponent("v1")
+        .appendingPathComponent("games")
+    )
+    request.httpMethod = "POST"
+    request.setValue("application/json", forHTTPHeaderField: "Accept")
+
+    let (data, response) = try await URLSession.shared.data(for: request)
+    try validate(response: response, data: data)
+    return try JSONDecoder().decode(RemoteGameResponse.self, from: data)
+  }
+
+  private func saveMove(baseURL: URL, gameID: String, entry: Entry) async throws {
+    var request = URLRequest(
+      url: baseURL
+        .appendingPathComponent("v1")
+        .appendingPathComponent("games")
+        .appendingPathComponent(gameID)
+        .appendingPathComponent("moves")
+    )
+    request.httpMethod = "POST"
+    request.setValue("application/json", forHTTPHeaderField: "Accept")
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.httpBody = try JSONEncoder().encode(
+      RemoteMoveRequest(ply: entry.ply, move_uci: entry.moveUCI)
+    )
+
+    let (data, response) = try await URLSession.shared.data(for: request)
+    try validate(response: response, data: data)
+  }
+
+  private func validate(response: URLResponse, data: Data) throws {
+    guard let httpResponse = response as? HTTPURLResponse else {
+      throw NSError(
+        domain: "ARChess",
+        code: -1,
+        userInfo: [NSLocalizedDescriptionKey: "Missing HTTP response from move log server."]
+      )
+    }
+
+    guard (200..<300).contains(httpResponse.statusCode) else {
+      let message = String(data: data, encoding: .utf8) ?? "Unexpected server response."
+      throw NSError(
+        domain: "ARChess",
+        code: httpResponse.statusCode,
+        userInfo: [NSLocalizedDescriptionKey: message]
+      )
+    }
+  }
+}
+
+private extension URL {
+  func deletingTrailingSlash() -> URL {
+    let raw = absoluteString
+    guard raw.hasSuffix("/") else {
+      return self
+    }
+
+    return URL(string: String(raw.dropLast())) ?? self
+  }
 }
 
 private struct ARChessRootView: View {
@@ -221,10 +432,11 @@ private struct LobbyView: View {
 private struct NativeARExperienceView: View {
   let mode: PlayerMode
   let closeExperience: () -> Void
+  @StateObject private var matchLog = MatchLogStore()
 
   var body: some View {
     ZStack {
-      NativeARView()
+      NativeARView(matchLog: matchLog)
         .ignoresSafeArea()
 
       LinearGradient(
@@ -237,6 +449,7 @@ private struct NativeARExperienceView: View {
         endPoint: .bottom
       )
       .ignoresSafeArea()
+      .allowsHitTesting(false)
 
       VStack(spacing: 16) {
         VStack(alignment: .leading, spacing: 10) {
@@ -249,7 +462,7 @@ private struct NativeARExperienceView: View {
             .font(.system(size: 30, weight: .heavy, design: .rounded))
             .foregroundStyle(.white)
 
-          Text("RealityKit and ARKit are running inside the iOS app. Scan a clear table and the board will settle closer to you for a higher-angle playing view.")
+          Text("RealityKit and ARKit are running inside the iOS app. Tap a piece, then tap a highlighted square to move it. Legal moves log in UCI and sync to Railway when ARChessAPIBaseURL is configured.")
             .font(.system(size: 15, weight: .medium, design: .rounded))
             .foregroundStyle(Color.white.opacity(0.86))
             .lineSpacing(3)
@@ -260,36 +473,81 @@ private struct NativeARExperienceView: View {
           RoundedRectangle(cornerRadius: 26, style: .continuous)
             .fill(.ultraThinMaterial)
         )
+        .allowsHitTesting(false)
 
         Spacer()
 
-        VStack(alignment: .leading, spacing: 10) {
-          Text("Native only")
-            .font(.system(size: 12, weight: .bold, design: .rounded))
-            .tracking(1.8)
-            .foregroundStyle(Color(red: 0.88, green: 0.82, blue: 0.70))
+        ZStack(alignment: .bottom) {
+          VStack(alignment: .leading, spacing: 10) {
+            Text("Match log")
+              .font(.system(size: 12, weight: .bold, design: .rounded))
+              .tracking(1.8)
+              .foregroundStyle(Color(red: 0.88, green: 0.82, blue: 0.70))
 
-          Text("The board now waits for a clear table-sized surface and uses native placeholder pieces until real assets are added.")
-            .font(.system(size: 15, weight: .medium, design: .rounded))
-            .foregroundStyle(Color.white.opacity(0.86))
+            Text(matchLog.syncStatus)
+              .font(.system(size: 15, weight: .medium, design: .rounded))
+              .foregroundStyle(Color.white.opacity(0.86))
+
+            if let remoteGameID = matchLog.remoteGameID {
+              Text("Game ID: \(remoteGameID)")
+                .font(.system(size: 12, weight: .semibold, design: .rounded))
+                .foregroundStyle(Color.white.opacity(0.62))
+                .textSelection(.enabled)
+            }
+
+            if matchLog.entries.isEmpty {
+              Text("Make a legal move to start the UCI move log.")
+                .font(.system(size: 14, weight: .medium, design: .rounded))
+                .foregroundStyle(Color.white.opacity(0.72))
+            } else {
+              ForEach(Array(matchLog.entries.suffix(6))) { entry in
+                HStack(alignment: .firstTextBaseline, spacing: 12) {
+                  Text(entry.label)
+                    .font(.system(size: 14, weight: .bold, design: .monospaced))
+                    .foregroundStyle(.white)
+
+                  Spacer(minLength: 0)
+
+                  Text(entry.statusLabel)
+                    .font(.system(size: 11, weight: .bold, design: .rounded))
+                    .tracking(1.1)
+                    .foregroundStyle(
+                      entry.isSynced
+                        ? Color(red: 0.57, green: 0.90, blue: 0.68)
+                        : Color(red: 0.93, green: 0.78, blue: 0.54)
+                    )
+                }
+              }
+            }
+          }
+          .frame(maxWidth: .infinity, alignment: .leading)
+          .padding(.top, 18)
+          .padding(.horizontal, 18)
+          .padding(.bottom, 116)
+          .background(
+            RoundedRectangle(cornerRadius: 24, style: .continuous)
+              .fill(Color(red: 0.05, green: 0.07, blue: 0.10).opacity(0.82))
+              .overlay(
+                RoundedRectangle(cornerRadius: 24, style: .continuous)
+                  .stroke(Color.white.opacity(0.14), lineWidth: 1)
+              )
+          )
+          .allowsHitTesting(false)
 
           NativeActionButton(title: "Exit AR", style: .solid) {
             closeExperience()
           }
+          .padding(18)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(18)
-        .background(
-          RoundedRectangle(cornerRadius: 24, style: .continuous)
-            .fill(Color(red: 0.05, green: 0.07, blue: 0.10).opacity(0.82))
-            .overlay(
-              RoundedRectangle(cornerRadius: 24, style: .continuous)
-                .stroke(Color.white.opacity(0.14), lineWidth: 1)
-            )
-        )
       }
       .padding(.horizontal, 18)
       .padding(.vertical, 24)
+    }
+    .task {
+      await matchLog.prepareRemoteGameIfNeeded()
+    }
+    .onDisappear {
+      matchLog.resetSession()
     }
   }
 }
@@ -393,9 +651,533 @@ private struct NativeActionButton: View {
   }
 }
 
+private enum ChessColor {
+  case white
+  case black
+
+  var opponent: ChessColor {
+    switch self {
+    case .white:
+      return .black
+    case .black:
+      return .white
+    }
+  }
+}
+
+private enum ChessPieceKind {
+  case pawn
+  case rook
+  case knight
+  case bishop
+  case queen
+  case king
+}
+
+private struct BoardSquare: Hashable {
+  let file: Int
+  let rank: Int
+
+  var isValid: Bool {
+    (0..<8).contains(file) && (0..<8).contains(rank)
+  }
+
+  var algebraic: String {
+    let fileScalar = UnicodeScalar(97 + file) ?? UnicodeScalar(97)!
+    return "\(Character(fileScalar))\(rank + 1)"
+  }
+
+  func offset(file deltaFile: Int, rank deltaRank: Int) -> BoardSquare? {
+    let target = BoardSquare(file: file + deltaFile, rank: rank + deltaRank)
+    return target.isValid ? target : nil
+  }
+}
+
+private struct ChessPieceState {
+  var color: ChessColor
+  var kind: ChessPieceKind
+}
+
+private struct CastlingRights {
+  var whiteKingside = true
+  var whiteQueenside = true
+  var blackKingside = true
+  var blackQueenside = true
+}
+
+private struct ChessMove {
+  let from: BoardSquare
+  let to: BoardSquare
+  let piece: ChessPieceState
+  var captured: ChessPieceState?
+  var isEnPassant = false
+  var rookMove: (from: BoardSquare, to: BoardSquare)?
+  var promotion: ChessPieceKind?
+
+  var uciString: String {
+    let promotionSuffix: String
+    if let promotion {
+      switch promotion {
+      case .queen:
+        promotionSuffix = "q"
+      case .rook:
+        promotionSuffix = "r"
+      case .bishop:
+        promotionSuffix = "b"
+      case .knight:
+        promotionSuffix = "n"
+      default:
+        promotionSuffix = ""
+      }
+    } else {
+      promotionSuffix = ""
+    }
+
+    return from.algebraic + to.algebraic + promotionSuffix
+  }
+}
+
+private struct ChessGameState {
+  var board: [BoardSquare: ChessPieceState]
+  var turn: ChessColor
+  var castlingRights: CastlingRights
+  var enPassantTarget: BoardSquare?
+
+  static func initial() -> ChessGameState {
+    let backRank: [ChessPieceKind] = [.rook, .knight, .bishop, .queen, .king, .bishop, .knight, .rook]
+    var board: [BoardSquare: ChessPieceState] = [:]
+
+    for file in 0..<8 {
+      board[BoardSquare(file: file, rank: 0)] = ChessPieceState(color: .white, kind: backRank[file])
+      board[BoardSquare(file: file, rank: 1)] = ChessPieceState(color: .white, kind: .pawn)
+      board[BoardSquare(file: file, rank: 6)] = ChessPieceState(color: .black, kind: .pawn)
+      board[BoardSquare(file: file, rank: 7)] = ChessPieceState(color: .black, kind: backRank[file])
+    }
+
+    return ChessGameState(
+      board: board,
+      turn: .white,
+      castlingRights: CastlingRights(),
+      enPassantTarget: nil
+    )
+  }
+
+  func piece(at square: BoardSquare) -> ChessPieceState? {
+    board[square]
+  }
+
+  func legalMoves(from square: BoardSquare) -> [ChessMove] {
+    guard let piece = board[square], piece.color == turn else {
+      return []
+    }
+
+    return pseudoLegalMoves(from: square, piece: piece).filter { move in
+      !applying(move).isInCheck(for: piece.color)
+    }
+  }
+
+  func legalMove(from: BoardSquare, to: BoardSquare) -> ChessMove? {
+    legalMoves(from: from).first { $0.to == to }
+  }
+
+  func applying(_ move: ChessMove) -> ChessGameState {
+    var next = self
+    var movingPiece = move.piece
+
+    next.board[move.from] = nil
+
+    if move.isEnPassant {
+      let capturedRank = move.piece.color == .white ? move.to.rank - 1 : move.to.rank + 1
+      next.board[BoardSquare(file: move.to.file, rank: capturedRank)] = nil
+    } else if move.captured != nil {
+      next.board[move.to] = nil
+    }
+
+    if let rookMove = move.rookMove, let rookPiece = next.board[rookMove.from] {
+      next.board[rookMove.from] = nil
+      next.board[rookMove.to] = rookPiece
+    }
+
+    if let promotion = move.promotion {
+      movingPiece.kind = promotion
+    }
+
+    next.board[move.to] = movingPiece
+    next.enPassantTarget = nil
+
+    if move.piece.kind == .pawn, abs(move.to.rank - move.from.rank) == 2 {
+      next.enPassantTarget = BoardSquare(file: move.from.file, rank: (move.from.rank + move.to.rank) / 2)
+    }
+
+    next.updateCastlingRights(for: move)
+    next.turn = turn.opponent
+    return next
+  }
+
+  func isInCheck(for color: ChessColor) -> Bool {
+    guard let kingSquare = board.first(where: { $0.value.color == color && $0.value.kind == .king })?.key else {
+      return false
+    }
+
+    return isSquareAttacked(kingSquare, by: color.opponent)
+  }
+
+  private func pseudoLegalMoves(from square: BoardSquare, piece: ChessPieceState) -> [ChessMove] {
+    switch piece.kind {
+    case .pawn:
+      return pawnMoves(from: square, piece: piece)
+    case .knight:
+      return stepMoves(
+        from: square,
+        piece: piece,
+        deltas: [
+          (1, 2), (2, 1), (2, -1), (1, -2),
+          (-1, -2), (-2, -1), (-2, 1), (-1, 2),
+        ]
+      )
+    case .bishop:
+      return slidingMoves(
+        from: square,
+        piece: piece,
+        directions: [(1, 1), (1, -1), (-1, -1), (-1, 1)]
+      )
+    case .rook:
+      return slidingMoves(
+        from: square,
+        piece: piece,
+        directions: [(1, 0), (-1, 0), (0, 1), (0, -1)]
+      )
+    case .queen:
+      return slidingMoves(
+        from: square,
+        piece: piece,
+        directions: [
+          (1, 1), (1, -1), (-1, -1), (-1, 1),
+          (1, 0), (-1, 0), (0, 1), (0, -1),
+        ]
+      )
+    case .king:
+      return kingMoves(from: square, piece: piece)
+    }
+  }
+
+  private func pawnMoves(from square: BoardSquare, piece: ChessPieceState) -> [ChessMove] {
+    let direction = piece.color == .white ? 1 : -1
+    let startRank = piece.color == .white ? 1 : 6
+    let promotionRank = piece.color == .white ? 7 : 0
+    var moves: [ChessMove] = []
+
+    if let oneForward = square.offset(file: 0, rank: direction), board[oneForward] == nil {
+      moves.append(
+        ChessMove(
+          from: square,
+          to: oneForward,
+          piece: piece,
+          captured: nil,
+          isEnPassant: false,
+          rookMove: nil,
+          promotion: oneForward.rank == promotionRank ? .queen : nil
+        )
+      )
+
+      if square.rank == startRank,
+         let twoForward = square.offset(file: 0, rank: direction * 2),
+         board[twoForward] == nil {
+        moves.append(ChessMove(from: square, to: twoForward, piece: piece))
+      }
+    }
+
+    for deltaFile in [-1, 1] {
+      guard let target = square.offset(file: deltaFile, rank: direction) else {
+        continue
+      }
+
+      if let captured = board[target], captured.color != piece.color {
+        moves.append(
+          ChessMove(
+            from: square,
+            to: target,
+            piece: piece,
+            captured: captured,
+            isEnPassant: false,
+            rookMove: nil,
+            promotion: target.rank == promotionRank ? .queen : nil
+          )
+        )
+      } else if target == enPassantTarget {
+        let capturedSquare = BoardSquare(file: target.file, rank: square.rank)
+        if let captured = board[capturedSquare], captured.color != piece.color, captured.kind == .pawn {
+          moves.append(
+            ChessMove(
+              from: square,
+              to: target,
+              piece: piece,
+              captured: captured,
+              isEnPassant: true,
+              rookMove: nil,
+              promotion: nil
+            )
+          )
+        }
+      }
+    }
+
+    return moves
+  }
+
+  private func stepMoves(
+    from square: BoardSquare,
+    piece: ChessPieceState,
+    deltas: [(Int, Int)]
+  ) -> [ChessMove] {
+    deltas.compactMap { deltaFile, deltaRank in
+      guard let target = square.offset(file: deltaFile, rank: deltaRank) else {
+        return nil
+      }
+
+      if let occupant = board[target] {
+        guard occupant.color != piece.color else {
+          return nil
+        }
+
+        return ChessMove(from: square, to: target, piece: piece, captured: occupant)
+      }
+
+      return ChessMove(from: square, to: target, piece: piece)
+    }
+  }
+
+  private func slidingMoves(
+    from square: BoardSquare,
+    piece: ChessPieceState,
+    directions: [(Int, Int)]
+  ) -> [ChessMove] {
+    var moves: [ChessMove] = []
+
+    for (deltaFile, deltaRank) in directions {
+      var current = square
+
+      while let next = current.offset(file: deltaFile, rank: deltaRank) {
+        if let occupant = board[next] {
+          if occupant.color != piece.color {
+            moves.append(ChessMove(from: square, to: next, piece: piece, captured: occupant))
+          }
+          break
+        }
+
+        moves.append(ChessMove(from: square, to: next, piece: piece))
+        current = next
+      }
+    }
+
+    return moves
+  }
+
+  private func kingMoves(from square: BoardSquare, piece: ChessPieceState) -> [ChessMove] {
+    var moves = stepMoves(
+      from: square,
+      piece: piece,
+      deltas: [
+        (-1, -1), (-1, 0), (-1, 1),
+        (0, -1),           (0, 1),
+        (1, -1),  (1, 0),  (1, 1),
+      ]
+    )
+
+    guard !isInCheck(for: piece.color) else {
+      return moves
+    }
+
+    let homeRank = piece.color == .white ? 0 : 7
+    let kingsideRookSquare = BoardSquare(file: 7, rank: homeRank)
+    let queensideRookSquare = BoardSquare(file: 0, rank: homeRank)
+    let kingStartSquare = BoardSquare(file: 4, rank: homeRank)
+
+    guard square == kingStartSquare else {
+      return moves
+    }
+
+    let opponent = piece.color.opponent
+
+    if canCastleKingside(for: piece.color),
+       board[BoardSquare(file: 5, rank: homeRank)] == nil,
+       board[BoardSquare(file: 6, rank: homeRank)] == nil,
+       board[kingsideRookSquare]?.kind == .rook,
+       board[kingsideRookSquare]?.color == piece.color,
+       !isSquareAttacked(BoardSquare(file: 5, rank: homeRank), by: opponent),
+       !isSquareAttacked(BoardSquare(file: 6, rank: homeRank), by: opponent) {
+      moves.append(
+        ChessMove(
+          from: square,
+          to: BoardSquare(file: 6, rank: homeRank),
+          piece: piece,
+          captured: nil,
+          isEnPassant: false,
+          rookMove: (
+            from: kingsideRookSquare,
+            to: BoardSquare(file: 5, rank: homeRank)
+          ),
+          promotion: nil
+        )
+      )
+    }
+
+    if canCastleQueenside(for: piece.color),
+       board[BoardSquare(file: 1, rank: homeRank)] == nil,
+       board[BoardSquare(file: 2, rank: homeRank)] == nil,
+       board[BoardSquare(file: 3, rank: homeRank)] == nil,
+       board[queensideRookSquare]?.kind == .rook,
+       board[queensideRookSquare]?.color == piece.color,
+       !isSquareAttacked(BoardSquare(file: 3, rank: homeRank), by: opponent),
+       !isSquareAttacked(BoardSquare(file: 2, rank: homeRank), by: opponent) {
+      moves.append(
+        ChessMove(
+          from: square,
+          to: BoardSquare(file: 2, rank: homeRank),
+          piece: piece,
+          captured: nil,
+          isEnPassant: false,
+          rookMove: (
+            from: queensideRookSquare,
+            to: BoardSquare(file: 3, rank: homeRank)
+          ),
+          promotion: nil
+        )
+      )
+    }
+
+    return moves
+  }
+
+  private func canCastleKingside(for color: ChessColor) -> Bool {
+    switch color {
+    case .white:
+      return castlingRights.whiteKingside
+    case .black:
+      return castlingRights.blackKingside
+    }
+  }
+
+  private func canCastleQueenside(for color: ChessColor) -> Bool {
+    switch color {
+    case .white:
+      return castlingRights.whiteQueenside
+    case .black:
+      return castlingRights.blackQueenside
+    }
+  }
+
+  private func isSquareAttacked(_ target: BoardSquare, by attacker: ChessColor) -> Bool {
+    for (origin, piece) in board where piece.color == attacker {
+      switch piece.kind {
+      case .pawn:
+        let direction = piece.color == .white ? 1 : -1
+        if origin.offset(file: -1, rank: direction) == target || origin.offset(file: 1, rank: direction) == target {
+          return true
+        }
+      case .knight:
+        let offsets = [
+          (1, 2), (2, 1), (2, -1), (1, -2),
+          (-1, -2), (-2, -1), (-2, 1), (-1, 2),
+        ]
+        if offsets.contains(where: { origin.offset(file: $0.0, rank: $0.1) == target }) {
+          return true
+        }
+      case .bishop:
+        if attacksAlongDirections(from: origin, target: target, directions: [(1, 1), (1, -1), (-1, -1), (-1, 1)]) {
+          return true
+        }
+      case .rook:
+        if attacksAlongDirections(from: origin, target: target, directions: [(1, 0), (-1, 0), (0, 1), (0, -1)]) {
+          return true
+        }
+      case .queen:
+        if attacksAlongDirections(
+          from: origin,
+          target: target,
+          directions: [
+            (1, 1), (1, -1), (-1, -1), (-1, 1),
+            (1, 0), (-1, 0), (0, 1), (0, -1),
+          ]
+        ) {
+          return true
+        }
+      case .king:
+        if abs(origin.file - target.file) <= 1, abs(origin.rank - target.rank) <= 1 {
+          return true
+        }
+      }
+    }
+
+    return false
+  }
+
+  private func attacksAlongDirections(
+    from origin: BoardSquare,
+    target: BoardSquare,
+    directions: [(Int, Int)]
+  ) -> Bool {
+    for (deltaFile, deltaRank) in directions {
+      var current = origin
+
+      while let next = current.offset(file: deltaFile, rank: deltaRank) {
+        if next == target {
+          return true
+        }
+
+        if board[next] != nil {
+          break
+        }
+
+        current = next
+      }
+    }
+
+    return false
+  }
+
+  private mutating func updateCastlingRights(for move: ChessMove) {
+    if move.piece.kind == .king {
+      switch move.piece.color {
+      case .white:
+        castlingRights.whiteKingside = false
+        castlingRights.whiteQueenside = false
+      case .black:
+        castlingRights.blackKingside = false
+        castlingRights.blackQueenside = false
+      }
+    }
+
+    if move.piece.kind == .rook {
+      revokeRookCastlingRight(at: move.from)
+    }
+
+    if move.captured?.kind == .rook, !move.isEnPassant {
+      revokeRookCastlingRight(at: move.to)
+    }
+  }
+
+  private mutating func revokeRookCastlingRight(at square: BoardSquare) {
+    switch (square.file, square.rank) {
+    case (0, 0):
+      castlingRights.whiteQueenside = false
+    case (7, 0):
+      castlingRights.whiteKingside = false
+    case (0, 7):
+      castlingRights.blackQueenside = false
+    case (7, 7):
+      castlingRights.blackKingside = false
+    default:
+      break
+    }
+  }
+}
+
 private struct NativeARView: UIViewRepresentable {
+  @ObservedObject var matchLog: MatchLogStore
+
   func makeCoordinator() -> Coordinator {
-    Coordinator()
+    Coordinator(matchLog: matchLog)
   }
 
   func makeUIView(context: Context) -> ARView {
@@ -409,15 +1191,30 @@ private struct NativeARView: UIViewRepresentable {
   final class Coordinator: NSObject, ARSessionDelegate {
     private let boardSize: Float = 0.40
     private let boardInset: Float = 0.08
+    private let matchLog: MatchLogStore
     private weak var arView: ARView?
     private var boardAnchor: AnchorEntity?
+    private var boardWorldTransform: simd_float4x4?
+    private var boardRoot = Entity()
+    private var piecesContainer = Entity()
+    private var highlightsContainer = Entity()
     private var trackedPlaneID: UUID?
+    private var gameState = ChessGameState.initial()
+    private var selectedSquare: BoardSquare?
+    private var selectedMoves: [ChessMove] = []
+
+    init(matchLog: MatchLogStore) {
+      self.matchLog = matchLog
+    }
 
     func configure(_ arView: ARView) {
       self.arView = arView
       arView.automaticallyConfigureSession = false
       arView.environment.background = .cameraFeed()
       arView.renderOptions.insert(.disableMotionBlur)
+
+      let tapRecognizer = UITapGestureRecognizer(target: self, action: #selector(handleTap(_:)))
+      arView.addGestureRecognizer(tapRecognizer)
 
       guard ARWorldTrackingConfiguration.isSupported else {
         return
@@ -470,8 +1267,147 @@ private struct NativeARView: UIViewRepresentable {
       updateBoardPlacement(session: session, anchors: anchors)
     }
 
+    @objc
+    private func handleTap(_ recognizer: UITapGestureRecognizer) {
+      guard let arView else {
+        return
+      }
+
+      let location = recognizer.location(in: arView)
+
+      if let entity = arView.entity(at: location) {
+        if let square = square(for: entity, prefix: "piece") {
+          handleTapOnPiece(at: square)
+          return
+        }
+
+        if let square = square(for: entity, prefix: "square") {
+          handleTapOnSquare(square)
+          return
+        }
+      }
+
+      guard let square = boardSquare(at: location, in: arView) else {
+        clearSelection()
+        return
+      }
+
+      if gameState.piece(at: square) != nil {
+        handleTapOnPiece(at: square)
+      } else {
+        handleTapOnSquare(square)
+      }
+    }
+
+    private func boardSquare(at location: CGPoint, in arView: ARView) -> BoardSquare? {
+      guard let boardWorldTransform else {
+        return nil
+      }
+
+      let hitResults = arView.raycast(from: location, allowing: .existingPlaneInfinite, alignment: .horizontal)
+      guard let hit = hitResults.first else {
+        return nil
+      }
+
+      let worldPoint = SIMD3<Float>(
+        hit.worldTransform.columns.3.x,
+        hit.worldTransform.columns.3.y,
+        hit.worldTransform.columns.3.z
+      )
+      let localPoint4 = boardWorldTransform.inverse * SIMD4<Float>(worldPoint.x, worldPoint.y, worldPoint.z, 1)
+      let localX = localPoint4.x
+      let localZ = localPoint4.z
+      let halfBoard = boardSize * 0.5
+
+      guard localX >= -halfBoard, localX <= halfBoard, localZ >= -halfBoard, localZ <= halfBoard else {
+        clearSelection()
+        return nil
+      }
+
+      let squareSize = boardSize / 8.0
+      let file = Int(floor((localX + halfBoard) / squareSize))
+      let rank = Int(floor((halfBoard - localZ) / squareSize))
+      let square = BoardSquare(
+        file: max(0, min(7, file)),
+        rank: max(0, min(7, rank))
+      )
+
+      guard square.isValid else {
+        return nil
+      }
+
+      return square
+    }
+
+    private func handleTapOnPiece(at square: BoardSquare) {
+      guard let piece = gameState.piece(at: square) else {
+        clearSelection()
+        return
+      }
+
+      if piece.color == gameState.turn {
+        if selectedSquare == square {
+          clearSelection()
+        } else {
+          select(square)
+        }
+        return
+      }
+
+      if let move = selectedMoves.first(where: { $0.to == square }) {
+        apply(move)
+      } else {
+        clearSelection()
+      }
+    }
+
+    private func handleTapOnSquare(_ square: BoardSquare) {
+      if let move = selectedMoves.first(where: { $0.to == square }) {
+        apply(move)
+        return
+      }
+
+      if let piece = gameState.piece(at: square), piece.color == gameState.turn {
+        select(square)
+      } else {
+        clearSelection()
+      }
+    }
+
+    private func select(_ square: BoardSquare) {
+      selectedSquare = square
+      selectedMoves = gameState.legalMoves(from: square)
+
+      if selectedMoves.isEmpty {
+        selectedSquare = nil
+      }
+
+      refreshBoardPresentation()
+    }
+
+    private func clearSelection() {
+      selectedSquare = nil
+      selectedMoves = []
+      refreshBoardPresentation()
+    }
+
+    private func apply(_ move: ChessMove) {
+      let movingColor = gameState.turn
+      gameState = gameState.applying(move)
+      selectedSquare = nil
+      selectedMoves = []
+      refreshBoardPresentation()
+      Task { @MainActor in
+        matchLog.recordMove(move.uciString, color: movingColor)
+      }
+    }
+
     private func updateBoardPlacement(session: ARSession, anchors: [ARAnchor]) {
       guard let frame = session.currentFrame else {
+        return
+      }
+
+      guard boardAnchor == nil else {
         return
       }
 
@@ -482,13 +1418,13 @@ private struct NativeARView: UIViewRepresentable {
 
       let transform = boardTransform(for: selectedPlane, frame: frame)
 
-      if let boardAnchor {
-        boardAnchor.transform = Transform(matrix: transform)
-      } else if let arView {
+      if let arView {
         let boardAnchor = AnchorEntity(world: transform)
         boardAnchor.addChild(makeBoardEntity())
         arView.scene.addAnchor(boardAnchor)
         self.boardAnchor = boardAnchor
+        boardWorldTransform = transform
+        refreshBoardPresentation()
       }
 
       trackedPlaneID = selectedPlane.identifier
@@ -518,16 +1454,15 @@ private struct NativeARView: UIViewRepresentable {
         return false
       }
 
-      if plane.classification.rawValue == ARPlaneAnchor.Classification.table.rawValue {
+      if isTableClassification(plane.classification) {
         return true
       }
 
-      if plane.classification.rawValue == ARPlaneAnchor.Classification.none.rawValue {
+      if isUnknownClassification(plane.classification) {
         let cameraY = frame.camera.transform.columns.3.y
         let planeY = plane.transform.columns.3.y
         let verticalDrop = cameraY - planeY
-        let largestExtent = max(plane.extent.x, plane.extent.z)
-        return verticalDrop > 0.22 && verticalDrop < 1.15 && largestExtent < 1.75
+        return verticalDrop > 0.10 && verticalDrop < 1.40
       }
 
       return false
@@ -538,34 +1473,65 @@ private struct NativeARView: UIViewRepresentable {
       let cameraPosition = simd_make_float3(frame.camera.transform.columns.3)
       let planePosition = simd_make_float3(plane.transform.columns.3)
       let distance = simd_distance(cameraPosition, planePosition)
-      let classificationBonus: Float =
-        plane.classification.rawValue == ARPlaneAnchor.Classification.table.rawValue ? 2.0 : 0.0
+      let classificationBonus: Float = isTableClassification(plane.classification) ? 2.0 : 0.0
       return classificationBonus + area - (distance * 0.35)
+    }
+
+    private func isTableClassification(_ classification: ARPlaneAnchor.Classification) -> Bool {
+      switch classification {
+      case ARPlaneAnchor.Classification.table:
+        return true
+      default:
+        return false
+      }
+    }
+
+    private func isUnknownClassification(_ classification: ARPlaneAnchor.Classification) -> Bool {
+      switch classification {
+      case ARPlaneAnchor.Classification.none:
+        return true
+      default:
+        return false
+      }
     }
 
     private func boardTransform(for plane: ARPlaneAnchor, frame: ARFrame) -> simd_float4x4 {
       let planeTransform = plane.transform
       let cameraWorld = simd_make_float3(frame.camera.transform.columns.3)
+      let cameraForward = simd_normalize(-simd_make_float3(frame.camera.transform.columns.2))
       let inversePlane = planeTransform.inverse
-      let cameraLocal4 = inversePlane * SIMD4<Float>(cameraWorld.x, cameraWorld.y, cameraWorld.z, 1)
-      let cameraLocal = SIMD2<Float>(cameraLocal4.x, cameraLocal4.z)
+      let planeHeight = planeTransform.columns.3.y
 
       let availableX = max(0, (plane.extent.x * 0.5) - (boardSize * 0.5) - boardInset)
       let availableZ = max(0, (plane.extent.z * 0.5) - (boardSize * 0.5) - boardInset)
 
-      let directionToPlayer = normalized(cameraLocal, fallback: SIMD2<Float>(0, 1))
-      let desiredOffset = SIMD2<Float>(
-        clamp(directionToPlayer.x * min(0.10, availableX), min: -availableX, max: availableX),
-        clamp(directionToPlayer.y * min(0.16, availableZ), min: -availableZ, max: availableZ)
+      let horizontalForward = normalized(
+        SIMD2<Float>(cameraForward.x, cameraForward.z),
+        fallback: SIMD2<Float>(0, -1)
+      )
+      let cameraHeightAbovePlane = max(0.18, cameraWorld.y - planeHeight)
+      let preferredViewAngleRadians: Float = 30.0 * .pi / 180.0
+      let preferredDistance = cameraHeightAbovePlane / tan(preferredViewAngleRadians)
+      let stableFrontDistance = clamp(preferredDistance + 0.12, min: 0.58, max: 0.82)
+      let targetWorld = SIMD3<Float>(
+        cameraWorld.x + (horizontalForward.x * stableFrontDistance),
+        planeHeight,
+        cameraWorld.z + (horizontalForward.y * stableFrontDistance)
       )
 
-      let localPosition = SIMD3<Float>(desiredOffset.x, 0.008, desiredOffset.y)
+      let targetLocal4 = inversePlane * SIMD4<Float>(targetWorld.x, targetWorld.y, targetWorld.z, 1)
+      let localPosition = SIMD3<Float>(
+        clamp(targetLocal4.x, min: -availableX, max: availableX),
+        0.012,
+        clamp(targetLocal4.z, min: -availableZ, max: availableZ)
+      )
+
       let worldPosition4 = planeTransform * SIMD4<Float>(localPosition.x, localPosition.y, localPosition.z, 1)
       let worldPosition = SIMD3<Float>(worldPosition4.x, worldPosition4.y, worldPosition4.z)
 
       let lookVector = normalized(
         SIMD2<Float>(cameraWorld.x - worldPosition.x, cameraWorld.z - worldPosition.z),
-        fallback: SIMD2<Float>(0, 1)
+        fallback: SIMD2<Float>(-horizontalForward.x, -horizontalForward.y)
       )
       let yaw = atan2(lookVector.x, lookVector.y) + .pi
       var result = simd_float4x4(simd_quatf(angle: yaw, axis: SIMD3<Float>(0, 1, 0)))
@@ -588,8 +1554,11 @@ private struct NativeARView: UIViewRepresentable {
 
     private func makeBoardEntity() -> Entity {
       let boardRoot = Entity()
-      let squareSize = boardSize / 8.0
+      self.boardRoot = boardRoot
+      piecesContainer = Entity()
+      highlightsContainer = Entity()
 
+      let squareSize = boardSize / 8.0
       let baseMesh = MeshResource.generateBox(size: SIMD3<Float>(boardSize + 0.03, 0.012, boardSize + 0.03))
       let baseMaterial = SimpleMaterial(
         color: UIColor(red: 0.18, green: 0.12, blue: 0.08, alpha: 1),
@@ -600,52 +1569,140 @@ private struct NativeARView: UIViewRepresentable {
       baseEntity.position = SIMD3<Float>(0, -0.010, 0)
       boardRoot.addChild(baseEntity)
 
-      for row in 0..<8 {
-        for column in 0..<8 {
+      for rank in 0..<8 {
+        for file in 0..<8 {
           let squareMesh = MeshResource.generateBox(size: SIMD3<Float>(squareSize, 0.004, squareSize))
-          let squareColor: UIColor = (row + column).isMultiple(of: 2)
+          let squareColor: UIColor = (rank + file).isMultiple(of: 2)
             ? UIColor(red: 0.93, green: 0.88, blue: 0.79, alpha: 1)
             : UIColor(red: 0.22, green: 0.18, blue: 0.15, alpha: 1)
 
           let squareMaterial = SimpleMaterial(color: squareColor, roughness: 0.35, isMetallic: false)
           let squareEntity = ModelEntity(mesh: squareMesh, materials: [squareMaterial])
-          squareEntity.position = SIMD3<Float>((Float(column) - 3.5) * squareSize, 0, (Float(row) - 3.5) * squareSize)
+          let square = BoardSquare(file: file, rank: rank)
+          squareEntity.position = boardPosition(square, squareSize: squareSize)
+          squareEntity.name = squareName(square)
+          squareEntity.generateCollisionShapes(recursive: false)
           boardRoot.addChild(squareEntity)
         }
       }
 
-      addInitialPieces(to: boardRoot, squareSize: squareSize)
-
+      boardRoot.addChild(highlightsContainer)
+      boardRoot.addChild(piecesContainer)
       return boardRoot
     }
 
-    private func addInitialPieces(to boardRoot: Entity, squareSize: Float) {
-      let backRank: [PieceKind] = [.rook, .knight, .bishop, .queen, .king, .bishop, .knight, .rook]
-      let whiteMaterial = SimpleMaterial(color: UIColor(red: 0.94, green: 0.95, blue: 0.97, alpha: 1), roughness: 0.24, isMetallic: true)
-      let blackMaterial = SimpleMaterial(color: UIColor(red: 0.18, green: 0.19, blue: 0.22, alpha: 1), roughness: 0.28, isMetallic: true)
+    private func refreshBoardPresentation() {
+      syncPieceEntities()
+      syncHighlights()
+    }
 
-      for file in 0..<8 {
-        let whiteBackPiece = makePieceEntity(kind: backRank[file], material: whiteMaterial)
-        whiteBackPiece.position = boardPosition(file: file, rankFromWhiteSide: 0, squareSize: squareSize)
-        boardRoot.addChild(whiteBackPiece)
+    private func syncPieceEntities() {
+      Array(piecesContainer.children).forEach { $0.removeFromParent() }
+      let squareSize = boardSize / 8.0
 
-        let whitePawn = makePieceEntity(kind: .pawn, material: whiteMaterial)
-        whitePawn.position = boardPosition(file: file, rankFromWhiteSide: 1, squareSize: squareSize)
-        boardRoot.addChild(whitePawn)
+      let orderedSquares = gameState.board.keys.sorted {
+        if $0.rank == $1.rank {
+          return $0.file < $1.file
+        }
+        return $0.rank < $1.rank
+      }
 
-        let blackPawn = makePieceEntity(kind: .pawn, material: blackMaterial)
-        blackPawn.position = boardPosition(file: file, rankFromWhiteSide: 6, squareSize: squareSize)
-        boardRoot.addChild(blackPawn)
+      for square in orderedSquares {
+        guard let piece = gameState.board[square] else {
+          continue
+        }
 
-        let blackBackPiece = makePieceEntity(kind: backRank[file], material: blackMaterial)
-        blackBackPiece.position = boardPosition(file: file, rankFromWhiteSide: 7, squareSize: squareSize)
-        boardRoot.addChild(blackBackPiece)
+        let pieceEntity = makePieceEntity(kind: piece.kind, material: pieceMaterial(for: piece.color))
+        pieceEntity.name = pieceName(square)
+        pieceEntity.position = boardPosition(square, squareSize: squareSize)
+
+        if selectedSquare == square {
+          pieceEntity.position.y += 0.016
+          pieceEntity.scale = SIMD3<Float>(repeating: 1.06)
+        }
+
+        pieceEntity.generateCollisionShapes(recursive: true)
+        piecesContainer.addChild(pieceEntity)
       }
     }
 
-    private func boardPosition(file: Int, rankFromWhiteSide: Int, squareSize: Float) -> SIMD3<Float> {
-      let x = (Float(file) - 3.5) * squareSize
-      let z = (3.5 - Float(rankFromWhiteSide)) * squareSize
+    private func syncHighlights() {
+      Array(highlightsContainer.children).forEach { $0.removeFromParent() }
+      let squareSize = boardSize / 8.0
+
+      if let selectedSquare {
+        let selectedHighlight = makeHighlightEntity(
+          size: squareSize,
+          color: UIColor(red: 0.87, green: 0.73, blue: 0.37, alpha: 0.44)
+        )
+        selectedHighlight.position = boardPosition(selectedSquare, squareSize: squareSize) + SIMD3<Float>(0, 0.0032, 0)
+        highlightsContainer.addChild(selectedHighlight)
+      }
+
+      for move in selectedMoves {
+        let isCapture = gameState.piece(at: move.to) != nil || move.isEnPassant
+        let color = isCapture
+          ? UIColor(red: 0.86, green: 0.34, blue: 0.29, alpha: 0.42)
+          : UIColor(red: 0.24, green: 0.72, blue: 0.46, alpha: 0.34)
+        let highlight = makeHighlightEntity(size: squareSize * (isCapture ? 0.94 : 0.58), color: color)
+        highlight.position = boardPosition(move.to, squareSize: squareSize) + SIMD3<Float>(0, 0.0026, 0)
+        highlightsContainer.addChild(highlight)
+      }
+    }
+
+    private func makeHighlightEntity(size: Float, color: UIColor) -> ModelEntity {
+      ModelEntity(
+        mesh: .generateBox(size: SIMD3<Float>(size, 0.0012, size)),
+        materials: [SimpleMaterial(color: color, roughness: 0.15, isMetallic: false)]
+      )
+    }
+
+    private func squareName(_ square: BoardSquare) -> String {
+      "square_\(square.file)_\(square.rank)"
+    }
+
+    private func pieceName(_ square: BoardSquare) -> String {
+      "piece_\(square.file)_\(square.rank)"
+    }
+
+    private func square(for entity: Entity, prefix: String) -> BoardSquare? {
+      var current: Entity? = entity
+
+      while let candidate = current {
+        let components = candidate.name.split(separator: "_")
+        if components.count == 3,
+           components[0] == Substring(prefix),
+           let file = Int(components[1]),
+           let rank = Int(components[2]) {
+          return BoardSquare(file: file, rank: rank)
+        }
+
+        current = candidate.parent
+      }
+
+      return nil
+    }
+
+    private func pieceMaterial(for color: ChessColor) -> SimpleMaterial {
+      switch color {
+      case .white:
+        return SimpleMaterial(
+          color: UIColor(red: 0.94, green: 0.95, blue: 0.97, alpha: 1),
+          roughness: 0.24,
+          isMetallic: true
+        )
+      case .black:
+        return SimpleMaterial(
+          color: UIColor(red: 0.18, green: 0.19, blue: 0.22, alpha: 1),
+          roughness: 0.28,
+          isMetallic: true
+        )
+      }
+    }
+
+    private func boardPosition(_ square: BoardSquare, squareSize: Float) -> SIMD3<Float> {
+      let x = (Float(square.file) - 3.5) * squareSize
+      let z = (3.5 - Float(square.rank)) * squareSize
       return SIMD3<Float>(x, 0.004, z)
     }
 
@@ -656,7 +1713,7 @@ private struct NativeARView: UIViewRepresentable {
       )
     }
 
-    private func makePieceEntity(kind: PieceKind, material: SimpleMaterial) -> Entity {
+    private func makePieceEntity(kind: ChessPieceKind, material: SimpleMaterial) -> Entity {
       let root = Entity()
 
       let base = makeColumn(width: 0.030, height: 0.006, depth: 0.030, material: material)
@@ -730,14 +1787,5 @@ private struct NativeARView: UIViewRepresentable {
 
       return root
     }
-  }
-
-  enum PieceKind {
-    case pawn
-    case rook
-    case knight
-    case bishop
-    case queen
-    case king
   }
 }
