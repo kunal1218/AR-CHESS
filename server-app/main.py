@@ -61,7 +61,7 @@ class GameMoveListResponse(BaseModel):
 def get_postgres_dsn() -> str:
     for env_key in ("DATABASE_PRIVATE_URL", "DATABASE_URL", "DATABASE_PUBLIC_URL"):
         database_url = os.getenv(env_key, "").strip()
-        if database_url:
+        if database_url and not is_placeholder_value(database_url):
             return normalize_postgres_dsn(database_url)
 
     host = (
@@ -90,6 +90,17 @@ def get_postgres_dsn() -> str:
         or "archess"
     )
 
+    if is_placeholder_value(host):
+        host = "localhost"
+    if is_placeholder_value(port):
+        port = str(DEFAULT_POSTGRES_PORT)
+    if is_placeholder_value(database):
+        database = "archess"
+    if is_placeholder_value(user):
+        user = "archess"
+    if is_placeholder_value(password):
+        password = "archess"
+
     return f"postgresql://{user}:{password}@{host}:{port}/{database}"
 
 
@@ -97,6 +108,17 @@ def normalize_postgres_dsn(raw_dsn: str) -> str:
     if raw_dsn.startswith("postgres://"):
         return "postgresql://" + raw_dsn.removeprefix("postgres://")
     return raw_dsn
+
+
+def is_placeholder_value(value: str) -> bool:
+    normalized = value.strip().lower()
+    return any(
+        marker in normalized
+        for marker in (
+            "your-railway-postgres-host",
+            "your-railway-service.up.railway.app",
+        )
+    )
 
 
 def connect_postgres() -> psycopg.Connection:

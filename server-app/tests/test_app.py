@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 
 from fastapi.testclient import TestClient
 
-from main import app, get_postgres_dsn, normalize_postgres_dsn
+from main import app, get_postgres_dsn, is_placeholder_value, normalize_postgres_dsn
 
 
 def test_fastapi_app_bootstraps() -> None:
@@ -124,3 +124,22 @@ def test_normalize_postgres_dsn_rewrites_postgres_scheme() -> None:
     assert normalize_postgres_dsn("postgres://user:pass@host:5432/db") == (
         "postgresql://user:pass@host:5432/db"
     )
+
+
+def test_get_postgres_dsn_skips_placeholder_database_url(monkeypatch) -> None:
+    monkeypatch.setenv(
+        "DATABASE_URL",
+        "postgresql://postgres:password@your-railway-postgres-host:5432/railway",
+    )
+    monkeypatch.setenv("PGHOST", "railway.internal")
+    monkeypatch.setenv("PGPORT", "5432")
+    monkeypatch.setenv("PGDATABASE", "railway")
+    monkeypatch.setenv("PGUSER", "postgres")
+    monkeypatch.setenv("PGPASSWORD", "secret")
+
+    assert get_postgres_dsn() == "postgresql://postgres:secret@railway.internal:5432/railway"
+
+
+def test_is_placeholder_value_detects_template_markers() -> None:
+    assert is_placeholder_value("postgresql://x:y@your-railway-postgres-host:5432/railway")
+    assert is_placeholder_value("https://your-railway-service.up.railway.app")
