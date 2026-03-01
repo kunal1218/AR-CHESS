@@ -4440,6 +4440,13 @@ private struct NativeARView: UIViewRepresentable {
   func updateUIView(_ uiView: ARView, context: Context) {}
 
   final class Coordinator: NSObject, ARSessionDelegate {
+    private struct AnimatedMoveContext {
+      let move: ChessMove
+      let beforeState: ChessGameState
+      let afterState: ChessGameState
+      let postApply: (@MainActor () async -> Void)?
+    }
+
     private let boardSize: Float = 0.40
     private let boardInset: Float = 0.08
     private let matchLog: MatchLogStore
@@ -4463,6 +4470,8 @@ private struct NativeARView: UIViewRepresentable {
     private var hasScheduledInitialAnalysis = false
     private var initialAnalysisTask: Task<Void, Never>?
     private var lastWarmupStatusMessage: String?
+    private var pendingAnimatedMoves: [AnimatedMoveContext] = []
+    private var moveAnimationTask: Task<Void, Never>?
 
     init(
       matchLog: MatchLogStore,
@@ -4478,6 +4487,7 @@ private struct NativeARView: UIViewRepresentable {
 
     deinit {
       initialAnalysisTask?.cancel()
+      moveAnimationTask?.cancel()
     }
 
     func configure(_ arView: ARView) {
@@ -4574,6 +4584,10 @@ private struct NativeARView: UIViewRepresentable {
 
     @objc
     private func handleTap(_ recognizer: UITapGestureRecognizer) {
+      guard moveAnimationTask == nil, pendingAnimatedMoves.isEmpty else {
+        return
+      }
+
       guard let arView else {
         return
       }
@@ -4714,14 +4728,21 @@ private struct NativeARView: UIViewRepresentable {
       let movingColor = gameState.turn
       let beforeState = gameState
       let afterState = gameState.applying(move)
-      gameState = afterState
-      selectedSquare = nil
-      selectedMoves = []
-      refreshBoardPresentation()
-      Task { @MainActor in
-        matchLog.recordMove(move.uciString, color: movingColor)
-        await commentary.handleMove(move: move, before: beforeState, after: afterState)
-      }
+      enqueueMoveAnimation(
+        AnimatedMoveContext(
+          move: move,
+          beforeState: beforeState,
+          afterState: afterState,
+          postApply: { [weak self] in
+            guard let self else {
+              return
+            }
+
+            self.matchLog.recordMove(move.uciString, color: movingColor)
+            await self.commentary.handleMove(move: move, before: beforeState, after: afterState)
+          }
+        )
+      )
     }
 
     private func applyServerMoveSet(_ moves: [QueueMatchMovePayload]) {
@@ -4751,20 +4772,74 @@ private struct NativeARView: UIViewRepresentable {
       }
 
       syncedQueueMoves = orderedMoves
-      gameState = rebuiltState
+      guard !newMoves.isEmpty else {
+        gameState = rebuiltState
+        selectedSquare = nil
+        selectedMoves = []
+        refreshBoardPresentation()
+        return
+      }
+
+      if newMoves.count != orderedMoves.count - previousMoveCount {
+        gameState = rebuiltState
+        selectedSquare = nil
+        selectedMoves = []
+        refreshBoardPresentation()
+      }
+
+      for item in newMoves {
+        enqueueMoveAnimation(
+          AnimatedMoveContext(
+            move: item.move,
+            beforeState: item.before,
+            afterState: item.after,
+            postApply: { [weak self] in
+              guard let self else {
+                return
+              }
+
+              await self.commentary.handleMove(move: item.move, before: item.before, after: item.after)
+            }
+          )
+        )
+      }
+    }
+
+    private func enqueueMoveAnimation(_ context: AnimatedMoveContext) {
+      pendingAnimatedMoves.append(context)
+
+      guard moveAnimationTask == nil else {
+        return
+      }
+
+      moveAnimationTask = Task { @MainActor [weak self] in
+        await self?.drainMoveAnimations()
+      }
+    }
+
+    @MainActor
+    private func drainMoveAnimations() async {
+      while !pendingAnimatedMoves.isEmpty {
+        let context = pendingAnimatedMoves.removeFirst()
+        await animateAndApply(context)
+      }
+
+      moveAnimationTask = nil
+    }
+
+    @MainActor
+    private func animateAndApply(_ context: AnimatedMoveContext) async {
       selectedSquare = nil
       selectedMoves = []
       refreshBoardPresentation()
 
-      guard !newMoves.isEmpty else {
-        return
+      if context.move.captured != nil || context.move.isEnPassant {
+        await animateCapture(for: context.move, beforeState: context.beforeState)
       }
 
-      Task { @MainActor in
-        for item in newMoves {
-          await commentary.handleMove(move: item.move, before: item.before, after: item.after)
-        }
-      }
+      gameState = context.afterState
+      refreshBoardPresentation()
+      await context.postApply?()
     }
 
     private func handleReactionCue(_ cue: PiecePersonalityDirector.ReactionCue) {
@@ -4774,6 +4849,253 @@ private struct NativeARView: UIViewRepresentable {
       case .currentKingCries(let color):
         animateKingCrying(for: color)
       }
+    }
+
+    @MainActor
+    private func animateCapture(for move: ChessMove, beforeState: ChessGameState) async {
+      guard let attacker = piecesContainer.findEntity(named: pieceName(move.from)) else {
+        return
+      }
+
+      let capturedSquare = capturedSquare(for: move)
+      let victim = capturedSquare.flatMap { piecesContainer.findEntity(named: pieceName($0)) }
+
+      switch move.piece.kind {
+      case .pawn:
+        await animatePawnKnifeCapture(attacker: attacker, victim: victim, move: move)
+      case .bishop:
+        await animateBishopSniperCapture(attacker: attacker, victim: victim, move: move)
+      case .knight:
+        await animateKnightStrikeCapture(attacker: attacker, victim: victim, move: move)
+      case .rook:
+        await animateRookBazookaCapture(attacker: attacker, victim: victim, move: move)
+      case .queen:
+        await animateQueenLaserCapture(attacker: attacker, victim: victim, move: move)
+      case .king:
+        await animateKingCrownCapture(attacker: attacker, victim: victim, move: move)
+      }
+    }
+
+    private func capturedSquare(for move: ChessMove) -> BoardSquare? {
+      if move.isEnPassant {
+        return BoardSquare(file: move.to.file, rank: move.from.rank)
+      }
+
+      return move.captured == nil ? nil : move.to
+    }
+
+    @MainActor
+    private func animatePawnKnifeCapture(attacker: Entity, victim: Entity?, move: ChessMove) async {
+      let direction = attackDirection(for: move)
+      let originalAttacker = attacker.transform
+      let lunge = transformed(originalAttacker, translation: direction * 0.028)
+      attacker.move(to: lunge, relativeTo: attacker.parent, duration: 0.12, timingFunction: .easeIn)
+
+      if let knife = attacker.findEntity(named: "pawn_knife") {
+        let slash = transformed(knife.transform, rotation: simd_quatf(angle: -.pi / 2.8, axis: SIMD3<Float>(1, 0, 0)))
+        knife.move(to: slash, relativeTo: attacker, duration: 0.10, timingFunction: .easeIn)
+      }
+
+      if let victim {
+        let struck = transformed(
+          victim.transform,
+          translation: direction * 0.024 + SIMD3<Float>(0, 0.010, 0),
+          rotation: simd_quatf(angle: .pi / 7, axis: SIMD3<Float>(0, 0, 1))
+        )
+        victim.move(to: struck, relativeTo: victim.parent, duration: 0.14, timingFunction: .easeOut)
+      }
+
+      try? await Task.sleep(nanoseconds: 300_000_000)
+    }
+
+    @MainActor
+    private func animateBishopSniperCapture(attacker: Entity, victim: Entity?, move: ChessMove) async {
+      let direction = attackDirection(for: move)
+      if let rifle = attacker.findEntity(named: "bishop_sniper") {
+        let aim = transformed(rifle.transform, rotation: simd_quatf(angle: -.pi / 10, axis: SIMD3<Float>(1, 0, 0)))
+        rifle.move(to: aim, relativeTo: attacker, duration: 0.08, timingFunction: .easeInOut)
+      }
+
+      if let victim {
+        let tracer = makeTracer(color: UIColor(red: 1.0, green: 0.94, blue: 0.70, alpha: 0.92), length: 0.16, thickness: 0.0035)
+        tracer.position = attacker.position + SIMD3<Float>(0, 0.040, 0) + (direction * 0.042)
+        tracer.orientation = simd_quatf(from: SIMD3<Float>(0, 1, 0), to: normalized3(direction + SIMD3<Float>(0, 0.10, 0), fallback: SIMD3<Float>(0, 1, 0)))
+        boardRoot.addChild(tracer)
+
+        let hit = transformed(
+          victim.transform,
+          translation: direction * 0.060 + SIMD3<Float>(0, 0.018, 0),
+          rotation: simd_quatf(angle: .pi / 5, axis: SIMD3<Float>(1, 0, 0))
+        )
+        victim.move(to: hit, relativeTo: victim.parent, duration: 0.18, timingFunction: .easeOut)
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) { [weak tracer] in
+          tracer?.removeFromParent()
+        }
+      }
+
+      try? await Task.sleep(nanoseconds: 320_000_000)
+    }
+
+    @MainActor
+    private func animateKnightStrikeCapture(attacker: Entity, victim: Entity?, move: ChessMove) async {
+      let direction = attackDirection(for: move)
+      let originalAttacker = attacker.transform
+      let leap = transformed(
+        originalAttacker,
+        translation: direction * 0.042 + SIMD3<Float>(0, 0.025, 0),
+        rotation: simd_quatf(angle: -.pi / 8, axis: SIMD3<Float>(1, 0, 0))
+      )
+      attacker.move(to: leap, relativeTo: attacker.parent, duration: 0.16, timingFunction: .easeIn)
+
+      if let victim {
+        let tossed = transformed(
+          victim.transform,
+          translation: direction * 0.130 + SIMD3<Float>(0, 0.060, 0),
+          rotation: simd_quatf(angle: .pi * 1.2, axis: SIMD3<Float>(0, 1, 0))
+        )
+        victim.move(to: tossed, relativeTo: victim.parent, duration: 0.26, timingFunction: .easeOut)
+      }
+
+      try? await Task.sleep(nanoseconds: 340_000_000)
+    }
+
+    @MainActor
+    private func animateRookBazookaCapture(attacker: Entity, victim: Entity?, move: ChessMove) async {
+      let direction = attackDirection(for: move)
+      let originalAttacker = attacker.transform
+      let recoil = transformed(originalAttacker, translation: direction * -0.018)
+      attacker.move(to: recoil, relativeTo: attacker.parent, duration: 0.10, timingFunction: .easeOut)
+
+      let rocket = ModelEntity(
+        mesh: .generateSphere(radius: 0.006),
+        materials: [SimpleMaterial(color: UIColor(red: 1.0, green: 0.58, blue: 0.22, alpha: 1), roughness: 0.10, isMetallic: true)]
+      )
+      rocket.position = attacker.position + SIMD3<Float>(0, 0.024, 0) + direction * 0.036
+      boardRoot.addChild(rocket)
+
+      if let victim {
+        let target = victim.position + SIMD3<Float>(0, 0.020, 0)
+        let rocketTransform = Transform(scale: rocket.scale, rotation: rocket.orientation, translation: target)
+        rocket.move(to: rocketTransform, relativeTo: rocket.parent, duration: 0.14, timingFunction: .linear)
+
+        let blasted = transformed(
+          victim.transform,
+          translation: direction * 0.110 + SIMD3<Float>(0, 0.050, 0),
+          rotation: simd_quatf(angle: .pi / 2.2, axis: SIMD3<Float>(0, 0, 1))
+        )
+        victim.move(to: blasted, relativeTo: victim.parent, duration: 0.26, timingFunction: .easeOut)
+      }
+
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.20) { [weak rocket] in
+        rocket?.removeFromParent()
+      }
+
+      try? await Task.sleep(nanoseconds: 340_000_000)
+    }
+
+    @MainActor
+    private func animateQueenLaserCapture(attacker: Entity, victim: Entity?, move: ChessMove) async {
+      let direction = attackDirection(for: move)
+
+      if let glasses = attacker.findEntity(named: "queen_sunglasses") {
+        let removed = transformed(
+          glasses.transform,
+          translation: SIMD3<Float>(0, 0.010, -0.018),
+          rotation: simd_quatf(angle: -.pi / 3.2, axis: SIMD3<Float>(1, 0, 0))
+        )
+        glasses.move(to: removed, relativeTo: attacker, duration: 0.08, timingFunction: .easeIn)
+      }
+
+      let leftBeam = makeTracer(color: UIColor(red: 1.0, green: 0.12, blue: 0.18, alpha: 0.96), length: 0.15, thickness: 0.0032)
+      let rightBeam = makeTracer(color: UIColor(red: 1.0, green: 0.12, blue: 0.18, alpha: 0.96), length: 0.15, thickness: 0.0032)
+      leftBeam.position = attacker.position + SIMD3<Float>(-0.007, 0.041, -0.012)
+      rightBeam.position = attacker.position + SIMD3<Float>(0.007, 0.041, -0.012)
+      leftBeam.orientation = simd_quatf(from: SIMD3<Float>(0, 1, 0), to: normalized3(direction + SIMD3<Float>(0, 0.04, 0), fallback: SIMD3<Float>(0, 1, 0)))
+      rightBeam.orientation = leftBeam.orientation
+      boardRoot.addChild(leftBeam)
+      boardRoot.addChild(rightBeam)
+
+      if let victim {
+        let vaporized = transformed(
+          victim.transform,
+          translation: direction * 0.050 + SIMD3<Float>(0, 0.030, 0),
+          scale: SIMD3<Float>(repeating: 0.18)
+        )
+        victim.move(to: vaporized, relativeTo: victim.parent, duration: 0.22, timingFunction: .easeIn)
+      }
+
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.20) { [weak leftBeam, weak rightBeam] in
+        leftBeam?.removeFromParent()
+        rightBeam?.removeFromParent()
+      }
+
+      try? await Task.sleep(nanoseconds: 300_000_000)
+    }
+
+    @MainActor
+    private func animateKingCrownCapture(attacker: Entity, victim: Entity?, move: ChessMove) async {
+      let direction = attackDirection(for: move)
+      if let crown = attacker.findEntity(named: "king_crown") {
+        let thrown = transformed(
+          crown.transform,
+          translation: direction * 0.070 + SIMD3<Float>(0, 0.018, 0),
+          rotation: simd_quatf(angle: .pi * 1.4, axis: SIMD3<Float>(0, 1, 0))
+        )
+        crown.move(to: thrown, relativeTo: attacker, duration: 0.16, timingFunction: .easeOut)
+      }
+
+      let originalAttacker = attacker.transform
+      let lunge = transformed(originalAttacker, translation: direction * 0.022)
+      attacker.move(to: lunge, relativeTo: attacker.parent, duration: 0.12, timingFunction: .easeIn)
+
+      if let victim {
+        let toppled = transformed(
+          victim.transform,
+          translation: direction * 0.070 + SIMD3<Float>(0, 0.024, 0),
+          rotation: simd_quatf(angle: .pi / 3.5, axis: SIMD3<Float>(1, 0, 0))
+        )
+        victim.move(to: toppled, relativeTo: victim.parent, duration: 0.22, timingFunction: .easeOut)
+      }
+
+      try? await Task.sleep(nanoseconds: 320_000_000)
+    }
+
+    private func attackDirection(for move: ChessMove) -> SIMD3<Float> {
+      let squareSize = boardSize / 8.0
+      let delta = boardPosition(move.to, squareSize: squareSize) - boardPosition(move.from, squareSize: squareSize)
+      return normalized3(SIMD3<Float>(delta.x, 0, delta.z), fallback: SIMD3<Float>(0, 0, -1))
+    }
+
+    private func normalized3(_ value: SIMD3<Float>, fallback: SIMD3<Float>) -> SIMD3<Float> {
+      let length = simd_length(value)
+      guard length > 0.0001 else {
+        return fallback
+      }
+
+      return value / length
+    }
+
+    private func transformed(
+      _ transform: Transform,
+      translation: SIMD3<Float> = .zero,
+      rotation: simd_quatf = simd_quatf(angle: 0, axis: SIMD3<Float>(0, 1, 0)),
+      scale: SIMD3<Float>? = nil
+    ) -> Transform {
+      var next = transform
+      next.translation += translation
+      next.rotation = simd_normalize(rotation * next.rotation)
+      if let scale {
+        next.scale = scale
+      }
+      return next
+    }
+
+    private func makeTracer(color: UIColor, length: Float, thickness: Float) -> ModelEntity {
+      ModelEntity(
+        mesh: .generateBox(size: SIMD3<Float>(thickness, length, thickness)),
+        materials: [SimpleMaterial(color: color, roughness: 0.05, isMetallic: true)]
+      )
     }
 
     private func canControlPiece(_ piece: ChessPieceState, at square: BoardSquare) -> Bool {
@@ -5297,8 +5619,63 @@ private struct NativeARView: UIViewRepresentable {
       )
     }
 
+    private func accessoryMaterial(color: UIColor, metallic: Bool = true) -> SimpleMaterial {
+      SimpleMaterial(color: color, roughness: metallic ? 0.18 : 0.32, isMetallic: metallic)
+    }
+
+    private func addHands(
+      to root: Entity,
+      material: SimpleMaterial,
+      leftName: String? = nil,
+      rightName: String? = nil,
+      spread: Float,
+      height: Float,
+      forward: Float
+    ) {
+      let leftHand = ModelEntity(mesh: .generateSphere(radius: 0.0048), materials: [material])
+      leftHand.name = leftName ?? "piece_hand_left"
+      leftHand.position = SIMD3<Float>(-spread, height, forward)
+      root.addChild(leftHand)
+
+      let rightHand = ModelEntity(mesh: .generateSphere(radius: 0.0048), materials: [material])
+      rightHand.name = rightName ?? "piece_hand_right"
+      rightHand.position = SIMD3<Float>(spread, height, forward)
+      root.addChild(rightHand)
+    }
+
+    private func addSunglasses(to root: Entity, name: String? = nil, height: Float, width: Float) {
+      let glassesMaterial = accessoryMaterial(color: UIColor(white: 0.04, alpha: 0.96), metallic: true)
+      let glasses = Entity()
+      glasses.name = name ?? "piece_sunglasses"
+      glasses.position = SIMD3<Float>(0, height, -0.013)
+
+      let leftLens = ModelEntity(
+        mesh: .generateBox(size: SIMD3<Float>(width, 0.006, 0.0024)),
+        materials: [glassesMaterial]
+      )
+      leftLens.position = SIMD3<Float>(-width * 0.68, 0, 0)
+      glasses.addChild(leftLens)
+
+      let rightLens = ModelEntity(
+        mesh: .generateBox(size: SIMD3<Float>(width, 0.006, 0.0024)),
+        materials: [glassesMaterial]
+      )
+      rightLens.position = SIMD3<Float>(width * 0.68, 0, 0)
+      glasses.addChild(rightLens)
+
+      let bridge = ModelEntity(
+        mesh: .generateBox(size: SIMD3<Float>(width * 0.58, 0.0018, 0.002)),
+        materials: [glassesMaterial]
+      )
+      glasses.addChild(bridge)
+
+      root.addChild(glasses)
+    }
+
     private func makePieceEntity(kind: ChessPieceKind, material: SimpleMaterial) -> Entity {
       let root = Entity()
+      let weaponMaterial = accessoryMaterial(color: UIColor(red: 0.67, green: 0.55, blue: 0.36, alpha: 1))
+      let accentMaterial = accessoryMaterial(color: UIColor(red: 0.94, green: 0.82, blue: 0.24, alpha: 1))
 
       let base = makeColumn(width: 0.030, height: 0.006, depth: 0.030, material: material)
       base.position.y = 0.003
@@ -5314,6 +5691,18 @@ private struct NativeARView: UIViewRepresentable {
         head.position.y = 0.033
         root.addChild(head)
 
+        addHands(to: root, material: material, spread: 0.017, height: 0.020, forward: 0.002)
+        addSunglasses(to: root, height: 0.031, width: 0.007)
+
+        let knife = ModelEntity(
+          mesh: .generateBox(size: SIMD3<Float>(0.003, 0.020, 0.002)),
+          materials: [weaponMaterial]
+        )
+        knife.name = "pawn_knife"
+        knife.position = SIMD3<Float>(0.016, 0.022, 0.010)
+        knife.orientation = simd_quatf(angle: -.pi / 4.8, axis: SIMD3<Float>(1, 0, 0))
+        root.addChild(knife)
+
       case .rook:
         let tower = makeColumn(width: 0.020, height: 0.026, depth: 0.020, material: material)
         tower.position.y = 0.019
@@ -5322,6 +5711,25 @@ private struct NativeARView: UIViewRepresentable {
         let crown = ModelEntity(mesh: .generateBox(size: SIMD3<Float>(0.024, 0.007, 0.024)), materials: [material])
         crown.position.y = 0.036
         root.addChild(crown)
+
+        addHands(to: root, material: material, spread: 0.020, height: 0.024, forward: 0.003)
+        addSunglasses(to: root, height: 0.032, width: 0.008)
+
+        let bazookaBody = ModelEntity(
+          mesh: .generateBox(size: SIMD3<Float>(0.010, 0.034, 0.010)),
+          materials: [weaponMaterial]
+        )
+        bazookaBody.name = "rook_bazooka"
+        bazookaBody.position = SIMD3<Float>(0.020, 0.028, 0.010)
+        bazookaBody.orientation = simd_quatf(angle: -.pi / 2.8, axis: SIMD3<Float>(1, 0, 0))
+        root.addChild(bazookaBody)
+
+        let bazookaTip = ModelEntity(
+          mesh: .generateSphere(radius: 0.005),
+          materials: [accentMaterial]
+        )
+        bazookaTip.position = SIMD3<Float>(0, 0.018, 0)
+        bazookaBody.addChild(bazookaTip)
 
       case .knight:
         let body = makeColumn(width: 0.018, height: 0.018, depth: 0.018, material: material)
@@ -5332,6 +5740,9 @@ private struct NativeARView: UIViewRepresentable {
         neck.position = SIMD3<Float>(0, 0.034, -0.003)
         neck.orientation = simd_quatf(angle: -.pi / 9, axis: SIMD3<Float>(1, 0, 0))
         root.addChild(neck)
+
+        addHands(to: root, material: material, spread: 0.019, height: 0.023, forward: 0.002)
+        addSunglasses(to: root, height: 0.034, width: 0.008)
 
       case .bishop:
         let body = makeColumn(width: 0.018, height: 0.024, depth: 0.018, material: material)
@@ -5346,6 +5757,25 @@ private struct NativeARView: UIViewRepresentable {
         finial.position.y = 0.050
         root.addChild(finial)
 
+        addHands(to: root, material: material, spread: 0.018, height: 0.026, forward: 0.002)
+        addSunglasses(to: root, height: 0.034, width: 0.0075)
+
+        let sniperBody = ModelEntity(
+          mesh: .generateBox(size: SIMD3<Float>(0.004, 0.034, 0.004)),
+          materials: [weaponMaterial]
+        )
+        sniperBody.name = "bishop_sniper"
+        sniperBody.position = SIMD3<Float>(0.019, 0.030, 0.010)
+        sniperBody.orientation = simd_quatf(angle: -.pi / 2.9, axis: SIMD3<Float>(1, 0, 0))
+        root.addChild(sniperBody)
+
+        let sniperCrossBar = ModelEntity(
+          mesh: .generateBox(size: SIMD3<Float>(0.014, 0.003, 0.003)),
+          materials: [accentMaterial]
+        )
+        sniperCrossBar.position = SIMD3<Float>(0, 0.009, 0)
+        sniperBody.addChild(sniperCrossBar)
+
       case .queen:
         let body = makeColumn(width: 0.020, height: 0.030, depth: 0.020, material: material)
         body.position.y = 0.021
@@ -5355,28 +5785,39 @@ private struct NativeARView: UIViewRepresentable {
         crown.position.y = 0.044
         root.addChild(crown)
 
+        addHands(to: root, material: material, spread: 0.020, height: 0.028, forward: 0.002)
+        addSunglasses(to: root, name: "queen_sunglasses", height: 0.039, width: 0.0084)
+
       case .king:
         let body = makeColumn(width: 0.020, height: 0.034, depth: 0.020, material: material)
         body.position.y = 0.023
         root.addChild(body)
 
-        let leftHand = ModelEntity(mesh: .generateSphere(radius: 0.0048), materials: [material])
-        leftHand.name = "king_hand_left"
-        leftHand.position = SIMD3<Float>(-0.022, 0.029, 0.001)
-        root.addChild(leftHand)
+        addHands(
+          to: root,
+          material: material,
+          leftName: "king_hand_left",
+          rightName: "king_hand_right",
+          spread: 0.022,
+          height: 0.029,
+          forward: 0.001
+        )
+        addSunglasses(to: root, height: 0.040, width: 0.0084)
 
-        let rightHand = ModelEntity(mesh: .generateSphere(radius: 0.0048), materials: [material])
-        rightHand.name = "king_hand_right"
-        rightHand.position = SIMD3<Float>(0.022, 0.029, 0.001)
-        root.addChild(rightHand)
+        let crownBase = ModelEntity(
+          mesh: .generateBox(size: SIMD3<Float>(0.022, 0.005, 0.022)),
+          materials: [accentMaterial]
+        )
+        crownBase.name = "king_crown"
+        crownBase.position.y = 0.045
+        root.addChild(crownBase)
 
-        let crossStem = ModelEntity(mesh: .generateBox(size: SIMD3<Float>(0.004, 0.014, 0.004)), materials: [material])
-        crossStem.position.y = 0.046
-        root.addChild(crossStem)
-
-        let crossBar = ModelEntity(mesh: .generateBox(size: SIMD3<Float>(0.012, 0.004, 0.004)), materials: [material])
-        crossBar.position.y = 0.048
-        root.addChild(crossBar)
+        let crownGem = ModelEntity(
+          mesh: .generateSphere(radius: 0.0055),
+          materials: [accentMaterial]
+        )
+        crownGem.position.y = 0.010
+        crownBase.addChild(crownGem)
 
         let tearMaterial = SimpleMaterial(
           color: UIColor(red: 0.46, green: 0.76, blue: 0.96, alpha: 0.88),
