@@ -4556,6 +4556,8 @@ private struct NativeARView: UIViewRepresentable {
       arView.automaticallyConfigureSession = false
       arView.environment.background = .cameraFeed()
       arView.renderOptions.insert(.disableMotionBlur)
+      arView.renderOptions.insert(.disableAREnvironmentLighting)
+      arView.renderOptions.insert(.disableGroundingShadows)
       Task { @MainActor [weak self] in
         self?.commentary.attachEngineHost(to: arView)
       }
@@ -4574,10 +4576,11 @@ private struct NativeARView: UIViewRepresentable {
       let configuration = ARWorldTrackingConfiguration()
       configuration.planeDetection = [.horizontal]
       configuration.environmentTexturing = .none
+      configuration.sceneReconstruction = []
+      arView.environment.sceneUnderstanding.options = []
 
-      if ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh) {
-        configuration.sceneReconstruction = .mesh
-        arView.environment.sceneUnderstanding.options.insert(.occlusion)
+      if let lowerPowerFormat = Self.preferredVideoFormat() {
+        configuration.videoFormat = lowerPowerFormat
       }
 
       arView.session.delegate = self
@@ -4632,6 +4635,24 @@ private struct NativeARView: UIViewRepresentable {
         coachingOverlay.trailingAnchor.constraint(equalTo: arView.trailingAnchor),
         coachingOverlay.bottomAnchor.constraint(equalTo: arView.bottomAnchor),
       ])
+    }
+
+    private static func preferredVideoFormat() -> ARConfiguration.VideoFormat? {
+      let formats = ARWorldTrackingConfiguration.supportedVideoFormats
+      let lowerPower30fps = formats
+        .filter { $0.framesPerSecond == 30 }
+        .sorted { lhs, rhs in
+          let lhsPixels = lhs.imageResolution.width * lhs.imageResolution.height
+          let rhsPixels = rhs.imageResolution.width * rhs.imageResolution.height
+          return lhsPixels < rhsPixels
+        }
+        .first
+
+      return lowerPower30fps ?? formats.min { lhs, rhs in
+        let lhsScore = CGFloat(lhs.framesPerSecond) * lhs.imageResolution.width * lhs.imageResolution.height
+        let rhsScore = CGFloat(rhs.framesPerSecond) * rhs.imageResolution.width * rhs.imageResolution.height
+        return lhsScore < rhsScore
+      }
     }
 
     func session(_ session: ARSession, didAdd anchors: [ARAnchor]) {
@@ -5752,15 +5773,15 @@ private struct NativeARView: UIViewRepresentable {
       switch color {
       case .white:
         return SimpleMaterial(
-          color: UIColor(red: 0.94, green: 0.95, blue: 0.97, alpha: 1),
-          roughness: 0.24,
-          isMetallic: true
+          color: UIColor(red: 0.96, green: 0.96, blue: 0.95, alpha: 1),
+          roughness: 0.98,
+          isMetallic: false
         )
       case .black:
         return SimpleMaterial(
-          color: UIColor(red: 0.18, green: 0.19, blue: 0.22, alpha: 1),
-          roughness: 0.28,
-          isMetallic: true
+          color: UIColor(red: 0.26, green: 0.27, blue: 0.30, alpha: 1),
+          roughness: 0.98,
+          isMetallic: false
         )
       }
     }
@@ -5779,7 +5800,7 @@ private struct NativeARView: UIViewRepresentable {
     }
 
     private func accessoryMaterial(color: UIColor, metallic: Bool = true) -> SimpleMaterial {
-      SimpleMaterial(color: color, roughness: metallic ? 0.18 : 0.32, isMetallic: metallic)
+      SimpleMaterial(color: color, roughness: 0.92, isMetallic: false)
     }
 
     private func addHands(
