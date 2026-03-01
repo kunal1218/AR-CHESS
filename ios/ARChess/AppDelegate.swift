@@ -216,7 +216,7 @@ private final class GeminiHintService {
 
   init(
     apiKey: String? = AppRuntimeConfig.current.geminiAPIKey,
-    modelName: String = "gemini-2.0-flash-lite",
+    modelName: String = "gemini-2.0-flash",
     session: URLSession = .shared
   ) {
     self.apiKey = apiKey
@@ -1701,6 +1701,177 @@ private struct SpokenLine {
 private enum SpeechPriority: Int {
   case normal
   case urgent
+}
+
+private enum CaptureImpactSound: CaseIterable {
+  case pawnSword
+  case bishopGunshot
+  case knightThud
+  case queenLaser
+  case rookExplosion
+}
+
+private final class CaptureSoundEffectEngine {
+  private static let logger = Logger(subsystem: "ARChess", category: "CaptureSFX")
+
+  private let queue = DispatchQueue(label: "ARChess.CaptureSFX")
+  private let engine = AVAudioEngine()
+  private let mixer = AVAudioMixerNode()
+  private let format = AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 1)!
+  private lazy var buffers: [CaptureImpactSound: AVAudioPCMBuffer] = Self.buildBuffers(format: format)
+
+  init() {
+    engine.attach(mixer)
+    engine.connect(mixer, to: engine.mainMixerNode, format: format)
+    mixer.outputVolume = 0.95
+  }
+
+  func play(_ effect: CaptureImpactSound) {
+    queue.async { [weak self] in
+      guard let self else {
+        return
+      }
+
+      do {
+        try self.ensureRunning()
+      } catch {
+        Self.logger.error("Capture SFX engine failed to start: \(error.localizedDescription, privacy: .public)")
+        return
+      }
+
+      guard let buffer = self.buffers[effect] else {
+        return
+      }
+
+      let player = AVAudioPlayerNode()
+      self.engine.attach(player)
+      self.engine.connect(player, to: self.mixer, format: self.format)
+      player.scheduleBuffer(buffer, at: nil, options: []) { [weak self, weak player] in
+        guard let self, let player else {
+          return
+        }
+
+        self.queue.async {
+          player.stop()
+          self.engine.disconnectNodeOutput(player)
+          self.engine.detach(player)
+        }
+      }
+      player.play()
+    }
+  }
+
+  private func ensureRunning() throws {
+    let session = AVAudioSession.sharedInstance()
+    try session.setCategory(.ambient, mode: .default, options: [.mixWithOthers])
+    try session.setActive(true, options: [])
+
+    guard !engine.isRunning else {
+      return
+    }
+
+    try engine.start()
+  }
+
+  private static func buildBuffers(format: AVAudioFormat) -> [CaptureImpactSound: AVAudioPCMBuffer] {
+    Dictionary(uniqueKeysWithValues: CaptureImpactSound.allCases.map { effect in
+      (effect, makeBuffer(for: effect, format: format))
+    })
+  }
+
+  private static func makeBuffer(for effect: CaptureImpactSound, format: AVAudioFormat) -> AVAudioPCMBuffer {
+    switch effect {
+    case .pawnSword:
+      return makePawnSwordBuffer(format: format)
+    case .bishopGunshot:
+      return makeBishopGunshotBuffer(format: format)
+    case .knightThud:
+      return makeKnightThudBuffer(format: format)
+    case .queenLaser:
+      return makeQueenLaserBuffer(format: format)
+    case .rookExplosion:
+      return makeRookExplosionBuffer(format: format)
+    }
+  }
+
+  private static func makePawnSwordBuffer(format: AVAudioFormat) -> AVAudioPCMBuffer {
+    synthesizeBuffer(duration: 0.18, format: format) { t, normalized, noise in
+      let env = expEnvelope(normalized, decay: 4.2)
+      let sweepFrequency = 1450.0 - (650.0 * normalized)
+      let tonal = Float(sin(2 * Double.pi * sweepFrequency * t)) * 0.22
+      let composite = (noise * 0.34 + tonal) * env
+      return clampSample(composite)
+    }
+  }
+
+  private static func makeBishopGunshotBuffer(format: AVAudioFormat) -> AVAudioPCMBuffer {
+    synthesizeBuffer(duration: 0.20, format: format) { t, normalized, noise in
+      let crackEnvelope = expEnvelope(normalized / 0.14, decay: 9.0)
+      let crack: Float = normalized < 0.14 ? (noise * 0.95 * crackEnvelope) : 0
+      let bodyWave = Float(sin(2 * Double.pi * 180 * t)) * expEnvelope(normalized, decay: 6.5) * 0.24
+      let tail = noise * expEnvelope(normalized, decay: 10.0) * 0.16
+      return clampSample(crack + bodyWave + tail)
+    }
+  }
+
+  private static func makeKnightThudBuffer(format: AVAudioFormat) -> AVAudioPCMBuffer {
+    synthesizeBuffer(duration: 0.26, format: format) { t, normalized, noise in
+      let low = Float(sin(2 * Double.pi * 92 * t)) * expEnvelope(normalized, decay: 5.0) * 0.55
+      let smack = noise * expEnvelope(normalized, decay: 16.0) * 0.12
+      return clampSample(low + smack)
+    }
+  }
+
+  private static func makeQueenLaserBuffer(format: AVAudioFormat) -> AVAudioPCMBuffer {
+    synthesizeBuffer(duration: 0.24, format: format) { t, normalized, noise in
+      let frequency = 1900.0 - (850.0 * normalized)
+      let vibrato = 1.0 + (sin(2 * Double.pi * 14 * t) * 0.05)
+      let beam = Float(sin(2 * Double.pi * frequency * vibrato * t)) * expEnvelope(normalized, decay: 2.8) * 0.42
+      let sparkle = noise * expEnvelope(normalized, decay: 7.5) * 0.06
+      return clampSample(beam + sparkle)
+    }
+  }
+
+  private static func makeRookExplosionBuffer(format: AVAudioFormat) -> AVAudioPCMBuffer {
+    synthesizeBuffer(duration: 0.42, format: format) { t, normalized, noise in
+      let boom = Float(sin(2 * Double.pi * 64 * t)) * expEnvelope(normalized, decay: 3.5) * 0.54
+      let burst = noise * expEnvelope(normalized, decay: 4.2) * 0.44
+      let rumble = Float(sin(2 * Double.pi * 34 * t)) * expEnvelope(normalized, decay: 2.2) * 0.18
+      return clampSample(boom + burst + rumble)
+    }
+  }
+
+  private static func synthesizeBuffer(
+    duration: Double,
+    format: AVAudioFormat,
+    generator: (_ time: Double, _ normalized: Double, _ noise: Float) -> Float
+  ) -> AVAudioPCMBuffer {
+    let sampleRate = format.sampleRate
+    let frames = max(1, AVAudioFrameCount(duration * sampleRate))
+    let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames)!
+    buffer.frameLength = frames
+
+    guard let channel = buffer.floatChannelData?[0] else {
+      return buffer
+    }
+
+    for index in 0..<Int(frames) {
+      let t = Double(index) / sampleRate
+      let normalized = min(max(Double(index) / Double(max(Int(frames) - 1, 1)), 0), 1)
+      let noise = Float.random(in: -1...1)
+      channel[index] = generator(t, normalized, noise)
+    }
+
+    return buffer
+  }
+
+  private static func expEnvelope(_ x: Double, decay: Double) -> Float {
+    Float(exp(-decay * max(0, x)))
+  }
+
+  private static func clampSample(_ sample: Float) -> Float {
+    min(max(sample, -1), 1)
+  }
 }
 
 private final class StockfishAssetSchemeHandler: NSObject, WKURLSchemeHandler {
@@ -3320,8 +3491,8 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       ]
     case .ok:
       return [
-        SpokenLine(speaker: .pawn, text: "Forward. Hold the line and draw blood later.", pitch: 0.98, rate: 0.44, volume: 0.84),
-        SpokenLine(speaker: .rook, text: "Slow hunt. Strong walls.", pitch: 1.34, rate: 0.46, volume: 0.96),
+        SpokenLine(speaker: .pawn, text: "I'll gladly die for my country.", pitch: 0.98, rate: 0.44, volume: 0.84),
+        SpokenLine(speaker: .king, text: "Good work, my subject.", pitch: 1.34, rate: 0.46, volume: 0.96),
       ]
     case .inaccuracy:
       return [
@@ -3343,7 +3514,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     case .rook:
       return [
         SpokenLine(speaker: .rook, text: "This beast was not ready to fall.", pitch: 1.52, rate: 0.52, volume: 1.0),
-        SpokenLine(speaker: .rook, text: "You do not cage a hunter for long.", pitch: 1.44, rate: 0.50, volume: 1.0),
+        SpokenLine(speaker: .rook, text: "You do not cage a beast for long.", pitch: 1.44, rate: 0.50, volume: 1.0),
       ]
     case .queen:
       return [
@@ -3391,33 +3562,33 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     switch kind {
     case .king:
       return [
-        SpokenLine(speaker: .king, text: "Keep this quiet and I may still survive the headlines.", pitch: 1.20, rate: 0.38, volume: 0.96),
+        SpokenLine(speaker: .king, text: "I'm the boss around here.", pitch: 1.20, rate: 0.38, volume: 0.96),
         SpokenLine(speaker: .king, text: "Stay calm. We can still broker a deal.", pitch: 1.16, rate: 0.36, volume: 0.94),
       ]
     case .queen:
       return [
-        SpokenLine(speaker: .queen, text: "Power looks better on me, do you not think?", pitch: 0.72, rate: 0.28, volume: 0.94),
+        SpokenLine(speaker: .queen, text: "HAHAHAHAHA.", pitch: 0.72, rate: 0.28, volume: 0.94),
         SpokenLine(speaker: .queen, text: "I could rule either side, but this one wears me well.", pitch: 0.70, rate: 0.27, volume: 0.92),
       ]
     case .bishop:
       return [
-        SpokenLine(speaker: .bishop, text: "Only Christ can save us, so move with purpose.", pitch: 0.84, rate: 0.34, volume: 0.90),
-        SpokenLine(speaker: .bishop, text: "This diagonal is scripture. Read it carefully.", pitch: 0.86, rate: 0.35, volume: 0.88),
+        SpokenLine(speaker: .bishop, text: "Only Christ can save us.", pitch: 0.84, rate: 0.34, volume: 0.90),
+        SpokenLine(speaker: .bishop, text: "This diagonal is safe under the watchful eye of my holy glock.", pitch: 0.86, rate: 0.35, volume: 0.88),
       ]
     case .knight:
       return [
-        SpokenLine(speaker: .knight, text: "I smell panic. Let me off the leash.", pitch: 1.48, rate: 0.60, volume: 0.98),
-        SpokenLine(speaker: .knight, text: "I hunt crooked and strike hard.", pitch: 1.44, rate: 0.58, volume: 0.96),
+        SpokenLine(speaker: .knight, text: "Let me off the leash.", pitch: 1.48, rate: 0.60, volume: 0.98),
+        SpokenLine(speaker: .knight, text: "Tis not a challenge for me.", pitch: 1.44, rate: 0.58, volume: 0.96),
       ]
     case .rook:
       return [
-        SpokenLine(speaker: .rook, text: "This beast guards the file. Nothing escapes.", pitch: 1.34, rate: 0.48, volume: 1.0),
-        SpokenLine(speaker: .rook, text: "A wall with teeth still counts as a wall.", pitch: 1.30, rate: 0.46, volume: 0.98),
+        SpokenLine(speaker: .rook, text: "I guard the file. Nothing escapes.", pitch: 1.34, rate: 0.48, volume: 1.0),
+        SpokenLine(speaker: .rook, text: "I am the largest.", pitch: 1.30, rate: 0.46, volume: 0.98),
       ]
     case .pawn:
       return [
-        SpokenLine(speaker: .pawn, text: "Forward. I was born for blood and promotion.", pitch: 0.98, rate: 0.43, volume: 0.86),
-        SpokenLine(speaker: .pawn, text: "I march first and I taste the danger first.", pitch: 0.96, rate: 0.41, volume: 0.84),
+        SpokenLine(speaker: .pawn, text: "I'll gladly die for my country.", pitch: 0.98, rate: 0.43, volume: 0.86),
+        SpokenLine(speaker: .pawn, text: "Coming through!", pitch: 0.96, rate: 0.41, volume: 0.84),
       ]
     }
   }
@@ -5183,6 +5354,7 @@ private struct NativeARView: UIViewRepresentable {
     private var lastWarmupStatusMessage: String?
     private var pendingAnimatedMoves: [AnimatedMoveContext] = []
     private var moveAnimationTask: Task<Void, Never>?
+    private let captureSoundEffects = CaptureSoundEffectEngine()
 
     init(
       matchLog: MatchLogStore,
@@ -5669,6 +5841,10 @@ private struct NativeARView: UIViewRepresentable {
         knife.move(to: slash, relativeTo: attacker, duration: 0.10, timingFunction: .easeIn)
       }
 
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [captureSoundEffects] in
+        captureSoundEffects.play(.pawnSword)
+      }
+
       if let victim {
         let struck = transformed(
           victim.transform,
@@ -5720,6 +5896,10 @@ private struct NativeARView: UIViewRepresentable {
         )
         victim.move(to: hit, relativeTo: victim.parent, duration: 0.18, timingFunction: .easeOut)
 
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.11) { [captureSoundEffects] in
+          captureSoundEffects.play(.bishopGunshot)
+        }
+
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) { [weak bullet, weak tracer] in
           bullet?.removeFromParent()
           tracer?.removeFromParent()
@@ -5747,6 +5927,10 @@ private struct NativeARView: UIViewRepresentable {
           rotation: simd_quatf(angle: .pi * 1.2, axis: SIMD3<Float>(0, 1, 0))
         )
         victim.move(to: tossed, relativeTo: victim.parent, duration: 0.26, timingFunction: .easeOut)
+      }
+
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.14) { [captureSoundEffects] in
+        captureSoundEffects.play(.knightThud)
       }
 
       try? await Task.sleep(nanoseconds: 340_000_000)
@@ -5796,6 +5980,10 @@ private struct NativeARView: UIViewRepresentable {
           rotation: simd_quatf(angle: .pi / 2.2, axis: SIMD3<Float>(0, 0, 1))
         )
         victim.move(to: blasted, relativeTo: victim.parent, duration: 0.26, timingFunction: .easeOut)
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.14) { [captureSoundEffects] in
+          captureSoundEffects.play(.rookExplosion)
+        }
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.20) { [weak exhaust] in
           exhaust?.removeFromParent()
@@ -5862,6 +6050,10 @@ private struct NativeARView: UIViewRepresentable {
           scale: SIMD3<Float>(repeating: 0.18)
         )
         victim.move(to: vaporized, relativeTo: victim.parent, duration: 0.22, timingFunction: .easeIn)
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.10) { [captureSoundEffects] in
+          captureSoundEffects.play(.queenLaser)
+        }
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.20) { [weak leftBolt, weak rightBolt, weak leftBeam, weak rightBeam] in
           leftBolt?.removeFromParent()
