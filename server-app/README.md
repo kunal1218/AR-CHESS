@@ -18,7 +18,9 @@ Backend owned by Person 1.
 
 - Copy `.env.example` to `.env` for local development if needed.
 - Use `.env.railway.example` as the Railway deployment template.
-- Prefer `DATABASE_URL` on Railway. The app falls back to `POSTGRES_*` variables if needed.
+- Prefer `DATABASE_URL` on Railway private networking.
+- `DATABASE_PRIVATE_URL` and `DATABASE_PUBLIC_URL` are also accepted if that is how your service variables are wired.
+- The app also supports Railway `PG*` variables and finally falls back to `POSTGRES_*` variables.
 
 ## Health ping
 

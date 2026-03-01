@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 
 from fastapi.testclient import TestClient
 
-from main import app
+from main import app, get_postgres_dsn, normalize_postgres_dsn
 
 
 def test_fastapi_app_bootstraps() -> None:
@@ -99,3 +99,28 @@ def test_get_game_moves_returns_ordered_log(monkeypatch) -> None:
     assert response.status_code == 200
     assert response.json()["game_id"] == str(game_id)
     assert [item["move_uci"] for item in response.json()["moves"]] == ["e2e4", "e7e5"]
+
+
+def test_get_postgres_dsn_prefers_railway_private_url(monkeypatch) -> None:
+    monkeypatch.setenv("DATABASE_PRIVATE_URL", "postgres://user:pass@private-host:5432/railway")
+    monkeypatch.setenv("DATABASE_URL", "postgresql://user:pass@public-host:5432/railway")
+
+    assert get_postgres_dsn() == "postgresql://user:pass@private-host:5432/railway"
+
+
+def test_get_postgres_dsn_supports_pg_fallback_vars(monkeypatch) -> None:
+    monkeypatch.delenv("DATABASE_PRIVATE_URL", raising=False)
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.setenv("PGHOST", "railway.internal")
+    monkeypatch.setenv("PGPORT", "5432")
+    monkeypatch.setenv("PGDATABASE", "railway")
+    monkeypatch.setenv("PGUSER", "postgres")
+    monkeypatch.setenv("PGPASSWORD", "secret")
+
+    assert get_postgres_dsn() == "postgresql://postgres:secret@railway.internal:5432/railway"
+
+
+def test_normalize_postgres_dsn_rewrites_postgres_scheme() -> None:
+    assert normalize_postgres_dsn("postgres://user:pass@host:5432/db") == (
+        "postgresql://user:pass@host:5432/db"
+    )

@@ -1,6 +1,7 @@
 import os
 import re
 import uuid
+import logging
 from datetime import datetime
 
 from fastapi import FastAPI, HTTPException
@@ -15,6 +16,8 @@ load_dotenv()
 DEFAULT_POSTGRES_PORT = 5432
 UCI_MOVE_PATTERN = re.compile(r"^[a-h][1-8][a-h][1-8][nbrq]?$")
 SCHEMA_READY = False
+logger = logging.getLogger("archess.server")
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
 
 app = FastAPI(
@@ -56,21 +59,57 @@ class GameMoveListResponse(BaseModel):
 
 
 def get_postgres_dsn() -> str:
-    database_url = os.getenv("DATABASE_URL", "").strip()
-    if database_url:
-        return database_url
+    for env_key in ("DATABASE_PRIVATE_URL", "DATABASE_URL", "DATABASE_PUBLIC_URL"):
+        database_url = os.getenv(env_key, "").strip()
+        if database_url:
+            return normalize_postgres_dsn(database_url)
 
-    host = os.getenv("POSTGRES_HOST", "localhost")
-    port = os.getenv("POSTGRES_PORT", str(DEFAULT_POSTGRES_PORT))
-    database = os.getenv("POSTGRES_DB", "archess")
-    user = os.getenv("POSTGRES_USER", "archess")
-    password = os.getenv("POSTGRES_PASSWORD", "archess")
+    host = (
+        os.getenv("PGHOST", "").strip()
+        or os.getenv("POSTGRES_HOST", "").strip()
+        or "localhost"
+    )
+    port = (
+        os.getenv("PGPORT", "").strip()
+        or os.getenv("POSTGRES_PORT", "").strip()
+        or str(DEFAULT_POSTGRES_PORT)
+    )
+    database = (
+        os.getenv("PGDATABASE", "").strip()
+        or os.getenv("POSTGRES_DB", "").strip()
+        or "archess"
+    )
+    user = (
+        os.getenv("PGUSER", "").strip()
+        or os.getenv("POSTGRES_USER", "").strip()
+        or "archess"
+    )
+    password = (
+        os.getenv("PGPASSWORD", "").strip()
+        or os.getenv("POSTGRES_PASSWORD", "").strip()
+        or "archess"
+    )
 
     return f"postgresql://{user}:{password}@{host}:{port}/{database}"
 
 
+def normalize_postgres_dsn(raw_dsn: str) -> str:
+    if raw_dsn.startswith("postgres://"):
+        return "postgresql://" + raw_dsn.removeprefix("postgres://")
+    return raw_dsn
+
+
 def connect_postgres() -> psycopg.Connection:
-    return psycopg.connect(get_postgres_dsn(), connect_timeout=5)
+    dsn = get_postgres_dsn()
+    logger.info("Connecting to Postgres using DSN source host=%s", redact_postgres_host(dsn))
+    return psycopg.connect(dsn, connect_timeout=5)
+
+
+def redact_postgres_host(dsn: str) -> str:
+    match = re.search(r"@([^/:?]+)", dsn)
+    if match:
+        return match.group(1)
+    return "unknown"
 
 
 def ensure_move_log_schema() -> None:
@@ -194,6 +233,7 @@ def ping_postgres() -> tuple[bool, str]:
 
         return True, "Postgres ping successful"
     except Exception as exc:
+        logger.exception("Postgres ping failed")
         return False, f"Postgres ping failed: {exc}"
 
 
@@ -226,6 +266,7 @@ def create_game() -> CreateGameResponse:
     try:
         game_id = create_game_record()
     except Exception as exc:
+        logger.exception("Could not create game log in Postgres")
         raise HTTPException(
             status_code=503,
             detail=f"Could not create game log in Postgres: {exc}",
@@ -242,6 +283,7 @@ def record_game_move(
     try:
         move = save_game_move(game_id=game_id, ply=payload.ply, move_uci=payload.move_uci)
     except Exception as exc:
+        logger.exception("Could not write move log to Postgres")
         raise HTTPException(
             status_code=503,
             detail=f"Could not write move log to Postgres: {exc}",
@@ -255,6 +297,7 @@ def get_game_moves(game_id: uuid.UUID) -> GameMoveListResponse:
     try:
         moves = [GameMoveRecord.model_validate(item) for item in fetch_game_moves(game_id)]
     except Exception as exc:
+        logger.exception("Could not load move log from Postgres")
         raise HTTPException(
             status_code=503,
             detail=f"Could not load move log from Postgres: {exc}",
