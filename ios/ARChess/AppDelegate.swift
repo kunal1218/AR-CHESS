@@ -401,6 +401,7 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
   private var isEngineReady = false
   private(set) var lastError: String?
   private(set) var lastStatus = "Stockfish idle."
+  private let analysisTimeoutNanoseconds: UInt64 = 25_000_000_000
 
   func analyze(fen: String, depth: Int = 10) async throws -> StockfishAnalysis {
     ensureWebView()
@@ -423,7 +424,7 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
     return try await withCheckedThrowingContinuation { continuation in
       pendingContinuations[requestID] = continuation
       timeoutTasks[requestID] = Task { [weak self] in
-        try? await Task.sleep(nanoseconds: 12_000_000_000)
+        try? await Task.sleep(nanoseconds: self?.analysisTimeoutNanoseconds ?? 25_000_000_000)
         await MainActor.run {
           guard let self,
                 let continuation = self.pendingContinuations.removeValue(forKey: requestID) else {
@@ -433,6 +434,8 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
           self.timeoutTasks[requestID]?.cancel()
           self.timeoutTasks[requestID] = nil
           self.lastError = "Stockfish request timed out."
+          self.lastStatus = "Stockfish search timed out at depth \(depth)."
+          self.cancelCurrentAnalysis()
           continuation.resume(
             throwing: NSError(
               domain: "ARChess.Stockfish",
@@ -568,6 +571,10 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
       baseURL: nil
     )
     self.webView = webView
+  }
+
+  private func cancelCurrentAnalysis() {
+    webView?.evaluateJavaScript("window.__archessCancelCurrentAnalysis && window.__archessCancelCurrentAnalysis();")
   }
 
   func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
@@ -805,6 +812,17 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
             sendEngineCommand('position fen ' + next.fen);
             sendEngineCommand('go depth ' + next.depth);
           }
+
+          window.__archessCancelCurrentAnalysis = function() {
+            if (bridgeState.engine) {
+              sendEngineCommand('stop');
+            }
+
+            bridgeState.current = null;
+            bridgeState.queue = [];
+            bridgeStatus('Current Stockfish search cancelled.');
+            return true;
+          };
 
           window.__archessAnalyze = function(id, fen, depth) {
             bridgeState.queue.push({ id, fen, depth });
