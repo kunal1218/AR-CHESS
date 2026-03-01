@@ -3545,9 +3545,8 @@ private struct NativeARExperienceView: View {
       .padding(.vertical, 24)
 
       VStack {
-        Spacer()
-        HStack(alignment: .bottom) {
-          VStack(alignment: .leading, spacing: 10) {
+        HStack(alignment: .top) {
+          HStack(spacing: 10) {
             overlayToggleButton(
               title: isModePanelVisible ? "Hide Mode" : "Show Mode",
               systemImage: "rectangle.topthird.inset.filled"
@@ -3569,13 +3568,17 @@ private struct NativeARExperienceView: View {
 
           Spacer(minLength: 16)
 
-          NativeActionButton(title: "Exit AR", style: .solid) {
+          overlayToggleButton(
+            title: "Exit AR",
+            systemImage: "xmark"
+          ) {
             closeExperience()
           }
-          .frame(maxWidth: 220)
         }
         .padding(.horizontal, 18)
-        .padding(.bottom, 24)
+        .padding(.top, 24)
+
+        Spacer()
       }
     }
     .task {
@@ -4971,10 +4974,28 @@ private struct NativeARView: UIViewRepresentable {
       }
 
       if let victim {
-        let tracer = makeTracer(color: UIColor(red: 1.0, green: 0.94, blue: 0.70, alpha: 0.92), length: 0.16, thickness: 0.0035)
-        tracer.position = attacker.position + SIMD3<Float>(0, 0.040, 0) + (direction * 0.042)
-        tracer.orientation = simd_quatf(from: SIMD3<Float>(0, 1, 0), to: normalized3(direction + SIMD3<Float>(0, 0.10, 0), fallback: SIMD3<Float>(0, 1, 0)))
+        let muzzle = attacker.position + SIMD3<Float>(0, 0.038, 0) + (direction * 0.048)
+        let target = victim.position + SIMD3<Float>(0, 0.018, 0)
+        let flight = normalized3(target - muzzle, fallback: direction)
+
+        let bullet = ModelEntity(
+          mesh: .generateSphere(radius: 0.0045),
+          materials: [SimpleMaterial(color: UIColor(red: 1.0, green: 0.93, blue: 0.70, alpha: 1), roughness: 0.08, isMetallic: true)]
+        )
+        bullet.position = muzzle
+        boardRoot.addChild(bullet)
+
+        let tracer = makeTracer(color: UIColor(red: 1.0, green: 0.94, blue: 0.70, alpha: 0.92), length: 0.05, thickness: 0.0028)
+        tracer.position = muzzle - (flight * 0.020)
+        tracer.orientation = simd_quatf(from: SIMD3<Float>(0, 1, 0), to: normalized3(flight + SIMD3<Float>(0, 0.02, 0), fallback: SIMD3<Float>(0, 1, 0)))
         boardRoot.addChild(tracer)
+
+        let bulletTransform = Transform(
+          scale: bullet.scale,
+          rotation: simd_quatf(angle: 0, axis: SIMD3<Float>(0, 1, 0)),
+          translation: target
+        )
+        bullet.move(to: bulletTransform, relativeTo: bullet.parent, duration: 0.11, timingFunction: .linear)
 
         let hit = transformed(
           victim.transform,
@@ -4983,7 +5004,8 @@ private struct NativeARView: UIViewRepresentable {
         )
         victim.move(to: hit, relativeTo: victim.parent, duration: 0.18, timingFunction: .easeOut)
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) { [weak tracer] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) { [weak bullet, weak tracer] in
+          bullet?.removeFromParent()
           tracer?.removeFromParent()
         }
       }
@@ -5021,17 +5043,36 @@ private struct NativeARView: UIViewRepresentable {
       let recoil = transformed(originalAttacker, translation: direction * -0.018)
       attacker.move(to: recoil, relativeTo: attacker.parent, duration: 0.10, timingFunction: .easeOut)
 
-      let rocket = ModelEntity(
-        mesh: .generateSphere(radius: 0.006),
-        materials: [SimpleMaterial(color: UIColor(red: 1.0, green: 0.58, blue: 0.22, alpha: 1), roughness: 0.10, isMetallic: true)]
+      let shell = Entity()
+      let shellBody = ModelEntity(
+        mesh: .generateBox(size: SIMD3<Float>(0.007, 0.024, 0.007)),
+        materials: [SimpleMaterial(color: UIColor(red: 0.88, green: 0.58, blue: 0.24, alpha: 1), roughness: 0.10, isMetallic: true)]
       )
-      rocket.position = attacker.position + SIMD3<Float>(0, 0.024, 0) + direction * 0.036
-      boardRoot.addChild(rocket)
+      shell.addChild(shellBody)
+
+      let shellTip = ModelEntity(
+        mesh: .generateSphere(radius: 0.005),
+        materials: [SimpleMaterial(color: UIColor(red: 0.98, green: 0.78, blue: 0.30, alpha: 1), roughness: 0.06, isMetallic: true)]
+      )
+      shellTip.position = SIMD3<Float>(0, 0.015, 0)
+      shell.addChild(shellTip)
+
+      let launchPoint = attacker.position + SIMD3<Float>(0, 0.024, 0) + direction * 0.036
+      shell.position = launchPoint
+      boardRoot.addChild(shell)
 
       if let victim {
         let target = victim.position + SIMD3<Float>(0, 0.020, 0)
-        let rocketTransform = Transform(scale: rocket.scale, rotation: rocket.orientation, translation: target)
-        rocket.move(to: rocketTransform, relativeTo: rocket.parent, duration: 0.14, timingFunction: .linear)
+        let flight = normalized3(target - launchPoint, fallback: direction)
+        shell.orientation = simd_quatf(from: SIMD3<Float>(0, 1, 0), to: normalized3(flight + SIMD3<Float>(0, 0.02, 0), fallback: SIMD3<Float>(0, 1, 0)))
+
+        let exhaust = makeTracer(color: UIColor(red: 1.0, green: 0.60, blue: 0.18, alpha: 0.78), length: 0.07, thickness: 0.005)
+        exhaust.position = launchPoint - (flight * 0.030)
+        exhaust.orientation = shell.orientation
+        boardRoot.addChild(exhaust)
+
+        let shellTransform = Transform(scale: shell.scale, rotation: shell.orientation, translation: target)
+        shell.move(to: shellTransform, relativeTo: shell.parent, duration: 0.14, timingFunction: .linear)
 
         let blasted = transformed(
           victim.transform,
@@ -5039,10 +5080,14 @@ private struct NativeARView: UIViewRepresentable {
           rotation: simd_quatf(angle: .pi / 2.2, axis: SIMD3<Float>(0, 0, 1))
         )
         victim.move(to: blasted, relativeTo: victim.parent, duration: 0.26, timingFunction: .easeOut)
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.20) { [weak exhaust] in
+          exhaust?.removeFromParent()
+        }
       }
 
-      DispatchQueue.main.asyncAfter(deadline: .now() + 0.20) { [weak rocket] in
-        rocket?.removeFromParent()
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.20) { [weak shell] in
+        shell?.removeFromParent()
       }
 
       try? await Task.sleep(nanoseconds: 340_000_000)
@@ -5061,27 +5106,53 @@ private struct NativeARView: UIViewRepresentable {
         glasses.move(to: removed, relativeTo: attacker, duration: 0.08, timingFunction: .easeIn)
       }
 
-      let leftBeam = makeTracer(color: UIColor(red: 1.0, green: 0.12, blue: 0.18, alpha: 0.96), length: 0.15, thickness: 0.0032)
-      let rightBeam = makeTracer(color: UIColor(red: 1.0, green: 0.12, blue: 0.18, alpha: 0.96), length: 0.15, thickness: 0.0032)
-      leftBeam.position = attacker.position + SIMD3<Float>(-0.007, 0.041, -0.012)
-      rightBeam.position = attacker.position + SIMD3<Float>(0.007, 0.041, -0.012)
-      leftBeam.orientation = simd_quatf(from: SIMD3<Float>(0, 1, 0), to: normalized3(direction + SIMD3<Float>(0, 0.04, 0), fallback: SIMD3<Float>(0, 1, 0)))
-      rightBeam.orientation = leftBeam.orientation
-      boardRoot.addChild(leftBeam)
-      boardRoot.addChild(rightBeam)
-
       if let victim {
+        let leftOrigin = attacker.position + SIMD3<Float>(-0.007, 0.041, -0.012)
+        let rightOrigin = attacker.position + SIMD3<Float>(0.007, 0.041, -0.012)
+        let target = victim.position + SIMD3<Float>(0, 0.024, 0)
+        let leftFlight = normalized3(target - leftOrigin, fallback: direction)
+        let rightFlight = normalized3(target - rightOrigin, fallback: direction)
+
+        let leftBolt = ModelEntity(
+          mesh: .generateSphere(radius: 0.0045),
+          materials: [SimpleMaterial(color: UIColor(red: 1.0, green: 0.14, blue: 0.22, alpha: 1), roughness: 0.04, isMetallic: true)]
+        )
+        let rightBolt = ModelEntity(
+          mesh: .generateSphere(radius: 0.0045),
+          materials: [SimpleMaterial(color: UIColor(red: 1.0, green: 0.14, blue: 0.22, alpha: 1), roughness: 0.04, isMetallic: true)]
+        )
+        leftBolt.position = leftOrigin
+        rightBolt.position = rightOrigin
+        boardRoot.addChild(leftBolt)
+        boardRoot.addChild(rightBolt)
+
+        let leftBeam = makeTracer(color: UIColor(red: 1.0, green: 0.12, blue: 0.18, alpha: 0.96), length: 0.06, thickness: 0.0032)
+        let rightBeam = makeTracer(color: UIColor(red: 1.0, green: 0.12, blue: 0.18, alpha: 0.96), length: 0.06, thickness: 0.0032)
+        leftBeam.position = leftOrigin - (leftFlight * 0.024)
+        rightBeam.position = rightOrigin - (rightFlight * 0.024)
+        leftBeam.orientation = simd_quatf(from: SIMD3<Float>(0, 1, 0), to: normalized3(leftFlight + SIMD3<Float>(0, 0.03, 0), fallback: SIMD3<Float>(0, 1, 0)))
+        rightBeam.orientation = simd_quatf(from: SIMD3<Float>(0, 1, 0), to: normalized3(rightFlight + SIMD3<Float>(0, 0.03, 0), fallback: SIMD3<Float>(0, 1, 0)))
+        boardRoot.addChild(leftBeam)
+        boardRoot.addChild(rightBeam)
+
+        let leftTransform = Transform(scale: leftBolt.scale, rotation: leftBolt.orientation, translation: target)
+        let rightTransform = Transform(scale: rightBolt.scale, rotation: rightBolt.orientation, translation: target)
+        leftBolt.move(to: leftTransform, relativeTo: leftBolt.parent, duration: 0.10, timingFunction: .linear)
+        rightBolt.move(to: rightTransform, relativeTo: rightBolt.parent, duration: 0.10, timingFunction: .linear)
+
         let vaporized = transformed(
           victim.transform,
           translation: direction * 0.050 + SIMD3<Float>(0, 0.030, 0),
           scale: SIMD3<Float>(repeating: 0.18)
         )
         victim.move(to: vaporized, relativeTo: victim.parent, duration: 0.22, timingFunction: .easeIn)
-      }
 
-      DispatchQueue.main.asyncAfter(deadline: .now() + 0.20) { [weak leftBeam, weak rightBeam] in
-        leftBeam?.removeFromParent()
-        rightBeam?.removeFromParent()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.20) { [weak leftBolt, weak rightBolt, weak leftBeam, weak rightBeam] in
+          leftBolt?.removeFromParent()
+          rightBolt?.removeFromParent()
+          leftBeam?.removeFromParent()
+          rightBeam?.removeFromParent()
+        }
       }
 
       try? await Task.sleep(nanoseconds: 300_000_000)
