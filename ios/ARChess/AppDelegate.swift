@@ -2898,11 +2898,23 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   }
 
   struct Caption {
-    let speaker: PersonalitySpeaker
+    let speaker: PersonalitySpeaker?
+    let speakerName: String
     let line: String
+    let imageAssetName: String?
 
-    var speakerName: String {
-      speaker.displayName
+    init(speaker: PersonalitySpeaker, line: String) {
+      self.speaker = speaker
+      self.speakerName = speaker.displayName
+      self.line = line
+      self.imageAssetName = nil
+    }
+
+    init(title: String, line: String, imageAssetName: String) {
+      self.speaker = nil
+      self.speakerName = title
+      self.line = line
+      self.imageAssetName = imageAssetName
     }
   }
 
@@ -2932,6 +2944,8 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   private var hintCache: [String: String] = [:]
   private var currentHintKey: String?
   private var pendingHintReveal = false
+  private var pendingHintNarration = false
+  private var narratedHintKeys: Set<String> = []
   private var nextKingCookedAllowedPly: [ChessColor: Int] = [:]
 
   override init() {
@@ -2988,6 +3002,8 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     hintCache.removeAll()
     currentHintKey = nil
     pendingHintReveal = false
+    pendingHintNarration = false
+    narratedHintKeys.removeAll()
     geminiDebugLines = []
     visibleHintText = nil
     isHintLoading = false
@@ -3189,11 +3205,8 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     } else if let captured = move.captured {
       dialogueLines = captureLines(for: captured.kind)
       priority = .normal
-    } else if let assessment {
-      dialogueLines = lines(for: assessment)
-      priority = .normal
     } else {
-      dialogueLines = ambientMoveFlavorLines()
+      dialogueLines = moveFlavorLines(for: move.piece.kind)
       priority = .normal
     }
 
