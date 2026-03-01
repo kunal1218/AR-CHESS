@@ -50,10 +50,31 @@ private enum PlayerMode: String, Hashable {
   }
 }
 
+private enum PlayModeChoice: Hashable {
+  case passAndPlay
+  case queueMatch
+
+  var title: String {
+    switch self {
+    case .passAndPlay:
+      return "Pass & Play"
+    case .queueMatch:
+      return "Queue Match"
+    }
+  }
+}
+
+private enum ExperienceMode: Hashable {
+  case passAndPlay(PlayerMode)
+  case queueMatch
+}
+
 private enum NativeScreen {
+  case modeSelection
   case landing
   case lobby(PlayerMode)
-  case experience(PlayerMode)
+  case queueMatch
+  case experience(ExperienceMode)
 }
 
 private struct AppRuntimeConfig {
@@ -92,6 +113,103 @@ private struct RemoteGameResponse: Decodable {
 private struct RemoteMoveRequest: Encodable {
   let ply: Int
   let move_uci: String
+}
+
+private struct QueueTicketRequest: Encodable {
+  let player_id: String
+}
+
+private struct QueueMatchMoveRequestPayload: Encodable {
+  let player_id: String
+  let ply: Int
+  let move_uci: String
+}
+
+private struct QueueTicketPayload: Decodable {
+  let ticket_id: String
+  let player_id: String
+  let status: String
+  let match_id: String?
+  let assigned_color: String?
+  let heartbeat_at: String
+  let expires_at: String
+  let poll_after_ms: Int
+}
+
+private struct QueueMatchMovePayload: Decodable, Equatable {
+  let match_id: String
+  let game_id: String
+  let ply: Int
+  let move_uci: String
+  let player_id: String
+  let created_at: String
+}
+
+private struct QueueMatchStatePayload: Decodable {
+  let match_id: String
+  let game_id: String
+  let status: String
+  let white_player_id: String
+  let black_player_id: String
+  let your_color: String?
+  let latest_ply: Int
+  let next_turn: String
+  let moves: [QueueMatchMovePayload]
+}
+
+private struct QueueMatchMovesPayload: Decodable {
+  let match_id: String
+  let game_id: String
+  let latest_ply: Int
+  let next_turn: String
+  let moves: [QueueMatchMovePayload]
+}
+
+private struct QueueConflictDetail: Decodable {
+  let message: String
+  let current_state: QueueMatchStatePayload
+}
+
+private struct QueueConflictEnvelope: Decodable {
+  let detail: QueueConflictDetail
+}
+
+private enum QueueMatchViewState: String {
+  case idle
+  case waiting
+  case matched
+  case reconnecting
+  case syncError
+  case cancelled
+}
+
+private enum QueueMatchStoreError: LocalizedError {
+  case missingAPIBaseURL
+  case invalidURL
+  case serverError(String)
+  case conflict(String, QueueMatchStatePayload)
+  case invalidMatchState(String)
+  case notYourTurn
+  case duplicateMove
+
+  var errorDescription: String? {
+    switch self {
+    case .missingAPIBaseURL:
+      return "Queue Match requires ARChessAPIBaseURL so this device can reach the backend."
+    case .invalidURL:
+      return "Queue Match could not build a valid backend URL."
+    case .serverError(let message):
+      return message
+    case .conflict(let message, _):
+      return message
+    case .invalidMatchState(let message):
+      return message
+    case .notYourTurn:
+      return "It is not your turn."
+    case .duplicateMove:
+      return "This move is already pending or already recorded."
+    }
+  }
 }
 
 @MainActor
@@ -252,6 +370,612 @@ private final class MatchLogStore: ObservableObject {
         userInfo: [NSLocalizedDescriptionKey: message]
       )
     }
+  }
+}
+
+@MainActor
+private final class QueueMatchStore: ObservableObject {
+  @Published private(set) var state: QueueMatchViewState = .idle
+  @Published private(set) var statusText = "Queue Match syncs through Railway."
+  @Published private(set) var logEntries: [MatchLogStore.Entry] = []
+  @Published private(set) var remoteGameID: String?
+  @Published private(set) var matchID: String?
+  @Published private(set) var assignedColor: ChessColor?
+  @Published private(set) var nextTurn: ChessColor = .white
+  @Published private(set) var latestPly = 0
+
+  let playerID: UUID
+
+  private let apiBaseURL: URL?
+  private var ticketID: UUID?
+  private var heartbeatTask: Task<Void, Never>?
+  private var ticketPollTask: Task<Void, Never>?
+  private var movePollTask: Task<Void, Never>?
+  private var knownMoves: [QueueMatchMovePayload] = []
+  private var pendingSubmittedPlies: Set<Int> = []
+  private var boardSyncHandler: (([QueueMatchMovePayload]) -> Void)?
+
+  init(apiBaseURL: URL? = AppRuntimeConfig.current.apiBaseURL) {
+    self.apiBaseURL = apiBaseURL
+
+    let defaultsKey = "ARChessDevicePlayerID"
+    if let raw = UserDefaults.standard.string(forKey: defaultsKey),
+       let stored = UUID(uuidString: raw) {
+      playerID = stored
+    } else {
+      let generated = UUID()
+      UserDefaults.standard.set(generated.uuidString, forKey: defaultsKey)
+      playerID = generated
+    }
+
+    if apiBaseURL == nil {
+      state = .syncError
+      statusText = "Queue Match requires ARChessAPIBaseURL before this device can join."
+    }
+  }
+
+  var canOpenExperience: Bool {
+    state == .matched && matchID != nil
+  }
+
+  var canSubmitMove: Bool {
+    guard state == .matched, let assignedColor else {
+      return false
+    }
+
+    return assignedColor == nextTurn
+  }
+
+  var playerIDLabel: String {
+    playerID.uuidString
+  }
+
+  func bindBoardSync(_ handler: @escaping ([QueueMatchMovePayload]) -> Void) {
+    boardSyncHandler = handler
+    handler(knownMoves.sorted(by: { $0.ply < $1.ply }))
+  }
+
+  func unbindBoardSync() {
+    boardSyncHandler = nil
+  }
+
+  func joinQueue() async {
+    guard let apiBaseURL else {
+      state = .syncError
+      statusText = QueueMatchStoreError.missingAPIBaseURL.localizedDescription
+      return
+    }
+
+    cancelAllTasks()
+    clearMatchStateForFreshQueue()
+    state = .waiting
+    statusText = "Joining queue as \(playerID.uuidString.prefix(8))..."
+
+    do {
+      let payload: QueueTicketPayload = try await requestJSON(
+        method: "POST",
+        pathComponents: ["v1", "matchmaking", "enqueue"],
+        requestBody: QueueTicketRequest(player_id: playerID.uuidString),
+        apiBaseURL: apiBaseURL
+      )
+      await applyTicket(payload)
+      if state == .waiting {
+        startWaitingLoops()
+      }
+    } catch {
+      state = .syncError
+      statusText = "Queue join failed: \(error.localizedDescription)"
+    }
+  }
+
+  func activateMatchSync() async {
+    guard let apiBaseURL else {
+      state = .syncError
+      statusText = QueueMatchStoreError.missingAPIBaseURL.localizedDescription
+      return
+    }
+
+    guard let matchID else {
+      state = .syncError
+      statusText = "Queue Match has no active match to sync."
+      return
+    }
+
+    do {
+      let statePayload: QueueMatchStatePayload = try await requestJSON(
+        method: "GET",
+        pathComponents: ["v1", "matches", matchID, "state"],
+        queryItems: [URLQueryItem(name: "player_id", value: playerID.uuidString)],
+        apiBaseURL: apiBaseURL
+      )
+      applyMatchState(statePayload, reconnecting: false)
+      startMovePollingLoop()
+    } catch {
+      self.state = .reconnecting
+      statusText = "Reconnecting to match: \(error.localizedDescription)"
+      startMovePollingLoop()
+    }
+  }
+
+  func stopRealtimeSync() {
+    movePollTask?.cancel()
+    movePollTask = nil
+    boardSyncHandler = nil
+  }
+
+  func exitQueueFlow() async {
+    if state == .waiting {
+      await cancelQueue()
+      return
+    }
+
+    cancelAllTasks()
+    if state == .matched {
+      statusText = "Match paused. Reopen Queue Match to reconnect."
+    }
+  }
+
+  func cancelQueue() async {
+    defer {
+      cancelAllTasks()
+      ticketID = nil
+      if state != .matched {
+        state = .cancelled
+      }
+      statusText = "Queue cancelled."
+      logEntries = []
+      remoteGameID = nil
+      matchID = nil
+      assignedColor = nil
+      latestPly = 0
+      nextTurn = .white
+      knownMoves = []
+      pendingSubmittedPlies.removeAll()
+      boardSyncHandler?([])
+    }
+
+    guard let apiBaseURL,
+          let ticketID,
+          state == .waiting || state == .reconnecting else {
+      return
+    }
+
+    var request = URLRequest(
+      url: makeURL(
+        apiBaseURL: apiBaseURL,
+        pathComponents: ["v1", "matchmaking", ticketID.uuidString],
+        queryItems: [URLQueryItem(name: "player_id", value: playerID.uuidString)]
+      )
+    )
+    request.httpMethod = "DELETE"
+    _ = try? await send(request, retries: 1)
+  }
+
+  func submitMove(moveUCI: String, ply: Int) async throws {
+    guard let apiBaseURL else {
+      throw QueueMatchStoreError.missingAPIBaseURL
+    }
+    guard let matchID else {
+      throw QueueMatchStoreError.invalidMatchState("Queue Match has no server match ID.")
+    }
+    guard canSubmitMove else {
+      throw QueueMatchStoreError.notYourTurn
+    }
+    guard !pendingSubmittedPlies.contains(ply), !knownMoves.contains(where: { $0.ply == ply }) else {
+      throw QueueMatchStoreError.duplicateMove
+    }
+
+    pendingSubmittedPlies.insert(ply)
+    statusText = "Submitting \(moveUCI)..."
+    defer { pendingSubmittedPlies.remove(ply) }
+
+    let requestBody = QueueMatchMoveRequestPayload(
+      player_id: playerID.uuidString,
+      ply: ply,
+      move_uci: moveUCI
+    )
+    let request = try makeRequest(
+      method: "POST",
+      pathComponents: ["v1", "matches", matchID, "moves"],
+      requestBody: requestBody,
+      apiBaseURL: apiBaseURL
+    )
+
+    let (data, response) = try await send(request, retries: 2)
+    if response.statusCode == 409 {
+      let envelope = try decode(QueueConflictEnvelope.self, from: data)
+      applyMatchState(envelope.detail.current_state, reconnecting: false)
+      throw QueueMatchStoreError.conflict(envelope.detail.message, envelope.detail.current_state)
+    }
+
+    guard (200..<300).contains(response.statusCode) else {
+      throw QueueMatchStoreError.serverError(errorMessage(from: data, response: response))
+    }
+
+    let move = try decode(QueueMatchMovePayload.self, from: data)
+    mergeMoves([move], replaceKnownMoves: false)
+    self.state = .matched
+    statusText = "Move \(move.move_uci) synced. Waiting for \(nextTurn.displayName)."
+  }
+
+  private func clearMatchStateForFreshQueue() {
+    remoteGameID = nil
+    matchID = nil
+    assignedColor = nil
+    latestPly = 0
+    nextTurn = .white
+    logEntries = []
+    knownMoves = []
+    pendingSubmittedPlies.removeAll()
+    boardSyncHandler?([])
+  }
+
+  private func startWaitingLoops() {
+    heartbeatTask?.cancel()
+    heartbeatTask = Task { [weak self] in
+      guard let self else {
+        return
+      }
+
+      while !Task.isCancelled {
+        do {
+          try await Task.sleep(nanoseconds: 10_000_000_000)
+          guard !Task.isCancelled, let ticketID else {
+            return
+          }
+
+          let payload: QueueTicketPayload = try await requestJSON(
+            method: "POST",
+            pathComponents: ["v1", "matchmaking", ticketID.uuidString, "heartbeat"],
+            requestBody: QueueTicketRequest(player_id: playerID.uuidString),
+            apiBaseURL: self.apiBaseURL
+          )
+          await applyTicket(payload)
+        } catch {
+          if Task.isCancelled {
+            return
+          }
+
+          await MainActor.run {
+            self.state = .reconnecting
+            self.statusText = "Queue heartbeat retrying: \(error.localizedDescription)"
+          }
+        }
+      }
+    }
+
+    ticketPollTask?.cancel()
+    ticketPollTask = Task { [weak self] in
+      guard let self else {
+        return
+      }
+
+      var attempt = 0
+      while !Task.isCancelled {
+        do {
+          guard let ticketID else {
+            return
+          }
+
+          let payload: QueueTicketPayload = try await requestJSON(
+            method: "GET",
+            pathComponents: ["v1", "matchmaking", ticketID.uuidString],
+            queryItems: [URLQueryItem(name: "player_id", value: playerID.uuidString)],
+            apiBaseURL: self.apiBaseURL
+          )
+          attempt = 0
+          await applyTicket(payload)
+          if self.state == .matched {
+            return
+          }
+          try await Task.sleep(nanoseconds: UInt64(max(1, payload.poll_after_ms)) * 1_000_000)
+        } catch {
+          if Task.isCancelled {
+            return
+          }
+
+          attempt += 1
+          await MainActor.run {
+            self.state = .reconnecting
+            self.statusText = "Queue poll retrying: \(error.localizedDescription)"
+          }
+          try? await Task.sleep(nanoseconds: retryDelayNanoseconds(attempt: attempt))
+        }
+      }
+    }
+  }
+
+  private func startMovePollingLoop() {
+    movePollTask?.cancel()
+    movePollTask = Task { [weak self] in
+      guard let self else {
+        return
+      }
+
+      var attempt = 0
+      while !Task.isCancelled {
+        do {
+          guard let matchID else {
+            return
+          }
+
+          let payload: QueueMatchMovesPayload = try await requestJSON(
+            method: "GET",
+            pathComponents: ["v1", "matches", matchID, "moves"],
+            queryItems: [
+              URLQueryItem(name: "after_ply", value: String(self.latestPly)),
+              URLQueryItem(name: "player_id", value: playerID.uuidString),
+            ],
+            apiBaseURL: self.apiBaseURL
+          )
+          attempt = 0
+          await MainActor.run {
+            self.state = .matched
+            self.nextTurn = ChessColor(serverValue: payload.next_turn) ?? self.nextTurn
+            self.latestPly = max(self.latestPly, payload.latest_ply)
+            self.remoteGameID = payload.game_id
+            self.matchID = payload.match_id
+          }
+          if !payload.moves.isEmpty {
+            await MainActor.run {
+              self.mergeMoves(payload.moves, replaceKnownMoves: false)
+            }
+          }
+          try await Task.sleep(nanoseconds: 900_000_000)
+        } catch {
+          if Task.isCancelled {
+            return
+          }
+
+          attempt += 1
+          await MainActor.run {
+            self.state = .reconnecting
+            self.statusText = "Match sync retrying: \(error.localizedDescription)"
+          }
+          try? await Task.sleep(nanoseconds: retryDelayNanoseconds(attempt: attempt))
+        }
+      }
+    }
+  }
+
+  private func applyTicket(_ ticket: QueueTicketPayload) async {
+    ticketID = UUID(uuidString: ticket.ticket_id)
+
+    switch ticket.status {
+    case "queued":
+      state = .waiting
+      statusText = "Waiting in queue as \(playerID.uuidString.prefix(8))..."
+    case "matched":
+      state = .matched
+      statusText = "Matched as \(ticket.assigned_color?.capitalized ?? "Unknown"). Opening synced board."
+      cancelWaitingTasks()
+      matchID = ticket.match_id
+      assignedColor = ChessColor(serverValue: ticket.assigned_color)
+    case "cancelled":
+      state = .cancelled
+      statusText = "Queue cancelled."
+    default:
+      state = .syncError
+      statusText = "Unexpected ticket state: \(ticket.status)"
+    }
+
+    if ticket.status == "matched", ticket.match_id != nil {
+      await activateMatchSync()
+    }
+  }
+
+  private func applyMatchState(_ payload: QueueMatchStatePayload, reconnecting: Bool) {
+    state = reconnecting ? .reconnecting : .matched
+    matchID = payload.match_id
+    remoteGameID = payload.game_id
+    assignedColor = ChessColor(serverValue: payload.your_color)
+    latestPly = payload.latest_ply
+    nextTurn = ChessColor(serverValue: payload.next_turn) ?? nextTurn
+    mergeMoves(payload.moves, replaceKnownMoves: true)
+
+    if reconnecting {
+      statusText = "Reconnected to match \(payload.match_id.prefix(8))."
+      state = .matched
+    } else {
+      let colorLabel = assignedColor?.displayName ?? "Unknown"
+      let turnLabel = nextTurn.displayName
+      statusText = "Matched as \(colorLabel). \(turnLabel) to move."
+    }
+  }
+
+  private func mergeMoves(_ incomingMoves: [QueueMatchMovePayload], replaceKnownMoves: Bool) {
+    if replaceKnownMoves {
+      knownMoves = incomingMoves.sorted(by: { $0.ply < $1.ply })
+    } else {
+      for move in incomingMoves {
+        if let existingIndex = knownMoves.firstIndex(where: { $0.ply == move.ply }) {
+          knownMoves[existingIndex] = move
+        } else {
+          knownMoves.append(move)
+        }
+      }
+      knownMoves.sort(by: { $0.ply < $1.ply })
+    }
+
+    latestPly = knownMoves.last?.ply ?? latestPly
+    nextTurn = ChessColor.turnColor(afterLatestPly: latestPly)
+    remoteGameID = incomingMoves.last?.game_id ?? remoteGameID
+    logEntries = knownMoves.map { move in
+      MatchLogStore.Entry(
+        ply: move.ply,
+        color: ChessColor.turnColor(forPly: move.ply),
+        moveUCI: move.move_uci,
+        isSynced: true,
+        syncError: nil
+      )
+    }
+    boardSyncHandler?(knownMoves)
+  }
+
+  private func cancelAllTasks() {
+    cancelWaitingTasks()
+    movePollTask?.cancel()
+    movePollTask = nil
+  }
+
+  private func cancelWaitingTasks() {
+    heartbeatTask?.cancel()
+    heartbeatTask = nil
+    ticketPollTask?.cancel()
+    ticketPollTask = nil
+  }
+
+  private func makeURL(
+    apiBaseURL: URL,
+    pathComponents: [String],
+    queryItems: [URLQueryItem] = []
+  ) -> URL {
+    var url = apiBaseURL
+    for component in pathComponents {
+      url.appendPathComponent(component)
+    }
+
+    guard !queryItems.isEmpty else {
+      return url
+    }
+
+    var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+    components?.queryItems = queryItems
+    return components?.url ?? url
+  }
+
+  private func makeRequest<Body: Encodable>(
+    method: String,
+    pathComponents: [String],
+    queryItems: [URLQueryItem] = [],
+    requestBody: Body? = nil,
+    apiBaseURL: URL?
+  ) throws -> URLRequest {
+    guard let apiBaseURL else {
+      throw QueueMatchStoreError.missingAPIBaseURL
+    }
+
+    let url = makeURL(apiBaseURL: apiBaseURL, pathComponents: pathComponents, queryItems: queryItems)
+    var request = URLRequest(url: url)
+    request.httpMethod = method
+    request.setValue("application/json", forHTTPHeaderField: "Accept")
+
+    if let requestBody {
+      request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+      request.httpBody = try JSONEncoder().encode(requestBody)
+    }
+
+    return request
+  }
+
+  private func makeRequest(
+    method: String,
+    pathComponents: [String],
+    queryItems: [URLQueryItem] = [],
+    apiBaseURL: URL?
+  ) throws -> URLRequest {
+    guard let apiBaseURL else {
+      throw QueueMatchStoreError.missingAPIBaseURL
+    }
+
+    let url = makeURL(apiBaseURL: apiBaseURL, pathComponents: pathComponents, queryItems: queryItems)
+    var request = URLRequest(url: url)
+    request.httpMethod = method
+    request.setValue("application/json", forHTTPHeaderField: "Accept")
+    return request
+  }
+
+  private func requestJSON<T: Decodable, Body: Encodable>(
+    method: String,
+    pathComponents: [String],
+    queryItems: [URLQueryItem] = [],
+    requestBody: Body? = nil,
+    apiBaseURL: URL?
+  ) async throws -> T {
+    let request = try makeRequest(
+      method: method,
+      pathComponents: pathComponents,
+      queryItems: queryItems,
+      requestBody: requestBody,
+      apiBaseURL: apiBaseURL
+    )
+    let (data, response) = try await send(request, retries: 2)
+    guard (200..<300).contains(response.statusCode) else {
+      throw QueueMatchStoreError.serverError(errorMessage(from: data, response: response))
+    }
+    return try decode(T.self, from: data)
+  }
+
+  private func requestJSON<T: Decodable>(
+    method: String,
+    pathComponents: [String],
+    queryItems: [URLQueryItem] = [],
+    apiBaseURL: URL?
+  ) async throws -> T {
+    let request = try makeRequest(
+      method: method,
+      pathComponents: pathComponents,
+      queryItems: queryItems,
+      apiBaseURL: apiBaseURL
+    )
+    let (data, response) = try await send(request, retries: 2)
+    guard (200..<300).contains(response.statusCode) else {
+      throw QueueMatchStoreError.serverError(errorMessage(from: data, response: response))
+    }
+    return try decode(T.self, from: data)
+  }
+
+  private func send(_ request: URLRequest, retries: Int) async throws -> (Data, HTTPURLResponse) {
+    var attempt = 0
+
+    while true {
+      do {
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse else {
+          throw QueueMatchStoreError.serverError("Missing HTTP response from queue service.")
+        }
+
+        if (500..<600).contains(httpResponse.statusCode), attempt < retries {
+          attempt += 1
+          state = .reconnecting
+          statusText = "Queue reconnecting after server error \(httpResponse.statusCode)..."
+          try await Task.sleep(nanoseconds: retryDelayNanoseconds(attempt: attempt))
+          continue
+        }
+
+        return (data, httpResponse)
+      } catch {
+        if attempt >= retries {
+          throw error
+        }
+
+        attempt += 1
+        state = .reconnecting
+        statusText = "Queue reconnecting..."
+        try await Task.sleep(nanoseconds: retryDelayNanoseconds(attempt: attempt))
+      }
+    }
+  }
+
+  private func decode<T: Decodable>(_ type: T.Type, from data: Data) throws -> T {
+    let decoder = JSONDecoder()
+    return try decoder.decode(type, from: data)
+  }
+
+  private func errorMessage(from data: Data, response: HTTPURLResponse) -> String {
+    let raw = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
+    if let raw, !raw.isEmpty {
+      return raw
+    }
+
+    return "Queue service returned HTTP \(response.statusCode)."
+  }
+
+  private func retryDelayNanoseconds(attempt: Int) -> UInt64 {
+    let cappedAttempt = min(attempt, 5)
+    let baseSeconds = pow(2.0, Double(cappedAttempt - 1)) * 0.6
+    let jitterSeconds = Double.random(in: 0.0...0.35)
+    return UInt64((baseSeconds + jitterSeconds) * 1_000_000_000)
   }
 }
 
@@ -966,6 +1690,10 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     suggestedMoveText = "Next best move: waiting on Stockfish..."
   }
 
+  func noteExternalStatus(_ message: String) {
+    latestAssessment = message
+  }
+
   func handleMove(
     move: ChessMove,
     before beforeState: ChessGameState,
@@ -1432,11 +2160,23 @@ private struct PiecePortraitView: View {
 }
 
 private struct ARChessRootView: View {
-  @State private var screen: NativeScreen = .landing
+  @State private var screen: NativeScreen = .modeSelection
+  @StateObject private var queueMatch = QueueMatchStore()
 
   var body: some View {
     ZStack {
       switch screen {
+      case .modeSelection:
+        ModeSelectionView { mode in
+          withAnimation(.spring(response: 0.42, dampingFraction: 0.88)) {
+            switch mode {
+            case .passAndPlay:
+              screen = .landing
+            case .queueMatch:
+              screen = .queueMatch
+            }
+          }
+        }
       case .landing:
         LandingView { mode in
           withAnimation(.spring(response: 0.42, dampingFraction: 0.88)) {
@@ -1448,22 +2188,111 @@ private struct ARChessRootView: View {
           mode: mode,
           openExperience: {
             withAnimation(.spring(response: 0.42, dampingFraction: 0.88)) {
-              screen = .experience(mode)
+              screen = .experience(.passAndPlay(mode))
             }
           },
           goBack: {
             withAnimation(.spring(response: 0.42, dampingFraction: 0.88)) {
-              screen = .landing
+              screen = .modeSelection
+            }
+          }
+        )
+      case .queueMatch:
+        QueueMatchView(
+          queueMatch: queueMatch,
+          openExperience: {
+            withAnimation(.spring(response: 0.42, dampingFraction: 0.88)) {
+              screen = .experience(.queueMatch)
+            }
+          },
+          goBack: {
+            Task {
+              await queueMatch.exitQueueFlow()
+            }
+            withAnimation(.spring(response: 0.42, dampingFraction: 0.88)) {
+              screen = .modeSelection
             }
           }
         )
       case .experience(let mode):
-        NativeARExperienceView(mode: mode) {
-          withAnimation(.spring(response: 0.42, dampingFraction: 0.88)) {
-            screen = .lobby(mode)
+        NativeARExperienceView(mode: mode, queueMatch: queueMatch) {
+          switch mode {
+          case .passAndPlay(let playerMode):
+            withAnimation(.spring(response: 0.42, dampingFraction: 0.88)) {
+              screen = .lobby(playerMode)
+            }
+          case .queueMatch:
+            Task {
+              await queueMatch.exitQueueFlow()
+            }
+            withAnimation(.spring(response: 0.42, dampingFraction: 0.88)) {
+              screen = .queueMatch
+            }
           }
         }
       }
+    }
+  }
+}
+
+private struct ModeSelectionView: View {
+  let onSelect: (PlayModeChoice) -> Void
+
+  var body: some View {
+    ZStack {
+      ChessboardBackdrop()
+      LinearGradient(
+        colors: [
+          Color(red: 0.03, green: 0.05, blue: 0.08).opacity(0.18),
+          Color(red: 0.03, green: 0.05, blue: 0.08).opacity(0.74),
+          Color(red: 0.03, green: 0.05, blue: 0.08).opacity(0.95),
+        ],
+        startPoint: .top,
+        endPoint: .bottom
+      )
+      .ignoresSafeArea()
+
+      VStack(spacing: 26) {
+        Spacer()
+
+        VStack(spacing: 12) {
+          Text("Native iOS")
+            .font(.system(size: 12, weight: .bold, design: .rounded))
+            .tracking(2.2)
+            .foregroundStyle(Color(red: 0.85, green: 0.78, blue: 0.64))
+
+          Text("AR Chess")
+            .font(.system(size: 50, weight: .heavy, design: .rounded))
+            .foregroundStyle(.white)
+
+          Text("Choose a local pass-and-play board or a synced queue match.")
+            .font(.system(size: 18, weight: .medium, design: .rounded))
+            .foregroundStyle(Color.white.opacity(0.82))
+            .multilineTextAlignment(.center)
+            .frame(maxWidth: 320)
+        }
+
+        VStack(spacing: 14) {
+          NativeActionButton(title: "Pass & Play", style: .solid) {
+            onSelect(.passAndPlay)
+          }
+
+          NativeActionButton(title: "Queue Match", style: .outline) {
+            onSelect(.queueMatch)
+          }
+        }
+        .frame(maxWidth: 340)
+
+        Text("Pass & Play stays unchanged • Queue Match syncs through Railway")
+          .font(.system(size: 14, weight: .medium, design: .rounded))
+          .foregroundStyle(Color.white.opacity(0.72))
+          .multilineTextAlignment(.center)
+          .frame(maxWidth: 320)
+
+        Spacer()
+      }
+      .padding(.horizontal, 24)
+      .padding(.vertical, 30)
     }
   }
 }
@@ -1596,15 +2425,130 @@ private struct LobbyView: View {
   }
 }
 
+private struct QueueMatchView: View {
+  @ObservedObject var queueMatch: QueueMatchStore
+  let openExperience: () -> Void
+  let goBack: () -> Void
+
+  var body: some View {
+    ZStack {
+      ChessboardBackdrop()
+      Color.black.opacity(0.60).ignoresSafeArea()
+
+      VStack(spacing: 22) {
+        Spacer()
+
+        VStack(alignment: .leading, spacing: 14) {
+          Text("Queue Match")
+            .font(.system(size: 12, weight: .bold, design: .rounded))
+            .tracking(2.0)
+            .foregroundStyle(Color(red: 0.84, green: 0.78, blue: 0.66))
+
+          Text("Matchmaking")
+            .font(.system(size: 34, weight: .heavy, design: .rounded))
+            .foregroundStyle(.white)
+
+          Text(queueHeadline)
+            .font(.system(size: 22, weight: .bold, design: .rounded))
+            .foregroundStyle(Color.white)
+
+          Text(queueMatch.statusText)
+            .font(.system(size: 16, weight: .medium, design: .rounded))
+            .foregroundStyle(Color.white.opacity(0.80))
+            .lineSpacing(3)
+
+          Text("Device player ID: \(queueMatch.playerIDLabel)")
+            .font(.system(size: 12, weight: .semibold, design: .rounded))
+            .foregroundStyle(Color.white.opacity(0.62))
+            .textSelection(.enabled)
+
+          if let matchID = queueMatch.matchID {
+            Text("Match ID: \(matchID)")
+              .font(.system(size: 12, weight: .semibold, design: .rounded))
+              .foregroundStyle(Color.white.opacity(0.62))
+              .textSelection(.enabled)
+          }
+
+          if let assignedColor = queueMatch.assignedColor {
+            Text("Assigned color: \(assignedColor.displayName)")
+              .font(.system(size: 15, weight: .bold, design: .rounded))
+              .foregroundStyle(Color(red: 0.95, green: 0.88, blue: 0.73))
+          }
+
+          VStack(spacing: 12) {
+            if queueMatch.state == .idle || queueMatch.state == .cancelled || queueMatch.state == .syncError {
+              NativeActionButton(title: "Join Queue", style: .solid) {
+                Task {
+                  await queueMatch.joinQueue()
+                }
+              }
+            }
+
+            if queueMatch.state == .waiting || queueMatch.state == .reconnecting {
+              NativeActionButton(title: "Cancel Queue", style: .outline) {
+                Task {
+                  await queueMatch.cancelQueue()
+                }
+              }
+            }
+
+            if queueMatch.canOpenExperience {
+              NativeActionButton(title: "Open Native AR", style: .solid) {
+                openExperience()
+              }
+            }
+
+            NativeActionButton(title: "Back", style: .outline) {
+              goBack()
+            }
+          }
+          .padding(.top, 4)
+        }
+        .padding(24)
+        .background(
+          RoundedRectangle(cornerRadius: 30, style: .continuous)
+            .fill(Color(red: 0.07, green: 0.10, blue: 0.14).opacity(0.88))
+            .overlay(
+              RoundedRectangle(cornerRadius: 30, style: .continuous)
+                .stroke(Color.white.opacity(0.12), lineWidth: 1)
+            )
+        )
+
+        Spacer()
+      }
+      .padding(.horizontal, 24)
+      .padding(.vertical, 30)
+    }
+  }
+
+  private var queueHeadline: String {
+    switch queueMatch.state {
+    case .idle:
+      return "Ready to join"
+    case .waiting:
+      return "Waiting for opponent"
+    case .matched:
+      return "Matched"
+    case .reconnecting:
+      return "Reconnecting"
+    case .syncError:
+      return "Sync error"
+    case .cancelled:
+      return "Cancelled"
+    }
+  }
+}
+
 private struct NativeARExperienceView: View {
-  let mode: PlayerMode
+  let mode: ExperienceMode
+  @ObservedObject var queueMatch: QueueMatchStore
   let closeExperience: () -> Void
   @StateObject private var matchLog = MatchLogStore()
   @StateObject private var commentary = PiecePersonalityDirector()
 
   var body: some View {
     ZStack {
-      NativeARView(matchLog: matchLog, commentary: commentary)
+      NativeARView(matchLog: matchLog, queueMatch: queueMatch, mode: mode, commentary: commentary)
         .ignoresSafeArea()
 
       LinearGradient(
@@ -1621,7 +2565,7 @@ private struct NativeARExperienceView: View {
 
       VStack(spacing: 16) {
         VStack(alignment: .leading, spacing: 10) {
-          Text(mode.title + " Mode")
+          Text(modeTitle)
             .font(.system(size: 12, weight: .bold, design: .rounded))
             .tracking(2.0)
             .foregroundStyle(Color(red: 0.87, green: 0.79, blue: 0.64))
@@ -1666,7 +2610,7 @@ private struct NativeARExperienceView: View {
               .tracking(1.8)
               .foregroundStyle(Color(red: 0.88, green: 0.82, blue: 0.70))
 
-            Text(matchLog.syncStatus)
+            Text(activeSyncStatus)
               .font(.system(size: 15, weight: .medium, design: .rounded))
               .foregroundStyle(Color.white.opacity(0.86))
 
@@ -1674,19 +2618,19 @@ private struct NativeARExperienceView: View {
               .font(.system(size: 13, weight: .semibold, design: .rounded))
               .foregroundStyle(Color.white.opacity(0.70))
 
-            if let remoteGameID = matchLog.remoteGameID {
+            if let remoteGameID = activeRemoteGameID {
               Text("Game ID: \(remoteGameID)")
                 .font(.system(size: 12, weight: .semibold, design: .rounded))
                 .foregroundStyle(Color.white.opacity(0.62))
                 .textSelection(.enabled)
             }
 
-            if matchLog.entries.isEmpty {
+            if activeEntries.isEmpty {
               Text("Make a legal move to start the UCI move log.")
                 .font(.system(size: 14, weight: .medium, design: .rounded))
                 .foregroundStyle(Color.white.opacity(0.72))
             } else {
-              ForEach(Array(matchLog.entries.suffix(6))) { entry in
+              ForEach(Array(activeEntries.suffix(6))) { entry in
                 HStack(alignment: .firstTextBaseline, spacing: 12) {
                   Text(entry.label)
                     .font(.system(size: 14, weight: .bold, design: .monospaced))
@@ -1726,11 +2670,15 @@ private struct NativeARExperienceView: View {
           .padding(18)
         }
       }
-      .padding(.horizontal, 18)
+    .padding(.horizontal, 18)
       .padding(.vertical, 24)
     }
     .task {
-      await matchLog.prepareRemoteGameIfNeeded()
+      if case .passAndPlay(_) = mode {
+        await matchLog.prepareRemoteGameIfNeeded()
+      } else {
+        await queueMatch.activateMatchSync()
+      }
       Task {
         try? await Task.sleep(nanoseconds: 1_000_000_000)
         await commentary.prepare(with: ChessGameState.initial())
@@ -1738,7 +2686,50 @@ private struct NativeARExperienceView: View {
     }
     .onDisappear {
       commentary.resetSession()
-      matchLog.resetSession()
+      switch mode {
+      case .passAndPlay(_):
+        matchLog.resetSession()
+      case .queueMatch:
+        Task {
+          await queueMatch.exitQueueFlow()
+        }
+      }
+    }
+  }
+
+  private var modeTitle: String {
+    switch mode {
+    case .passAndPlay(let playerMode):
+      return playerMode.title + " Mode"
+    case .queueMatch:
+      return "Queue Match"
+    }
+  }
+
+  private var activeEntries: [MatchLogStore.Entry] {
+    switch mode {
+    case .passAndPlay(_):
+      return matchLog.entries
+    case .queueMatch:
+      return queueMatch.logEntries
+    }
+  }
+
+  private var activeRemoteGameID: String? {
+    switch mode {
+    case .passAndPlay(_):
+      return matchLog.remoteGameID
+    case .queueMatch:
+      return queueMatch.remoteGameID
+    }
+  }
+
+  private var activeSyncStatus: String {
+    switch mode {
+    case .passAndPlay(_):
+      return matchLog.syncStatus
+    case .queueMatch:
+      return queueMatch.statusText
     }
   }
 }
@@ -1846,6 +2837,17 @@ private enum ChessColor {
   case white
   case black
 
+  init?(serverValue: String?) {
+    switch serverValue?.lowercased() {
+    case "white":
+      self = .white
+    case "black":
+      self = .black
+    default:
+      return nil
+    }
+  }
+
   var opponent: ChessColor {
     switch self {
     case .white:
@@ -1862,6 +2864,23 @@ private enum ChessColor {
     case .black:
       return "b"
     }
+  }
+
+  var displayName: String {
+    switch self {
+    case .white:
+      return "White"
+    case .black:
+      return "Black"
+    }
+  }
+
+  static func turnColor(forPly ply: Int) -> ChessColor {
+    ply.isMultiple(of: 2) ? .black : .white
+  }
+
+  static func turnColor(afterLatestPly latestPly: Int) -> ChessColor {
+    latestPly.isMultiple(of: 2) ? .white : .black
   }
 }
 
@@ -1894,6 +2913,33 @@ private enum ChessPieceKind {
 private struct BoardSquare: Hashable {
   let file: Int
   let rank: Int
+
+  init(file: Int, rank: Int) {
+    self.file = file
+    self.rank = rank
+  }
+
+  init?(algebraic: String) {
+    let trimmed = algebraic.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    guard trimmed.count == 2 else {
+      return nil
+    }
+
+    let characters = Array(trimmed)
+    guard let fileScalar = characters.first?.unicodeScalars.first,
+          let rankScalar = characters.last?.unicodeScalars.first else {
+      return nil
+    }
+
+    let fileValue = Int(fileScalar.value) - 97
+    let rankValue = Int(rankScalar.value) - 49
+    guard (0..<8).contains(fileValue), (0..<8).contains(rankValue) else {
+      return nil
+    }
+
+    self.file = fileValue
+    self.rank = rankValue
+  }
 
   var isValid: Bool {
     (0..<8).contains(file) && (0..<8).contains(rank)
@@ -2050,6 +3096,39 @@ private struct ChessGameState {
 
   func legalMove(from: BoardSquare, to: BoardSquare) -> ChessMove? {
     legalMoves(from: from).first { $0.to == to }
+  }
+
+  func move(forUCI uci: String) -> ChessMove? {
+    let trimmed = uci.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    guard trimmed.count == 4 || trimmed.count == 5 else {
+      return nil
+    }
+
+    let fromIndex = trimmed.index(trimmed.startIndex, offsetBy: 2)
+    let toIndex = trimmed.index(fromIndex, offsetBy: 2)
+    let fromString = String(trimmed[..<fromIndex])
+    let toString = String(trimmed[fromIndex..<toIndex])
+    let promotionCode = trimmed.count == 5 ? trimmed.last : nil
+
+    guard let from = BoardSquare(algebraic: fromString),
+          let to = BoardSquare(algebraic: toString) else {
+      return nil
+    }
+
+    return legalMoves(from: from).first { candidate in
+      guard candidate.to == to else {
+        return false
+      }
+
+      switch (candidate.promotion, promotionCode) {
+      case (nil, nil):
+        return true
+      case (.some(let promotion), .some(let code)):
+        return promotion.fenSymbol == code
+      default:
+        return false
+      }
+    }
   }
 
   func hasLegalMoves(for color: ChessColor) -> Bool {
@@ -2473,10 +3552,12 @@ private struct ChessGameState {
 
 private struct NativeARView: UIViewRepresentable {
   @ObservedObject var matchLog: MatchLogStore
+  @ObservedObject var queueMatch: QueueMatchStore
+  let mode: ExperienceMode
   @ObservedObject var commentary: PiecePersonalityDirector
 
   func makeCoordinator() -> Coordinator {
-    Coordinator(matchLog: matchLog, commentary: commentary)
+    Coordinator(matchLog: matchLog, queueMatch: queueMatch, mode: mode, commentary: commentary)
   }
 
   func makeUIView(context: Context) -> ARView {
@@ -2491,6 +3572,8 @@ private struct NativeARView: UIViewRepresentable {
     private let boardSize: Float = 0.40
     private let boardInset: Float = 0.08
     private let matchLog: MatchLogStore
+    private let queueMatch: QueueMatchStore
+    private let mode: ExperienceMode
     private let commentary: PiecePersonalityDirector
     private weak var arView: ARView?
     private var boardAnchor: AnchorEntity?
@@ -2502,9 +3585,18 @@ private struct NativeARView: UIViewRepresentable {
     private var gameState = ChessGameState.initial()
     private var selectedSquare: BoardSquare?
     private var selectedMoves: [ChessMove] = []
+    private var syncedQueueMoves: [QueueMatchMovePayload] = []
+    private var queueAssignedColor: ChessColor?
 
-    init(matchLog: MatchLogStore, commentary: PiecePersonalityDirector) {
+    init(
+      matchLog: MatchLogStore,
+      queueMatch: QueueMatchStore,
+      mode: ExperienceMode,
+      commentary: PiecePersonalityDirector
+    ) {
       self.matchLog = matchLog
+      self.queueMatch = queueMatch
+      self.mode = mode
       self.commentary = commentary
     }
 
@@ -2544,6 +3636,26 @@ private struct NativeARView: UIViewRepresentable {
 
       arView.session.delegate = self
       arView.session.run(configuration, options: [.resetTracking, .removeExistingAnchors])
+
+      if case .queueMatch = mode {
+        Task { @MainActor [weak self] in
+          guard let self else {
+            return
+          }
+
+          self.queueAssignedColor = self.queueMatch.assignedColor
+          self.queueMatch.bindBoardSync { [weak self] moves in
+            guard let self else {
+              return
+            }
+
+            Task { @MainActor [weak self] in
+              self?.queueAssignedColor = self?.queueMatch.assignedColor
+            }
+            self.applyServerMoveSet(moves)
+          }
+        }
+      }
 
       let coachingOverlay = ARCoachingOverlayView()
       coachingOverlay.session = arView.session
@@ -2646,7 +3758,7 @@ private struct NativeARView: UIViewRepresentable {
         return
       }
 
-      if piece.color == gameState.turn {
+      if canControlPiece(piece, at: square) {
         if selectedSquare == square {
           clearSelection()
         } else {
@@ -2668,7 +3780,7 @@ private struct NativeARView: UIViewRepresentable {
         return
       }
 
-      if let piece = gameState.piece(at: square), piece.color == gameState.turn {
+      if let piece = gameState.piece(at: square), canControlPiece(piece, at: square) {
         select(square)
       } else {
         clearSelection()
@@ -2693,6 +3805,20 @@ private struct NativeARView: UIViewRepresentable {
     }
 
     private func apply(_ move: ChessMove) {
+      if case .queueMatch = mode {
+        let targetPly = syncedQueueMoves.count + 1
+        Task { @MainActor in
+          do {
+            try await queueMatch.submitMove(moveUCI: move.uciString, ply: targetPly)
+          } catch {
+            await MainActor.run {
+              commentary.noteExternalStatus("Queue move sync failed: \(error.localizedDescription)")
+            }
+          }
+        }
+        return
+      }
+
       let movingColor = gameState.turn
       let beforeState = gameState
       let afterState = gameState.applying(move)
@@ -2703,6 +3829,67 @@ private struct NativeARView: UIViewRepresentable {
       Task { @MainActor in
         matchLog.recordMove(move.uciString, color: movingColor)
         await commentary.handleMove(move: move, before: beforeState, after: afterState)
+      }
+    }
+
+    private func applyServerMoveSet(_ moves: [QueueMatchMovePayload]) {
+      let orderedMoves = moves.sorted(by: { $0.ply < $1.ply })
+      guard orderedMoves != syncedQueueMoves else {
+        return
+      }
+
+      let previousMoveCount = syncedQueueMoves.count
+      var rebuiltState = ChessGameState.initial()
+      var newMoves: [(move: ChessMove, before: ChessGameState, after: ChessGameState)] = []
+
+      for payload in orderedMoves {
+        guard let move = rebuiltState.move(forUCI: payload.move_uci) else {
+          Task { @MainActor in
+            commentary.noteExternalStatus("Queue sync could not apply \(payload.move_uci).")
+          }
+          return
+        }
+
+        let beforeState = rebuiltState
+        let afterState = rebuiltState.applying(move)
+        if payload.ply > previousMoveCount {
+          newMoves.append((move: move, before: beforeState, after: afterState))
+        }
+        rebuiltState = afterState
+      }
+
+      syncedQueueMoves = orderedMoves
+      gameState = rebuiltState
+      selectedSquare = nil
+      selectedMoves = []
+      refreshBoardPresentation()
+
+      guard !newMoves.isEmpty else {
+        return
+      }
+
+      Task { @MainActor in
+        for item in newMoves {
+          await commentary.handleMove(move: item.move, before: item.before, after: item.after)
+        }
+      }
+    }
+
+    private func canControlPiece(_ piece: ChessPieceState, at square: BoardSquare) -> Bool {
+      guard piece.color == gameState.turn else {
+        return false
+      }
+
+      switch mode {
+      case .passAndPlay(_):
+        return true
+      case .queueMatch:
+        guard let assignedColor = queueAssignedColor,
+              assignedColor == gameState.turn else {
+          clearSelection()
+          return false
+        }
+        return piece.color == assignedColor
       }
     }
 

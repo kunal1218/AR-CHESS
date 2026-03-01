@@ -116,6 +116,82 @@
         "game_id": "string",
         "moves": "GameMove[]"
       }
+    },
+    {
+      "name": "enqueue_matchmaking_ticket",
+      "method": "POST",
+      "path": "/v1/matchmaking/enqueue",
+      "request": {
+        "player_id": "string"
+      },
+      "response": "MatchmakingTicket",
+      "notes": "Creates or refreshes a queue ticket for the calling player. The server may immediately return a matched ticket."
+    },
+    {
+      "name": "heartbeat_matchmaking_ticket",
+      "method": "POST",
+      "path": "/v1/matchmaking/{ticket_id}/heartbeat",
+      "request": {
+        "player_id": "string"
+      },
+      "response": "MatchmakingTicket",
+      "notes": "Extends queue TTL and can opportunistically pair the ticket if another waiting player is available."
+    },
+    {
+      "name": "get_matchmaking_ticket",
+      "method": "GET",
+      "path": "/v1/matchmaking/{ticket_id}",
+      "request": {
+        "player_id": "string?"
+      },
+      "response": "MatchmakingTicket"
+    },
+    {
+      "name": "cancel_matchmaking_ticket",
+      "method": "DELETE",
+      "path": "/v1/matchmaking/{ticket_id}",
+      "request": {
+        "player_id": "string"
+      },
+      "response": "MatchmakingTicket"
+    },
+    {
+      "name": "get_match_state",
+      "method": "GET",
+      "path": "/v1/matches/{match_id}/state",
+      "request": {
+        "player_id": "string?"
+      },
+      "response": "MatchState",
+      "notes": "Returns the authoritative move list, next turn, and the caller's assigned color."
+    },
+    {
+      "name": "record_match_move",
+      "method": "POST",
+      "path": "/v1/matches/{match_id}/moves",
+      "request": {
+        "player_id": "string",
+        "ply": "number",
+        "move_uci": "string"
+      },
+      "response": "MatchMove",
+      "notes": "Returns 409 with current server state if the caller is out of turn or another move already owns that ply."
+    },
+    {
+      "name": "get_match_moves",
+      "method": "GET",
+      "path": "/v1/matches/{match_id}/moves",
+      "request": {
+        "after_ply": "number?",
+        "player_id": "string?"
+      },
+      "response": {
+        "match_id": "string",
+        "game_id": "string",
+        "latest_ply": "number",
+        "next_turn": "string",
+        "moves": "MatchMove[]"
+      }
     }
   ],
   "events": [],
@@ -160,6 +236,44 @@
         "ply": "number",
         "move_uci": "string",
         "created_at": "string"
+      }
+    },
+    {
+      "name": "MatchmakingTicket",
+      "fields": {
+        "ticket_id": "string",
+        "player_id": "string",
+        "status": "string",
+        "match_id": "string?",
+        "assigned_color": "string?",
+        "heartbeat_at": "string",
+        "expires_at": "string",
+        "poll_after_ms": "number"
+      }
+    },
+    {
+      "name": "MatchMove",
+      "fields": {
+        "match_id": "string",
+        "game_id": "string",
+        "ply": "number",
+        "move_uci": "string",
+        "player_id": "string",
+        "created_at": "string"
+      }
+    },
+    {
+      "name": "MatchState",
+      "fields": {
+        "match_id": "string",
+        "game_id": "string",
+        "status": "string",
+        "white_player_id": "string",
+        "black_player_id": "string",
+        "your_color": "string?",
+        "latest_ply": "number",
+        "next_turn": "string",
+        "moves": "MatchMove[]"
       }
     }
   ]
