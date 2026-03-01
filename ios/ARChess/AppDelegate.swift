@@ -1643,15 +1643,15 @@ private enum PersonalitySpeaker {
     case .pawn:
       return 0.94
     case .rook:
-      return 1.72
-    case .knight:
-      return 1.46
-    case .bishop:
-      return 0.86
-    case .queen:
       return 0.68
+    case .knight:
+      return 1.48
+    case .bishop:
+      return 1.04
+    case .queen:
+      return 1.22
     case .king:
-      return 1.28
+      return 0.82
     }
   }
 
@@ -2660,6 +2660,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   @Published private(set) var hintStatusText = "Fun hints warm up in the background when it is your turn."
   @Published private(set) var visibleHintText: String?
   @Published private(set) var isHintLoading = false
+  @Published private(set) var geminiDebugLines: [String] = []
 
   private let analyzer = StockfishWASMAnalyzer()
   private let hintService = GeminiHintService()
@@ -2730,6 +2731,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     hintCache.removeAll()
     currentHintKey = nil
     pendingHintReveal = false
+    geminiDebugLines = []
     visibleHintText = nil
     isHintLoading = false
     completedPlyCount = 0
@@ -2787,12 +2789,14 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       visibleHintText = nil
       isHintLoading = false
       hintStatusText = "Set GEMINI_API_KEY in .env and rebuild to enable Gemini hints."
+      appendGeminiDebug("Hint tap ignored because GEMINI_API_KEY is not configured.")
       return
     }
 
     guard let state = stateProvider?() else {
       visibleHintText = nil
       hintStatusText = "No board state available for a hint yet."
+      appendGeminiDebug("Hint tap ignored because there is no board state.")
       return
     }
 
@@ -2800,12 +2804,14 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       visibleHintText = nil
       isHintLoading = false
       hintStatusText = "Hints wake up when it is your turn."
+      appendGeminiDebug("Hint tap ignored because it is not the local player's turn.")
       return
     }
 
     pendingHintReveal = true
 
     if let analysis = cachedAnalysis?.analysis, cachedAnalysis?.fen == state.fenString {
+      appendGeminiDebug("Hint tapped with cached Stockfish analysis ready; attempting instant reveal.")
       prefetchHint(for: state, analysis: analysis, revealWhenReady: true)
       return
     }
@@ -2813,6 +2819,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     visibleHintText = nil
     isHintLoading = true
     hintStatusText = "Loading hint..."
+    appendGeminiDebug("Hint tapped before cached analysis was ready; forcing analysis first.")
     Task { @MainActor [weak self] in
       guard let self else {
         return
@@ -3065,6 +3072,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       visibleHintText = nil
       isHintLoading = false
       hintStatusText = defaultHintStatus()
+      appendGeminiDebug("Skipped prefetch because GEMINI_API_KEY is not configured.")
       return
     }
 
@@ -3076,6 +3084,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       visibleHintText = nil
       isHintLoading = false
       hintStatusText = "Hints wake up when it is your turn."
+      appendGeminiDebug("Skipped prefetch because it is not the local player's turn.")
       return
     }
 
@@ -3083,6 +3092,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       visibleHintText = nil
       isHintLoading = false
       hintStatusText = "Hint unavailable for this position."
+      appendGeminiDebug("Skipped prefetch because the Stockfish best move could not be converted into a hint context.")
       return
     }
 
@@ -3099,6 +3109,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     if let cached = hintCache[key] {
       isHintLoading = false
       hintStatusText = "Hint ready. Tap Hint."
+      appendGeminiDebug("Served cached Gemini hint for current turn.")
       if pendingHintReveal {
         visibleHintText = cached
         pendingHintReveal = false
@@ -3108,6 +3119,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
 
     isHintLoading = true
     hintStatusText = pendingHintReveal ? "Loading hint..." : "Preparing a playful hint..."
+    appendGeminiDebug("Prefetching Gemini hint in background for move \(context.bestMove).")
 
     hintTask?.cancel()
     hintTask = Task { [weak self] in
@@ -3126,12 +3138,17 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
           self.hintCache[key] = hint
           self.isHintLoading = false
           self.hintStatusText = "Hint ready. Tap Hint."
+          self.appendGeminiDebug("Gemini hint ready and cached for the current turn.")
           if self.pendingHintReveal {
             self.visibleHintText = hint
             self.pendingHintReveal = false
+            self.appendGeminiDebug("Gemini hint revealed instantly from the completed prefetch.")
           }
         }
       } catch is CancellationError {
+        await MainActor.run {
+          self.appendGeminiDebug("Gemini hint request was cancelled because a newer turn replaced it.")
+        }
         return
       } catch {
         await MainActor.run {
@@ -3144,6 +3161,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
           self.visibleHintText = nil
           self.pendingHintReveal = false
           self.hintStatusText = "Hint unavailable right now."
+          self.appendGeminiDebug("Gemini hint request failed: \(error.localizedDescription)")
         }
       }
     }
@@ -3153,6 +3171,16 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     hintService.isConfigured
       ? "Fun hints warm up in the background when it is your turn."
       : "Set GEMINI_API_KEY in .env and rebuild to enable Gemini hints."
+  }
+
+  private func appendGeminiDebug(_ message: String) {
+    let formatter = DateFormatter()
+    formatter.dateFormat = "HH:mm:ss"
+    let stamped = "[\(formatter.string(from: Date()))] \(message)"
+    geminiDebugLines.append(stamped)
+    if geminiDebugLines.count > 18 {
+      geminiDebugLines.removeFirst(geminiDebugLines.count - 18)
+    }
   }
 
   private func shouldPrefetchHint(for _: ChessGameState) -> Bool {
@@ -3439,7 +3467,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
 
     let utterance = AVSpeechUtterance(string: line.text)
     utterance.voice = AVSpeechSynthesisVoice(language: "en-US")
-    utterance.pitchMultiplier = min(max(line.pitch ?? line.speaker.defaultPitch, 0.5), 2.0)
+    utterance.pitchMultiplier = min(max(resolvedPitch(for: line), 0.5), 2.0)
     utterance.rate = min(max(line.rate ?? line.speaker.defaultRate, 0.1), 0.65)
     utterance.volume = min(max(line.volume ?? line.speaker.defaultVolume, 0.0), 1.0)
     utterance.preUtteranceDelay = 0.02
@@ -3449,6 +3477,17 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     )
     synthesizer.speak(utterance)
     return true
+  }
+
+  private func resolvedPitch(for line: SpokenLine) -> Float {
+    let base = line.speaker.defaultPitch
+    guard let linePitch = line.pitch else {
+      return base
+    }
+
+    // Keep each piece's core voice identity stable while allowing slight per-line variation.
+    let blended = base + ((linePitch - base) * 0.10)
+    return blended
   }
 }
 
@@ -3906,6 +3945,7 @@ private struct NativeARExperienceView: View {
   @StateObject private var commentary = PiecePersonalityDirector()
   @State private var isModePanelVisible = false
   @State private var isMatchLogVisible = false
+  @State private var isGeminiDebugVisible = false
 
   var body: some View {
     ZStack {
@@ -4014,6 +4054,43 @@ private struct NativeARExperienceView: View {
           .transition(.move(edge: .bottom).combined(with: .opacity))
         }
 
+        if isGeminiDebugVisible {
+          VStack(alignment: .leading, spacing: 10) {
+            Text("Gemini debug")
+              .font(.system(size: 12, weight: .bold, design: .rounded))
+              .tracking(1.8)
+              .foregroundStyle(Color(red: 0.88, green: 0.82, blue: 0.70))
+
+            Text(commentary.hintStatusText)
+              .font(.system(size: 14, weight: .semibold, design: .rounded))
+              .foregroundStyle(Color.white.opacity(0.86))
+
+            if commentary.geminiDebugLines.isEmpty {
+              Text("No Gemini activity yet.")
+                .font(.system(size: 13, weight: .medium, design: .rounded))
+                .foregroundStyle(Color.white.opacity(0.68))
+            } else {
+              ForEach(Array(commentary.geminiDebugLines.reversed()), id: \.self) { line in
+                Text(line)
+                  .font(.system(size: 12, weight: .medium, design: .monospaced))
+                  .foregroundStyle(Color.white.opacity(0.80))
+                  .textSelection(.enabled)
+              }
+            }
+          }
+          .frame(maxWidth: .infinity, alignment: .leading)
+          .padding(18)
+          .background(
+            RoundedRectangle(cornerRadius: 24, style: .continuous)
+              .fill(Color(red: 0.07, green: 0.08, blue: 0.12).opacity(0.86))
+              .overlay(
+                RoundedRectangle(cornerRadius: 24, style: .continuous)
+                  .stroke(Color.white.opacity(0.14), lineWidth: 1)
+              )
+          )
+          .transition(.move(edge: .bottom).combined(with: .opacity))
+        }
+
         if isMatchLogVisible {
           VStack(alignment: .leading, spacing: 10) {
             Text("Match log")
@@ -4095,6 +4172,15 @@ private struct NativeARExperienceView: View {
             ) {
               withAnimation(.spring(response: 0.30, dampingFraction: 0.86)) {
                 isMatchLogVisible.toggle()
+              }
+            }
+
+            overlayToggleButton(
+              title: isGeminiDebugVisible ? "Hide Gemini Debug" : "Show Gemini Debug",
+              systemImage: "sparkles.rectangle.stack"
+            ) {
+              withAnimation(.spring(response: 0.30, dampingFraction: 0.86)) {
+                isGeminiDebugVisible.toggle()
               }
             }
           }
