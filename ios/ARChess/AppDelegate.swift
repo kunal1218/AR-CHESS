@@ -677,6 +677,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   @Published private(set) var caption: Caption?
   @Published private(set) var analysisStatus = "Stockfish depth 10 warming up..."
   @Published private(set) var latestAssessment = "Waiting for initial analysis."
+  @Published private(set) var suggestedMoveText = "Next best move: waiting on Stockfish..."
 
   private let analyzer = StockfishWASMAnalyzer()
   private let synthesizer = AVSpeechSynthesizer()
@@ -699,9 +700,11 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       cachedAnalysis = CachedAnalysis(fen: fen, analysis: analysis)
       analysisStatus = "Stockfish depth 10 ready."
       latestAssessment = "Prep eval: \(describe(analysis: analysis, moverColor: state.turn))."
+      suggestedMoveText = bestMoveDescription(from: analysis)
     } catch {
       analysisStatus = "Stockfish unavailable. Falling back to local board events."
       latestAssessment = "Local commentary only."
+      suggestedMoveText = "Next best move unavailable."
     }
   }
 
@@ -713,6 +716,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     analyzer.reset()
     analysisStatus = "Stockfish depth 10 warming up..."
     latestAssessment = "Waiting for initial analysis."
+    suggestedMoveText = "Next best move: waiting on Stockfish..."
   }
 
   func handleMove(
@@ -726,8 +730,10 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     if let afterAnalysis {
       cachedAnalysis = CachedAnalysis(fen: afterState.fenString, analysis: afterAnalysis)
       analysisStatus = "Stockfish depth 10 live."
+      suggestedMoveText = bestMoveDescription(from: afterAnalysis)
     } else if analyzer.lastError != nil {
       analysisStatus = "Stockfish unavailable. Falling back to local board events."
+      suggestedMoveText = "Next best move unavailable."
     }
 
     let assessment = classifyMove(
@@ -860,6 +866,44 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
 
     let cp = analysis.scoreCp ?? 0
     return "\(cp) cp"
+  }
+
+  private func bestMoveDescription(from analysis: StockfishAnalysis) -> String {
+    guard let bestMove = analysis.bestMove, bestMove != "(none)" else {
+      return "Next best move unavailable."
+    }
+
+    return "Next best move: \(humanReadableMove(bestMove))"
+  }
+
+  private func humanReadableMove(_ uci: String) -> String {
+    guard uci.count >= 4 else {
+      return uci
+    }
+
+    let from = String(uci.prefix(2))
+    let to = String(uci.dropFirst(2).prefix(2))
+
+    guard uci.count > 4 else {
+      return "\(from) to \(to)"
+    }
+
+    let promotionCode = uci.suffix(1).lowercased()
+    let promotionName: String
+    switch promotionCode {
+    case "q":
+      promotionName = "queen"
+    case "r":
+      promotionName = "rook"
+    case "b":
+      promotionName = "bishop"
+    case "n":
+      promotionName = "knight"
+    default:
+      promotionName = String(promotionCode)
+    }
+
+    return "\(from) to \(to), promoting to \(promotionName)"
   }
 
   private func lines(for classification: MoveClassification) -> [SpokenLine] {
@@ -1157,6 +1201,10 @@ private struct NativeARExperienceView: View {
           Text(commentary.analysisStatus)
             .font(.system(size: 12, weight: .semibold, design: .rounded))
             .foregroundStyle(Color(red: 0.88, green: 0.82, blue: 0.70))
+
+          Text(commentary.suggestedMoveText)
+            .font(.system(size: 13, weight: .bold, design: .rounded))
+            .foregroundStyle(Color.white.opacity(0.92))
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(18)
