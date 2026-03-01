@@ -972,7 +972,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       dialogueLines = lines(for: assessment)
       priority = .normal
     } else {
-      dialogueLines = moveFlavorLines(for: move.piece.kind)
+      dialogueLines = ambientMoveFlavorLines()
       priority = .normal
     }
 
@@ -1239,8 +1239,52 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     }
   }
 
+  private func ambientMoveFlavorLines() -> [SpokenLine] {
+    let weightedKinds: [(ChessPieceKind, Int)] = [
+      (.pawn, 1),
+      (.rook, 3),
+      (.knight, 3),
+      (.bishop, 3),
+      (.queen, 3),
+      (.king, 3),
+    ]
+
+    let totalWeight = weightedKinds.reduce(0) { $0 + $1.1 }
+    var roll = Int.random(in: 0..<max(totalWeight, 1))
+
+    for (kind, weight) in weightedKinds {
+      if roll < weight {
+        return moveFlavorLines(for: kind)
+      }
+      roll -= weight
+    }
+
+    return moveFlavorLines(for: .knight)
+  }
+
+  private func weightedRandomLine(from lines: [SpokenLine]) -> SpokenLine? {
+    guard !lines.isEmpty else {
+      return nil
+    }
+
+    let weightedLines = lines.map { line in
+      (line: line, weight: line.speaker == .pawn ? 1 : 3)
+    }
+    let totalWeight = weightedLines.reduce(0) { $0 + $1.weight }
+    var roll = Int.random(in: 0..<max(totalWeight, 1))
+
+    for weightedLine in weightedLines {
+      if roll < weightedLine.weight {
+        return weightedLine.line
+      }
+      roll -= weightedLine.weight
+    }
+
+    return weightedLines.last?.line
+  }
+
   private func speakRandomLine(from lines: [SpokenLine], priority: SpeechPriority) -> Bool {
-    guard let line = lines.randomElement() else {
+    guard let line = weightedRandomLine(from: lines) else {
       return false
     }
 
@@ -1490,10 +1534,12 @@ private struct NativeARExperienceView: View {
 
         if let caption = commentary.caption {
           VStack(alignment: .leading, spacing: 6) {
-            Text(caption.speaker)
-              .font(.system(size: 12, weight: .bold, design: .rounded))
-              .tracking(1.8)
-              .foregroundStyle(Color(red: 0.95, green: 0.88, blue: 0.74))
+            HStack(spacing: 6) {
+              Image(systemName: "mic.fill")
+              Text(caption.speaker)
+            }
+            .font(.system(size: 12, weight: .bold, design: .rounded))
+            .foregroundStyle(Color(red: 0.95, green: 0.88, blue: 0.74))
 
             Text(caption.line)
               .font(.system(size: 17, weight: .bold, design: .rounded))
