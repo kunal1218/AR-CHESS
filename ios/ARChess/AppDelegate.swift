@@ -1444,16 +1444,13 @@ private enum SpeechPriority: Int {
 private final class StockfishAssetSchemeHandler: NSObject, WKURLSchemeHandler {
   private let indexHTMLProvider: () -> String
   private let engineData: Data
-  private let wasmData: Data
 
   init(
     indexHTMLProvider: @escaping () -> String,
-    engineData: Data,
-    wasmData: Data
+    engineData: Data
   ) {
     self.indexHTMLProvider = indexHTMLProvider
     self.engineData = engineData
-    self.wasmData = wasmData
     super.init()
   }
 
@@ -1471,8 +1468,6 @@ private final class StockfishAssetSchemeHandler: NSObject, WKURLSchemeHandler {
       responsePayload = (Data(indexHTMLProvider().utf8), "text/html")
     case "/stockfish-nnue-16-single.js":
       responsePayload = (engineData, "application/javascript")
-    case "/stockfish-nnue-16-single.wasm":
-      responsePayload = (wasmData, "application/wasm")
     default:
       responsePayload = nil
     }
@@ -1765,10 +1760,9 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
 
     let schemeHandler = StockfishAssetSchemeHandler(
       indexHTMLProvider: { [weak self] in
-        self?.stockfishBridgeHTML() ?? ""
+        self?.stockfishBridgeHTML(wasmBase64: wasmData.base64EncodedString()) ?? ""
       },
-      engineData: engineData,
-      wasmData: wasmData
+      engineData: engineData
     )
     configuration.setURLSchemeHandler(schemeHandler, forURLScheme: Self.scheme)
 
@@ -1963,8 +1957,7 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
     return String(data: data ?? Data("{}".utf8), encoding: .utf8) ?? "{}"
   }
 
-  private func stockfishBridgeHTML() -> String {
-    let wasmURL = "\(Self.scheme)://bundle/stockfish-nnue-16-single.wasm"
+  private func stockfishBridgeHTML(wasmBase64: String) -> String {
     return """
     <!doctype html>
     <html>
@@ -1973,7 +1966,7 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
         <meta name="viewport" content="width=device-width, initial-scale=1.0" />
         <script id="stockfish-engine" src="\(Self.scheme)://bundle/stockfish-nnue-16-single.js"></script>
         <script>
-          const wasmURL = \(jsonLiteral(wasmURL));
+          const wasmBase64 = \(jsonLiteral(wasmBase64));
           const bridgeState = {
             state: 'INIT',
             waitingReadyReason: null,
@@ -2018,6 +2011,15 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
             bridgePost({ type: 'line', line, timestamp: Date.now() });
           }
 
+          function decodeBase64ToUint8Array(base64) {
+            const binary = atob(base64);
+            const bytes = new Uint8Array(binary.length);
+            for (let index = 0; index < binary.length; index += 1) {
+              bytes[index] = binary.charCodeAt(index);
+            }
+            return bytes;
+          }
+
           function sendEngineCommand(command) {
             if (!bridgeState.engine) {
               bridgePost({ type: 'error', message: 'Stockfish engine missing while sending command.' });
@@ -2048,14 +2050,8 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
                 return;
               }
 
-              bridgeStatus('Fetching local WASM...');
-              const wasmResponse = await fetch(wasmURL);
-              if (!wasmResponse.ok) {
-                bridgePost({ type: 'error', message: 'Could not load bundled WASM.' });
-                return;
-              }
-
-              const wasmBinary = new Uint8Array(await wasmResponse.arrayBuffer());
+              bridgeStatus('Decoding bundled WASM...');
+              const wasmBinary = decodeBase64ToUint8Array(wasmBase64);
               bridgeStatus('Instantiating Stockfish locally...');
               const engine = await factory({ wasmBinary });
               bridgeState.engine = engine;
