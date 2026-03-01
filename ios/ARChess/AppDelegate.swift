@@ -703,9 +703,8 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
                 return;
               }
 
-              bridgeStatus('Waiting for readyok...');
+              bridgeStatus('Waiting for uciok...');
               engine.postMessage('uci');
-              engine.postMessage('isready');
             } catch (error) {
               bridgePost({ type: 'error', message: String(error) });
             }
@@ -713,6 +712,14 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
 
           function handleEngineLine(line) {
             line = String(line);
+
+            if (line === 'uciok') {
+              bridgeStatus('uciok received. Waiting for readyok...');
+              bridgeState.engine.postMessage('setoption name UCI_AnalyseMode value true');
+              bridgeState.engine.postMessage('setoption name Hash value 16');
+              bridgeState.engine.postMessage('isready');
+              return;
+            }
 
             if (line === 'readyok') {
               bridgeState.ready = true;
@@ -772,8 +779,8 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
               pv: [],
             };
 
+            bridgeStatus('Analyzing depth ' + next.depth + '...');
             bridgeState.engine.postMessage('stop');
-            bridgeState.engine.postMessage('ucinewgame');
             bridgeState.engine.postMessage('position fen ' + next.fen);
             bridgeState.engine.postMessage('go depth ' + next.depth);
           }
@@ -834,7 +841,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       suggestedMoveText = bestMoveDescription(from: analysis)
     } catch {
       let message = analyzer.lastError ?? error.localizedDescription
-      analysisStatus = "Stockfish unavailable. Falling back to local board events."
+      analysisStatus = "Stockfish unavailable. Last stage: \(analyzer.lastStatus)"
       latestAssessment = "Stockfish error: \(message)"
       suggestedMoveText = "Next best move unavailable."
     }
@@ -864,7 +871,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       analysisStatus = "Stockfish depth 10 live."
       suggestedMoveText = bestMoveDescription(from: afterAnalysis)
     } else if analyzer.lastError != nil {
-      analysisStatus = "Stockfish unavailable. Falling back to local board events."
+      analysisStatus = "Stockfish unavailable. Last stage: \(analyzer.lastStatus)"
       latestAssessment = "Stockfish error: \(analyzer.lastError ?? analyzer.lastStatus)"
       suggestedMoveText = "Next best move unavailable."
     }
@@ -878,7 +885,12 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     if let assessment {
       latestAssessment = "\(assessment.label): \(swingDescription(before: beforeAnalysis, after: afterAnalysis, moverColor: beforeState.turn))"
     } else {
-      latestAssessment = "Local event commentary only."
+      let stockfishMessage = analyzer.lastError ?? analyzer.lastStatus
+      if beforeAnalysis == nil || afterAnalysis == nil {
+        latestAssessment = "Stockfish error: \(stockfishMessage)"
+      } else {
+        latestAssessment = "Local event commentary only."
+      }
     }
 
     if let assessment {
