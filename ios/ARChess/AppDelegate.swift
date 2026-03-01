@@ -396,10 +396,11 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
   private var webView: WKWebView?
   private var pendingContinuations: [String: CheckedContinuation<StockfishAnalysis, Error>] = [:]
   private var timeoutTasks: [String: Task<Void, Never>] = [:]
-  private var bridgeInstallContinuations: [CheckedContinuation<Void, Error>] = []
-  private var bridgeInstallTimeoutTask: Task<Void, Never>?
-  private var isBridgeInstalled = false
+  private var readyContinuations: [CheckedContinuation<Void, Error>] = []
+  private var readyTimeoutTask: Task<Void, Never>?
+  private var isEngineReady = false
   private(set) var lastError: String?
+  private(set) var lastStatus = "Stockfish idle."
 
   func analyze(fen: String, depth: Int = 10) async throws -> StockfishAnalysis {
     ensureWebView()
@@ -412,7 +413,7 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
       )
     }
 
-    try await waitUntilBridgeInstalled()
+    try await waitUntilReady()
 
     let requestID = UUID().uuidString
     let requestScript = """
@@ -461,8 +462,15 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
 
   func reset() {
     lastError = nil
-    bridgeInstallTimeoutTask?.cancel()
-    bridgeInstallTimeoutTask = nil
+    lastStatus = "Stockfish idle."
+    readyTimeoutTask?.cancel()
+    readyTimeoutTask = nil
+    readyContinuations.removeAll()
+    pendingContinuations.removeAll()
+    timeoutTasks.values.forEach { $0.cancel() }
+    timeoutTasks.removeAll()
+    isEngineReady = false
+    webView = nil
   }
 
   func userContentController(
@@ -476,24 +484,28 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
     }
 
     switch type {
-    case "bridgeInstalled":
-      isBridgeInstalled = true
-      lastError = nil
-      bridgeInstallTimeoutTask?.cancel()
-      bridgeInstallTimeoutTask = nil
-      let continuations = bridgeInstallContinuations
-      bridgeInstallContinuations.removeAll()
-      continuations.forEach { $0.resume() }
+    case "status":
+      if let message = payload["message"] as? String {
+        lastStatus = message
+      }
     case "ready":
+      isEngineReady = true
       lastError = nil
+      lastStatus = "Stockfish ready."
+      readyTimeoutTask?.cancel()
+      readyTimeoutTask = nil
+      let continuations = readyContinuations
+      readyContinuations.removeAll()
+      continuations.forEach { $0.resume() }
     case "error":
       let message = payload["message"] as? String ?? "Unknown Stockfish bridge error."
       lastError = message
-      if !isBridgeInstalled, !bridgeInstallContinuations.isEmpty {
-        bridgeInstallTimeoutTask?.cancel()
-        bridgeInstallTimeoutTask = nil
-        let continuations = bridgeInstallContinuations
-        bridgeInstallContinuations.removeAll()
+      lastStatus = "Stockfish error: \(message)"
+      if !isEngineReady, !readyContinuations.isEmpty {
+        readyTimeoutTask?.cancel()
+        readyTimeoutTask = nil
+        let continuations = readyContinuations
+        readyContinuations.removeAll()
         continuations.forEach {
           $0.resume(
             throwing: NSError(
@@ -531,7 +543,7 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
       return
     }
 
-    guard let runtimeDirectory = Self.stockfishRuntimeDirectoryURL() else {
+    guard let payload = Self.stockfishBridgePayload() else {
       lastError = "Bundled Stockfish assets are missing or unreadable."
       return
     }
@@ -546,23 +558,21 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
     let webView = WKWebView(frame: .zero, configuration: configuration)
     webView.isHidden = true
     webView.navigationDelegate = self
-    let htmlURL = runtimeDirectory.appendingPathComponent("stockfish-bridge.html")
-    do {
-      try Self.stockfishBridgeHTML(messageHandlerName: messageHandlerName).write(
-        to: htmlURL,
-        atomically: true,
-        encoding: .utf8
-      )
-      webView.loadFileURL(htmlURL, allowingReadAccessTo: runtimeDirectory)
-    } catch {
-      lastError = error.localizedDescription
-      return
-    }
+    lastStatus = "Stockfish booting..."
+    webView.loadHTMLString(
+      Self.stockfishBridgeHTML(
+        messageHandlerName: messageHandlerName,
+        engineSource: payload.engineSource,
+        wasmBase64: payload.wasmBase64
+      ),
+      baseURL: nil
+    )
     self.webView = webView
   }
 
   func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
     lastError = error.localizedDescription
+    lastStatus = "Stockfish webview navigation failed."
   }
 
   func webView(
@@ -571,27 +581,28 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
     withError error: Error
   ) {
     lastError = error.localizedDescription
+    lastStatus = "Stockfish webview provisional navigation failed."
   }
 
-  private func waitUntilBridgeInstalled() async throws {
-    if isBridgeInstalled {
+  private func waitUntilReady() async throws {
+    if isEngineReady {
       return
     }
 
     try await withCheckedThrowingContinuation { continuation in
-      bridgeInstallContinuations.append(continuation)
-      if bridgeInstallTimeoutTask == nil {
-        bridgeInstallTimeoutTask = Task { [weak self] in
-          try? await Task.sleep(nanoseconds: 5_000_000_000)
+      readyContinuations.append(continuation)
+      if readyTimeoutTask == nil {
+        readyTimeoutTask = Task { [weak self] in
+          try? await Task.sleep(nanoseconds: 8_000_000_000)
           await MainActor.run {
-            guard let self, !self.isBridgeInstalled, !self.bridgeInstallContinuations.isEmpty else {
+            guard let self, !self.isEngineReady, !self.readyContinuations.isEmpty else {
               return
             }
 
-            let errorMessage = self.lastError ?? "Stockfish bridge did not finish loading."
-            let continuations = self.bridgeInstallContinuations
-            self.bridgeInstallContinuations.removeAll()
-            self.bridgeInstallTimeoutTask = nil
+            let errorMessage = self.lastError ?? self.lastStatus
+            let continuations = self.readyContinuations
+            self.readyContinuations.removeAll()
+            self.readyTimeoutTask = nil
             self.lastError = errorMessage
             continuations.forEach {
               $0.resume(
@@ -608,33 +619,16 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
     }
   }
 
-  private static func stockfishRuntimeDirectoryURL() -> URL? {
+  private static func stockfishBridgePayload() -> (engineSource: String, wasmBase64: String)? {
     guard let bundledJSURL = Bundle.main.url(forResource: "stockfish-nnue-16-single", withExtension: "js"),
-          let bundledWASMURL = Bundle.main.url(forResource: "stockfish-nnue-16-single", withExtension: "wasm") else {
+          let bundledWASMURL = Bundle.main.url(forResource: "stockfish-nnue-16-single", withExtension: "wasm"),
+          let engineSource = try? String(contentsOf: bundledJSURL, encoding: .utf8),
+          let wasmData = try? Data(contentsOf: bundledWASMURL) else {
       return nil
     }
 
-    let runtimeDirectory = FileManager.default.temporaryDirectory
-      .appendingPathComponent("ARChessStockfish", isDirectory: true)
-
-    do {
-      try FileManager.default.createDirectory(at: runtimeDirectory, withIntermediateDirectories: true)
-      let runtimeJSURL = runtimeDirectory.appendingPathComponent("stockfish-nnue-16-single.js")
-      let runtimeWASMURL = runtimeDirectory.appendingPathComponent("stockfish-nnue-16-single.wasm")
-
-      if FileManager.default.fileExists(atPath: runtimeJSURL.path) {
-        try FileManager.default.removeItem(at: runtimeJSURL)
-      }
-      if FileManager.default.fileExists(atPath: runtimeWASMURL.path) {
-        try FileManager.default.removeItem(at: runtimeWASMURL)
-      }
-
-      try FileManager.default.copyItem(at: bundledJSURL, to: runtimeJSURL)
-      try FileManager.default.copyItem(at: bundledWASMURL, to: runtimeWASMURL)
-      return runtimeDirectory
-    } catch {
-      return nil
-    }
+    let sanitizedEngineSource = engineSource.replacingOccurrences(of: "</script", with: "<\\/script")
+    return (engineSource: sanitizedEngineSource, wasmBase64: wasmData.base64EncodedString())
   }
 
   private func javaScriptStringLiteral(_ value: String) -> String {
@@ -643,13 +637,20 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
     return String(json.dropFirst().dropLast())
   }
 
-  private static func stockfishBridgeHTML(messageHandlerName: String) -> String {
+  private static func stockfishBridgeHTML(
+    messageHandlerName: String,
+    engineSource: String,
+    wasmBase64: String
+  ) -> String {
     """
     <!doctype html>
     <html>
       <head>
         <meta charset="utf-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <script id="stockfish-engine">
+        \(engineSource)
+        </script>
         <script>
           const bridgeState = {
             ready: false,
@@ -657,6 +658,7 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
             queue: [],
             current: null,
           };
+          const wasmBase64 = \(jsonStringLiteral(wasmBase64));
 
           function bridgePost(payload) {
             if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.\(messageHandlerName)) {
@@ -664,14 +666,44 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
             }
           }
 
-          function bootStockfish() {
+          function bridgeStatus(message) {
+            bridgePost({ type: 'status', message });
+          }
+
+          function decodeBase64ToUint8Array(base64) {
+            const binary = atob(base64);
+            const length = binary.length;
+            const bytes = new Uint8Array(length);
+            for (let index = 0; index < length; index += 1) {
+              bytes[index] = binary.charCodeAt(index);
+            }
+            return bytes;
+          }
+
+          async function bootStockfish() {
             try {
-              const engine = new Worker('stockfish-nnue-16-single.js');
+              bridgeStatus('Preparing Stockfish engine...');
+              const factory = document.getElementById('stockfish-engine')._exports;
+              if (!factory) {
+                bridgePost({ type: 'error', message: 'Stockfish engine factory missing.' });
+                return;
+              }
+
+              bridgeStatus('Decoding bundled WASM...');
+              const wasmBinary = decodeBase64ToUint8Array(wasmBase64);
+              bridgeStatus('Instantiating engine...');
+              const engine = await factory({ wasmBinary });
               bridgeState.engine = engine;
-              engine.onmessage = (event) => handleEngineLine(event.data);
-              engine.onerror = (event) => {
-                bridgePost({ type: 'error', message: event.message || 'Stockfish worker failed.' });
-              };
+              if (typeof engine.addMessageListener === 'function') {
+                engine.addMessageListener(handleEngineLine);
+              } else if (typeof engine.onmessage !== 'undefined') {
+                engine.onmessage = handleEngineLine;
+              } else {
+                bridgePost({ type: 'error', message: 'Stockfish listener API missing.' });
+                return;
+              }
+
+              bridgeStatus('Waiting for readyok...');
               engine.postMessage('uci');
               engine.postMessage('isready');
             } catch (error) {
@@ -684,6 +716,7 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
 
             if (line === 'readyok') {
               bridgeState.ready = true;
+              bridgeStatus('readyok received.');
               bridgePost({ type: 'ready' });
               drainAnalysisQueue();
               return;
@@ -750,14 +783,18 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
             drainAnalysisQueue();
             return true;
           };
-
-          bridgePost({ type: 'bridgeInstalled' });
           bootStockfish();
         </script>
       </head>
       <body></body>
     </html>
     """
+  }
+
+  private static func jsonStringLiteral(_ value: String) -> String {
+    let data = try? JSONSerialization.data(withJSONObject: [value])
+    let json = String(data: data ?? Data("[]".utf8), encoding: .utf8) ?? "[\"\"]"
+    return String(json.dropFirst().dropLast())
   }
 }
 
@@ -828,7 +865,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       suggestedMoveText = bestMoveDescription(from: afterAnalysis)
     } else if analyzer.lastError != nil {
       analysisStatus = "Stockfish unavailable. Falling back to local board events."
-      latestAssessment = "Stockfish error: \(analyzer.lastError ?? "Unknown Stockfish error.")"
+      latestAssessment = "Stockfish error: \(analyzer.lastError ?? analyzer.lastStatus)"
       suggestedMoveText = "Next best move unavailable."
     }
 
@@ -1409,8 +1446,11 @@ private struct NativeARExperienceView: View {
       .padding(.vertical, 24)
     }
     .task {
-      await commentary.prepare(with: ChessGameState.initial())
       await matchLog.prepareRemoteGameIfNeeded()
+      Task {
+        try? await Task.sleep(nanoseconds: 1_000_000_000)
+        await commentary.prepare(with: ChessGameState.initial())
+      }
     }
     .onDisappear {
       commentary.resetSession()
