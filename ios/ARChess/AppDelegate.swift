@@ -1074,8 +1074,9 @@ private enum StockfishControllerState: String {
 private struct StockfishEngineConfig {
   var defaultMovetimeMs = 80
   var hardTimeoutMs = 600
-  var startupTimeoutMs = 2_000
-  var readyTimeoutMs = 1_000
+  // Cold boot inside a hidden WKWebView is slower than a normal search and should not share the same budget.
+  var startupTimeoutMs = 6_000
+  var readyTimeoutMs = 1_500
   var threads = 1
   var hashMB = 16
   var strictFENValidation = false
@@ -2322,7 +2323,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   }
 
   @Published private(set) var caption: Caption?
-  @Published private(set) var analysisStatus = "Stockfish movetime 80ms warming up..."
+  @Published private(set) var analysisStatus = "Waiting for AR tracking to settle before warming Stockfish..."
   @Published private(set) var latestAssessment = "Waiting for initial analysis."
   @Published private(set) var suggestedMoveText = "Next best move: waiting on Stockfish..."
   @Published private(set) var whiteEvalText = "White eval: --"
@@ -2380,7 +2381,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     completedPlyCount = 0
     nextCommentaryPly = Int.random(in: Self.commentaryIntervalRange)
     analyzer.reset()
-    analysisStatus = "Stockfish movetime \(Self.preferredMovetimeMs)ms warming up..."
+    analysisStatus = "Waiting for AR tracking to settle before warming Stockfish..."
     latestAssessment = "Waiting for initial analysis."
     suggestedMoveText = "Next best move: waiting on Stockfish..."
     whiteEvalText = "White eval: --"
@@ -2390,6 +2391,14 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
 
   func noteExternalStatus(_ message: String) {
     latestAssessment = message
+  }
+
+  func noteWarmupStatus(_ message: String) {
+    guard cachedAnalysis == nil else {
+      return
+    }
+
+    analysisStatus = message
   }
 
   func bindStateProvider(_ provider: @escaping () -> ChessGameState?) {
@@ -3471,10 +3480,6 @@ private struct NativeARExperienceView: View {
       } else {
         await queueMatch.activateMatchSync()
       }
-      Task {
-        try? await Task.sleep(nanoseconds: 1_000_000_000)
-        await commentary.prepare(with: ChessGameState.initial())
-      }
     }
     .onDisappear {
       commentary.resetSession()
@@ -4382,6 +4387,10 @@ private struct NativeARView: UIViewRepresentable {
     private var syncedQueueMoves: [QueueMatchMovePayload] = []
     private var queueAssignedColor: ChessColor?
     private var hasBoundReactionHandler = false
+    private var stableTrackingFrames = 0
+    private var hasScheduledInitialAnalysis = false
+    private var initialAnalysisTask: Task<Void, Never>?
+    private var lastWarmupStatusMessage: String?
 
     init(
       matchLog: MatchLogStore,
@@ -4395,11 +4404,16 @@ private struct NativeARView: UIViewRepresentable {
       self.commentary = commentary
     }
 
+    deinit {
+      initialAnalysisTask?.cancel()
+    }
+
     func configure(_ arView: ARView) {
       self.arView = arView
       arView.automaticallyConfigureSession = false
       arView.environment.background = .cameraFeed()
       arView.renderOptions.insert(.disableMotionBlur)
+      noteWarmupStatus("Waiting for board placement before warming Stockfish...")
 
       let tapRecognizer = UITapGestureRecognizer(target: self, action: #selector(handleTap(_:)))
       arView.addGestureRecognizer(tapRecognizer)
@@ -4412,18 +4426,9 @@ private struct NativeARView: UIViewRepresentable {
       configuration.planeDetection = [.horizontal]
       configuration.environmentTexturing = .automatic
 
-      if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
-        configuration.frameSemantics.insert(.sceneDepth)
-      }
-
-      if ARWorldTrackingConfiguration.supportsFrameSemantics(.personSegmentationWithDepth) {
-        configuration.frameSemantics.insert(.personSegmentationWithDepth)
-      }
-
       if ARWorldTrackingConfiguration.supportsSceneReconstruction(.meshWithClassification) {
         configuration.sceneReconstruction = .meshWithClassification
         arView.environment.sceneUnderstanding.options.insert(.occlusion)
-        arView.environment.sceneUnderstanding.options.insert(.physics)
       } else if ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh) {
         configuration.sceneReconstruction = .mesh
         arView.environment.sceneUnderstanding.options.insert(.occlusion)
@@ -4489,6 +4494,10 @@ private struct NativeARView: UIViewRepresentable {
 
     func session(_ session: ARSession, didUpdate anchors: [ARAnchor]) {
       updateBoardPlacement(session: session, anchors: anchors)
+    }
+
+    func session(_ session: ARSession, didUpdate frame: ARFrame) {
+      updateTrackingReadiness(frame)
     }
 
     @objc
@@ -4863,6 +4872,74 @@ private struct NativeARView: UIViewRepresentable {
       }
 
       trackedPlaneID = selectedPlane.identifier
+      maybeScheduleInitialAnalysis()
+    }
+
+    private func updateTrackingReadiness(_ frame: ARFrame) {
+      let trackingIsStable: Bool
+      switch frame.camera.trackingState {
+      case .normal:
+        trackingIsStable = true
+      default:
+        trackingIsStable = false
+      }
+
+      if trackingIsStable {
+        stableTrackingFrames += 1
+      } else {
+        stableTrackingFrames = 0
+      }
+
+      if boardAnchor == nil {
+        noteWarmupStatus("Waiting for board placement before warming Stockfish...")
+      } else if stableTrackingFrames < 30 {
+        noteWarmupStatus("Waiting for AR tracking to stabilize before warming Stockfish...")
+      } else {
+        maybeScheduleInitialAnalysis()
+      }
+    }
+
+    private func maybeScheduleInitialAnalysis() {
+      guard !hasScheduledInitialAnalysis else {
+        return
+      }
+
+      guard boardAnchor != nil else {
+        return
+      }
+
+      guard stableTrackingFrames >= 30 else {
+        return
+      }
+
+      hasScheduledInitialAnalysis = true
+      noteWarmupStatus("Tracking stable. Warming local Stockfish...")
+      initialAnalysisTask?.cancel()
+      initialAnalysisTask = Task { @MainActor [weak self] in
+        try? await Task.sleep(nanoseconds: 1_500_000_000)
+        guard let self else {
+          return
+        }
+
+        guard self.boardAnchor != nil, self.stableTrackingFrames >= 30 else {
+          self.hasScheduledInitialAnalysis = false
+          self.noteWarmupStatus("AR tracking slipped. Waiting to warm Stockfish again...")
+          return
+        }
+
+        await self.commentary.prepare(with: self.gameState, force: true)
+      }
+    }
+
+    private func noteWarmupStatus(_ message: String) {
+      guard lastWarmupStatusMessage != message else {
+        return
+      }
+
+      lastWarmupStatusMessage = message
+      Task { @MainActor [weak self] in
+        self?.commentary.noteWarmupStatus(message)
+      }
     }
 
     private func selectBestPlane(from planes: [ARPlaneAnchor], frame: ARFrame) -> ARPlaneAnchor? {
