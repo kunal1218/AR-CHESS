@@ -680,6 +680,27 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
             return bytes;
           }
 
+          function sendEngineCommand(command) {
+            const engine = bridgeState.engine;
+            if (!engine) {
+              bridgePost({ type: 'error', message: 'Stockfish engine missing while sending command.' });
+              return false;
+            }
+
+            if (typeof engine.onCustomMessage === 'function') {
+              engine.onCustomMessage(command);
+              return true;
+            }
+
+            if (typeof engine.postMessage === 'function') {
+              engine.postMessage(command);
+              return true;
+            }
+
+            bridgePost({ type: 'error', message: 'Stockfish command API missing.' });
+            return false;
+          }
+
           async function bootStockfish() {
             try {
               bridgeStatus('Preparing Stockfish engine...');
@@ -704,7 +725,7 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
               }
 
               bridgeStatus('Waiting for uciok...');
-              engine.postMessage('uci');
+              sendEngineCommand('uci');
             } catch (error) {
               bridgePost({ type: 'error', message: String(error) });
             }
@@ -715,9 +736,9 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
 
             if (line === 'uciok') {
               bridgeStatus('uciok received. Waiting for readyok...');
-              bridgeState.engine.postMessage('setoption name UCI_AnalyseMode value true');
-              bridgeState.engine.postMessage('setoption name Hash value 16');
-              bridgeState.engine.postMessage('isready');
+              sendEngineCommand('setoption name UCI_AnalyseMode value true');
+              sendEngineCommand('setoption name Hash value 16');
+              sendEngineCommand('isready');
               return;
             }
 
@@ -780,9 +801,9 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
             };
 
             bridgeStatus('Analyzing depth ' + next.depth + '...');
-            bridgeState.engine.postMessage('stop');
-            bridgeState.engine.postMessage('position fen ' + next.fen);
-            bridgeState.engine.postMessage('go depth ' + next.depth);
+            sendEngineCommand('stop');
+            sendEngineCommand('position fen ' + next.fen);
+            sendEngineCommand('go depth ' + next.depth);
           }
 
           window.__archessAnalyze = function(id, fen, depth) {
