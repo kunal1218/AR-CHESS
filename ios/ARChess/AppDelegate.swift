@@ -2628,7 +2628,8 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
 private final class PiecePersonalityDirector: NSObject, ObservableObject, @preconcurrency AVSpeechSynthesizerDelegate {
   private static let preferredMovetimeMs = 80
   private static let preferredHardTimeoutMs = 600
-  private static let commentaryIntervalRange = 3...4
+  private static let commentaryIntervalRange = 2...3
+  private static let kingCookedCooldownPly = 15
   private static let substantialGainThreshold = 120
   private static let substantialDropThreshold = -140
 
@@ -2676,6 +2677,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   private var hintCache: [String: String] = [:]
   private var currentHintKey: String?
   private var pendingHintReveal = false
+  private var nextKingCookedAllowedPly: [ChessColor: Int] = [:]
 
   override init() {
     super.init()
@@ -2736,6 +2738,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     isHintLoading = false
     completedPlyCount = 0
     nextCommentaryPly = Int.random(in: Self.commentaryIntervalRange)
+    nextKingCookedAllowedPly = [:]
     analyzer.reset()
     analysisStatus = "Waiting for AR tracking to settle before warming Stockfish..."
     latestAssessment = "Waiting for initial analysis."
@@ -2898,21 +2901,23 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
         reactionHandler?(ReactionCue(kind: .enemyKingPrays(color: beforeState.turn.opponent)))
       } else if swing <= Self.substantialDropThreshold {
         reactionHandler?(ReactionCue(kind: .currentKingCries(color: beforeState.turn)))
-        if speakRandomLine(
-          from: [
-            SpokenLine(
-              speaker: .king,
-              text: "I'm cooked.",
-              pitch: 1.18,
-              rate: 0.46,
-              volume: 1.0
-            )
-          ],
-          priority: .urgent
-        ) {
+        if canKingSayCooked(for: beforeState.turn),
+           speakRandomLine(
+             from: [
+               SpokenLine(
+                 speaker: .king,
+                 text: "I'm cooked.",
+                 pitch: 1.18,
+                 rate: 0.46,
+                 volume: 1.0
+               )
+             ],
+             priority: .urgent
+           ) {
+          noteKingCookedSpoken(for: beforeState.turn)
           scheduleNextCommentaryWindow()
+          return
         }
-        return
       }
     }
 
@@ -3291,6 +3296,14 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
 
   private func scheduleNextCommentaryWindow() {
     nextCommentaryPly = completedPlyCount + Int.random(in: Self.commentaryIntervalRange)
+  }
+
+  private func canKingSayCooked(for color: ChessColor) -> Bool {
+    completedPlyCount >= (nextKingCookedAllowedPly[color] ?? 0)
+  }
+
+  private func noteKingCookedSpoken(for color: ChessColor) {
+    nextKingCookedAllowedPly[color] = completedPlyCount + Self.kingCookedCooldownPly
   }
 
   private func lines(for classification: MoveClassification) -> [SpokenLine] {
