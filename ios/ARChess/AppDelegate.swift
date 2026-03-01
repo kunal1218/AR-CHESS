@@ -4506,6 +4506,8 @@ private struct NativeARView: UIViewRepresentable {
 
     private let boardSize: Float = 0.40
     private let boardInset: Float = 0.08
+    private let minimumBoardScale: Float = 1.0
+    private let maximumBoardScale: Float = 2.4
     private let matchLog: MatchLogStore
     private let queueMatch: QueueMatchStore
     private let mode: ExperienceMode
@@ -4514,6 +4516,8 @@ private struct NativeARView: UIViewRepresentable {
     private var boardAnchor: AnchorEntity?
     private var boardWorldTransform: simd_float4x4?
     private var boardRoot = Entity()
+    private var boardScale: Float = 1.0
+    private var pinchStartScale: Float = 1.0
     private var piecesContainer = Entity()
     private var highlightsContainer = Entity()
     private var trackedPlaneID: UUID?
@@ -4559,6 +4563,9 @@ private struct NativeARView: UIViewRepresentable {
 
       let tapRecognizer = UITapGestureRecognizer(target: self, action: #selector(handleTap(_:)))
       arView.addGestureRecognizer(tapRecognizer)
+
+      let pinchRecognizer = UIPinchGestureRecognizer(target: self, action: #selector(handlePinch(_:)))
+      arView.addGestureRecognizer(pinchRecognizer)
 
       guard ARWorldTrackingConfiguration.isSupported else {
         return
@@ -4675,6 +4682,28 @@ private struct NativeARView: UIViewRepresentable {
       }
     }
 
+    @objc
+    private func handlePinch(_ recognizer: UIPinchGestureRecognizer) {
+      guard boardAnchor != nil else {
+        return
+      }
+
+      switch recognizer.state {
+      case .began:
+        pinchStartScale = boardScale
+      case .changed, .ended:
+        let nextScale = clamp(pinchStartScale * Float(recognizer.scale), min: minimumBoardScale, max: maximumBoardScale)
+        guard abs(nextScale - boardScale) > 0.0001 else {
+          return
+        }
+
+        boardScale = nextScale
+        applyBoardScale()
+      default:
+        break
+      }
+    }
+
     private func boardSquare(at location: CGPoint, in arView: ARView) -> BoardSquare? {
       guard let boardWorldTransform else {
         return nil
@@ -4691,8 +4720,8 @@ private struct NativeARView: UIViewRepresentable {
         hit.worldTransform.columns.3.z
       )
       let localPoint4 = boardWorldTransform.inverse * SIMD4<Float>(worldPoint.x, worldPoint.y, worldPoint.z, 1)
-      let localX = localPoint4.x
-      let localZ = localPoint4.z
+      let localX = localPoint4.x / boardScale
+      let localZ = localPoint4.z / boardScale
       let halfBoard = boardSize * 0.5
 
       guard localX >= -halfBoard, localX <= halfBoard, localZ >= -halfBoard, localZ <= halfBoard else {
@@ -4713,6 +4742,10 @@ private struct NativeARView: UIViewRepresentable {
       }
 
       return square
+    }
+
+    private func applyBoardScale() {
+      boardRoot.scale = SIMD3<Float>(repeating: boardScale)
     }
 
     private func handleTapOnPiece(at square: BoardSquare) {
@@ -5585,6 +5618,7 @@ private struct NativeARView: UIViewRepresentable {
 
     private func makeBoardEntity() -> Entity {
       let boardRoot = Entity()
+      boardRoot.scale = SIMD3<Float>(repeating: boardScale)
       self.boardRoot = boardRoot
       piecesContainer = Entity()
       highlightsContainer = Entity()
