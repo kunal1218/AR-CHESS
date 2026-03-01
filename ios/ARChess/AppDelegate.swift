@@ -3395,6 +3395,8 @@ private struct NativeARExperienceView: View {
   let closeExperience: () -> Void
   @StateObject private var matchLog = MatchLogStore()
   @StateObject private var commentary = PiecePersonalityDirector()
+  @State private var isModePanelVisible = false
+  @State private var isMatchLogVisible = false
 
   var body: some View {
     ZStack {
@@ -3414,59 +3416,62 @@ private struct NativeARExperienceView: View {
       .allowsHitTesting(false)
 
       VStack(spacing: 16) {
-        VStack(alignment: .leading, spacing: 10) {
-          Text(modeTitle)
-            .font(.system(size: 12, weight: .bold, design: .rounded))
-            .tracking(2.0)
-            .foregroundStyle(Color(red: 0.87, green: 0.79, blue: 0.64))
+        if isModePanelVisible {
+          VStack(alignment: .leading, spacing: 10) {
+            Text(modeTitle)
+              .font(.system(size: 12, weight: .bold, design: .rounded))
+              .tracking(2.0)
+              .foregroundStyle(Color(red: 0.87, green: 0.79, blue: 0.64))
 
-          Text("Native AR Sandbox")
-            .font(.system(size: 30, weight: .heavy, design: .rounded))
-            .foregroundStyle(.white)
+            Text("Native AR Sandbox")
+              .font(.system(size: 30, weight: .heavy, design: .rounded))
+              .foregroundStyle(.white)
 
-          Text("RealityKit and ARKit are running inside the iOS app. Tap a piece, then tap a highlighted square to move it. Legal moves log in UCI and sync to Railway when ARChessAPIBaseURL is configured.")
-            .font(.system(size: 15, weight: .medium, design: .rounded))
-            .foregroundStyle(Color.white.opacity(0.86))
-            .lineSpacing(3)
+            Text("RealityKit and ARKit are running inside the iOS app. Tap a piece, then tap a highlighted square to move it. Legal moves log in UCI and sync to Railway when ARChessAPIBaseURL is configured.")
+              .font(.system(size: 15, weight: .medium, design: .rounded))
+              .foregroundStyle(Color.white.opacity(0.86))
+              .lineSpacing(3)
 
-          Text(commentary.analysisStatus)
-            .font(.system(size: 12, weight: .semibold, design: .rounded))
-            .foregroundStyle(Color(red: 0.88, green: 0.82, blue: 0.70))
+            Text(commentary.analysisStatus)
+              .font(.system(size: 12, weight: .semibold, design: .rounded))
+              .foregroundStyle(Color(red: 0.88, green: 0.82, blue: 0.70))
 
-          Text(commentary.suggestedMoveText)
-            .font(.system(size: 13, weight: .bold, design: .rounded))
-            .foregroundStyle(Color.white.opacity(0.92))
+            Text(commentary.suggestedMoveText)
+              .font(.system(size: 13, weight: .bold, design: .rounded))
+              .foregroundStyle(Color.white.opacity(0.92))
 
-          HStack(spacing: 10) {
-            VStack(alignment: .leading, spacing: 4) {
-              Text(commentary.whiteEvalText)
-                .font(.system(size: 12, weight: .bold, design: .rounded))
-                .foregroundStyle(Color.white.opacity(0.94))
+            HStack(spacing: 10) {
+              VStack(alignment: .leading, spacing: 4) {
+                Text(commentary.whiteEvalText)
+                  .font(.system(size: 12, weight: .bold, design: .rounded))
+                  .foregroundStyle(Color.white.opacity(0.94))
 
-              Text(commentary.blackEvalText)
-                .font(.system(size: 12, weight: .bold, design: .rounded))
-                .foregroundStyle(Color.white.opacity(0.88))
+                Text(commentary.blackEvalText)
+                  .font(.system(size: 12, weight: .bold, design: .rounded))
+                  .foregroundStyle(Color.white.opacity(0.88))
 
-              Text(commentary.analysisTimingText)
-                .font(.system(size: 11, weight: .semibold, design: .rounded))
-                .foregroundStyle(Color.white.opacity(0.66))
-            }
+                Text(commentary.analysisTimingText)
+                  .font(.system(size: 11, weight: .semibold, design: .rounded))
+                  .foregroundStyle(Color.white.opacity(0.66))
+              }
 
-            Spacer(minLength: 12)
+              Spacer(minLength: 12)
 
-            NativeActionButton(title: "Analyze current position", style: .outline) {
-              Task {
-                await commentary.analyzeCurrentPosition()
+              NativeActionButton(title: "Analyze current position", style: .outline) {
+                Task {
+                  await commentary.analyzeCurrentPosition()
+                }
               }
             }
           }
+          .frame(maxWidth: .infinity, alignment: .leading)
+          .padding(18)
+          .background(
+            RoundedRectangle(cornerRadius: 26, style: .continuous)
+              .fill(.ultraThinMaterial)
+          )
+          .transition(.move(edge: .top).combined(with: .opacity))
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(18)
-        .background(
-          RoundedRectangle(cornerRadius: 26, style: .continuous)
-            .fill(.ultraThinMaterial)
-        )
 
         Spacer()
 
@@ -3476,7 +3481,7 @@ private struct NativeARExperienceView: View {
           .transition(.move(edge: .bottom).combined(with: .opacity))
         }
 
-        ZStack(alignment: .bottom) {
+        if isMatchLogVisible {
           VStack(alignment: .leading, spacing: 10) {
             Text("Match log")
               .font(.system(size: 12, weight: .bold, design: .rounded))
@@ -3524,9 +3529,7 @@ private struct NativeARExperienceView: View {
             }
           }
           .frame(maxWidth: .infinity, alignment: .leading)
-          .padding(.top, 18)
-          .padding(.horizontal, 18)
-          .padding(.bottom, 116)
+          .padding(18)
           .background(
             RoundedRectangle(cornerRadius: 24, style: .continuous)
               .fill(Color(red: 0.05, green: 0.07, blue: 0.10).opacity(0.82))
@@ -3535,16 +3538,45 @@ private struct NativeARExperienceView: View {
                   .stroke(Color.white.opacity(0.14), lineWidth: 1)
               )
           )
-          .allowsHitTesting(false)
+          .transition(.move(edge: .bottom).combined(with: .opacity))
+        }
+      }
+      .padding(.horizontal, 18)
+      .padding(.vertical, 24)
+
+      VStack {
+        Spacer()
+        HStack(alignment: .bottom) {
+          VStack(alignment: .leading, spacing: 10) {
+            overlayToggleButton(
+              title: isModePanelVisible ? "Hide Mode" : "Show Mode",
+              systemImage: "rectangle.topthird.inset.filled"
+            ) {
+              withAnimation(.spring(response: 0.30, dampingFraction: 0.86)) {
+                isModePanelVisible.toggle()
+              }
+            }
+
+            overlayToggleButton(
+              title: isMatchLogVisible ? "Hide Log" : "Show Log",
+              systemImage: "text.append"
+            ) {
+              withAnimation(.spring(response: 0.30, dampingFraction: 0.86)) {
+                isMatchLogVisible.toggle()
+              }
+            }
+          }
+
+          Spacer(minLength: 16)
 
           NativeActionButton(title: "Exit AR", style: .solid) {
             closeExperience()
           }
-          .padding(18)
+          .frame(maxWidth: 220)
         }
+        .padding(.horizontal, 18)
+        .padding(.bottom, 24)
       }
-    .padding(.horizontal, 18)
-      .padding(.vertical, 24)
     }
     .task {
       if case .passAndPlay(_) = mode {
@@ -3566,6 +3598,28 @@ private struct NativeARExperienceView: View {
         }
       }
     }
+  }
+
+  private func overlayToggleButton(
+    title: String,
+    systemImage: String,
+    action: @escaping () -> Void
+  ) -> some View {
+    Button(action: action) {
+      Image(systemName: systemImage)
+        .font(.system(size: 15, weight: .bold))
+        .foregroundStyle(.white)
+        .frame(width: 42, height: 42)
+        .background(
+          Circle()
+            .fill(Color.black.opacity(0.54))
+            .overlay(
+              Circle()
+                .stroke(Color.white.opacity(0.16), lineWidth: 1)
+            )
+        )
+    }
+    .accessibilityLabel(title)
   }
 
   private var modeTitle: String {
