@@ -325,6 +325,57 @@ private enum PersonalitySpeaker {
     }
   }
 
+  var portraitGlyph: String {
+    switch self {
+    case .pawn:
+      return "♟"
+    case .rook:
+      return "♜"
+    case .knight:
+      return "♞"
+    case .bishop:
+      return "♝"
+    case .queen:
+      return "♛"
+    case .king:
+      return "♚"
+    }
+  }
+
+  var portraitTint: Color {
+    switch self {
+    case .pawn:
+      return Color(red: 0.79, green: 0.21, blue: 0.24)
+    case .rook:
+      return Color(red: 0.79, green: 0.48, blue: 0.18)
+    case .knight:
+      return Color(red: 0.78, green: 0.30, blue: 0.12)
+    case .bishop:
+      return Color(red: 0.63, green: 0.63, blue: 0.85)
+    case .queen:
+      return Color(red: 0.84, green: 0.48, blue: 0.58)
+    case .king:
+      return Color(red: 0.92, green: 0.76, blue: 0.36)
+    }
+  }
+
+  var portraitRotation: Double {
+    switch self {
+    case .pawn:
+      return -7
+    case .rook:
+      return -9
+    case .knight:
+      return -14
+    case .bishop:
+      return -10
+    case .queen:
+      return -8
+    case .king:
+      return -6
+    }
+  }
+
   var defaultPitch: Float {
     switch self {
     case .pawn:
@@ -857,8 +908,12 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   private static let commentaryIntervalRange = 3...4
 
   struct Caption {
-    let speaker: String
+    let speaker: PersonalitySpeaker
     let line: String
+
+    var speakerName: String {
+      speaker.displayName
+    }
   }
 
   @Published private(set) var caption: Caption?
@@ -1302,11 +1357,77 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     utterance.volume = min(max(line.volume ?? line.speaker.defaultVolume, 0.0), 1.0)
     utterance.preUtteranceDelay = 0.02
     utteranceCaptions[ObjectIdentifier(utterance)] = Caption(
-      speaker: line.speaker.displayName,
+      speaker: line.speaker,
       line: line.text
     )
     synthesizer.speak(utterance)
     return true
+  }
+}
+
+private struct PieceSpeechBubble: View {
+  let caption: PiecePersonalityDirector.Caption
+
+  var body: some View {
+    HStack(alignment: .center, spacing: 14) {
+      PiecePortraitView(speaker: caption.speaker)
+
+      VStack(alignment: .leading, spacing: 6) {
+        Text(caption.speakerName)
+          .font(.system(size: 12, weight: .bold, design: .rounded))
+          .foregroundStyle(Color(red: 0.95, green: 0.88, blue: 0.74))
+
+        Text(caption.line)
+          .font(.system(size: 17, weight: .bold, design: .rounded))
+          .foregroundStyle(.white)
+          .lineSpacing(2)
+      }
+
+      Spacer(minLength: 0)
+    }
+    .frame(maxWidth: .infinity, alignment: .leading)
+    .padding(.horizontal, 16)
+    .padding(.vertical, 14)
+    .background(
+      RoundedRectangle(cornerRadius: 24, style: .continuous)
+        .fill(Color(red: 0.08, green: 0.10, blue: 0.15).opacity(0.92))
+        .overlay(
+          RoundedRectangle(cornerRadius: 24, style: .continuous)
+            .stroke(Color.white.opacity(0.12), lineWidth: 1)
+        )
+    )
+  }
+}
+
+private struct PiecePortraitView: View {
+  let speaker: PersonalitySpeaker
+
+  var body: some View {
+    ZStack {
+      RoundedRectangle(cornerRadius: 18, style: .continuous)
+        .fill(
+          LinearGradient(
+            colors: [
+              speaker.portraitTint.opacity(0.95),
+              Color(red: 0.15, green: 0.17, blue: 0.22),
+            ],
+            startPoint: .topLeading,
+            endPoint: .bottomTrailing
+          )
+        )
+
+      RoundedRectangle(cornerRadius: 18, style: .continuous)
+        .stroke(Color.white.opacity(0.18), lineWidth: 1)
+
+      Text(speaker.portraitGlyph)
+        .font(.system(size: 34, weight: .bold, design: .serif))
+        .foregroundStyle(Color.white.opacity(0.96))
+        .rotationEffect(.degrees(speaker.portraitRotation))
+        .rotation3DEffect(.degrees(-18), axis: (x: 0, y: 1, z: 0))
+        .offset(x: 1, y: -1)
+        .shadow(color: Color.black.opacity(0.28), radius: 8, x: 0, y: 5)
+    }
+    .frame(width: 66, height: 66)
   }
 }
 
@@ -1533,29 +1654,7 @@ private struct NativeARExperienceView: View {
         Spacer()
 
         if let caption = commentary.caption {
-          VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 6) {
-              Image(systemName: "mic.fill")
-              Text(caption.speaker)
-            }
-            .font(.system(size: 12, weight: .bold, design: .rounded))
-            .foregroundStyle(Color(red: 0.95, green: 0.88, blue: 0.74))
-
-            Text(caption.line)
-              .font(.system(size: 17, weight: .bold, design: .rounded))
-              .foregroundStyle(.white)
-              .lineSpacing(2)
-          }
-          .frame(maxWidth: .infinity, alignment: .leading)
-          .padding(16)
-          .background(
-            RoundedRectangle(cornerRadius: 22, style: .continuous)
-              .fill(Color(red: 0.08, green: 0.10, blue: 0.15).opacity(0.88))
-              .overlay(
-                RoundedRectangle(cornerRadius: 22, style: .continuous)
-                  .stroke(Color.white.opacity(0.12), lineWidth: 1)
-              )
-          )
+          PieceSpeechBubble(caption: caption)
           .allowsHitTesting(false)
           .transition(.move(edge: .bottom).combined(with: .opacity))
         }
