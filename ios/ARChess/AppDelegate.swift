@@ -216,7 +216,7 @@ private final class GeminiHintService {
 
   init(
     apiKey: String? = AppRuntimeConfig.current.geminiAPIKey,
-    modelName: String = "gemini-1.5-flash",
+    modelName: String = "gemini-2.0-flash-lite",
     session: URLSession = .shared
   ) {
     self.apiKey = apiKey
