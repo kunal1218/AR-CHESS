@@ -1711,6 +1711,15 @@ private enum CaptureImpactSound: CaseIterable {
   case rookExplosion
 }
 
+private enum PieceMoveSound: CaseIterable {
+  case pawnMarch
+  case rookSlide
+  case knightClop
+  case bishopChime
+  case queenSweep
+  case kingShuffle
+}
+
 private final class CaptureSoundEffectEngine {
   private static let logger = Logger(subsystem: "ARChess", category: "CaptureSFX")
 
@@ -1719,6 +1728,7 @@ private final class CaptureSoundEffectEngine {
   private let mixer = AVAudioMixerNode()
   private let format = AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 1)!
   private lazy var buffers: [CaptureImpactSound: AVAudioPCMBuffer] = Self.buildBuffers(format: format)
+  private lazy var moveBuffers: [PieceMoveSound: AVAudioPCMBuffer] = Self.buildMoveBuffers(format: format)
 
   init() {
     engine.attach(mixer)
@@ -1727,6 +1737,30 @@ private final class CaptureSoundEffectEngine {
   }
 
   func play(_ effect: CaptureImpactSound) {
+    playBuffer(buffers[effect])
+  }
+
+  func playMove(for kind: ChessPieceKind) {
+    let effect: PieceMoveSound
+    switch kind {
+    case .pawn:
+      effect = .pawnMarch
+    case .rook:
+      effect = .rookSlide
+    case .knight:
+      effect = .knightClop
+    case .bishop:
+      effect = .bishopChime
+    case .queen:
+      effect = .queenSweep
+    case .king:
+      effect = .kingShuffle
+    }
+
+    playBuffer(moveBuffers[effect])
+  }
+
+  private func playBuffer(_ buffer: AVAudioPCMBuffer?) {
     queue.async { [weak self] in
       guard let self else {
         return
@@ -1739,7 +1773,7 @@ private final class CaptureSoundEffectEngine {
         return
       }
 
-      guard let buffer = self.buffers[effect] else {
+      guard let buffer else {
         return
       }
 
@@ -1776,6 +1810,12 @@ private final class CaptureSoundEffectEngine {
   private static func buildBuffers(format: AVAudioFormat) -> [CaptureImpactSound: AVAudioPCMBuffer] {
     Dictionary(uniqueKeysWithValues: CaptureImpactSound.allCases.map { effect in
       (effect, makeBuffer(for: effect, format: format))
+    })
+  }
+
+  private static func buildMoveBuffers(format: AVAudioFormat) -> [PieceMoveSound: AVAudioPCMBuffer] {
+    Dictionary(uniqueKeysWithValues: PieceMoveSound.allCases.map { effect in
+      (effect, makeMoveBuffer(for: effect, format: format))
     })
   }
 
@@ -1838,6 +1878,50 @@ private final class CaptureSoundEffectEngine {
       let burst = noise * expEnvelope(normalized, decay: 4.2) * 0.44
       let rumble = Float(sin(2 * Double.pi * 34 * t)) * expEnvelope(normalized, decay: 2.2) * 0.18
       return clampSample(boom + burst + rumble)
+    }
+  }
+
+  private static func makeMoveBuffer(for effect: PieceMoveSound, format: AVAudioFormat) -> AVAudioPCMBuffer {
+    switch effect {
+    case .pawnMarch:
+      return synthesizeBuffer(duration: 0.10, format: format) { t, normalized, noise in
+        let click = noise * expEnvelope(normalized, decay: 22.0) * 0.10
+        let body = Float(sin(2 * Double.pi * 210 * t)) * expEnvelope(normalized, decay: 11.0) * 0.08
+        return clampSample(click + body)
+      }
+    case .rookSlide:
+      return synthesizeBuffer(duration: 0.14, format: format) { t, normalized, noise in
+        let scrape = noise * expEnvelope(normalized, decay: 8.0) * 0.16
+        let low = Float(sin(2 * Double.pi * 86 * t)) * expEnvelope(normalized, decay: 7.5) * 0.12
+        return clampSample(scrape + low)
+      }
+    case .knightClop:
+      return synthesizeBuffer(duration: 0.12, format: format) { t, normalized, noise in
+        let phase = normalized < 0.45 ? 1.0 : 0.52
+        let clop = noise * expEnvelope(normalized, decay: 18.0) * Float(phase) * 0.18
+        let hoof = Float(sin(2 * Double.pi * 150 * t)) * expEnvelope(normalized, decay: 13.0) * 0.10
+        return clampSample(clop + hoof)
+      }
+    case .bishopChime:
+      return synthesizeBuffer(duration: 0.16, format: format) { t, normalized, noise in
+        let toneA = Float(sin(2 * Double.pi * 620 * t)) * expEnvelope(normalized, decay: 6.0) * 0.10
+        let toneB = Float(sin(2 * Double.pi * 930 * t)) * expEnvelope(normalized, decay: 8.0) * 0.06
+        let air = noise * expEnvelope(normalized, decay: 14.0) * 0.02
+        return clampSample(toneA + toneB + air)
+      }
+    case .queenSweep:
+      return synthesizeBuffer(duration: 0.15, format: format) { t, normalized, noise in
+        let sweepFrequency = 540.0 + (360.0 * normalized)
+        let sweep = Float(sin(2 * Double.pi * sweepFrequency * t)) * expEnvelope(normalized, decay: 4.4) * 0.12
+        let shimmer = noise * expEnvelope(normalized, decay: 12.0) * 0.03
+        return clampSample(sweep + shimmer)
+      }
+    case .kingShuffle:
+      return synthesizeBuffer(duration: 0.13, format: format) { t, normalized, noise in
+        let wobble = Float(sin(2 * Double.pi * 118 * t)) * expEnvelope(normalized, decay: 7.2) * 0.10
+        let step = noise * expEnvelope(normalized, decay: 17.0) * 0.08
+        return clampSample(wobble + step)
+      }
     }
   }
 
@@ -5777,6 +5861,8 @@ private struct NativeARView: UIViewRepresentable {
       selectedSquare = nil
       selectedMoves = []
       refreshBoardPresentation()
+
+      captureSoundEffects.playMove(for: context.move.piece.kind)
 
       if context.move.captured != nil || context.move.isEnPassant {
         await animateCapture(for: context.move, beforeState: context.beforeState)
