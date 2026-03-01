@@ -401,7 +401,7 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
   private var isEngineReady = false
   private(set) var lastError: String?
   private(set) var lastStatus = "Stockfish idle."
-  private let analysisTimeoutNanoseconds: UInt64 = 25_000_000_000
+  private let analysisTimeoutNanoseconds: UInt64 = 10_000_000_000
 
   func analyze(fen: String, depth: Int = 10) async throws -> StockfishAnalysis {
     ensureWebView()
@@ -802,6 +802,8 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
             const next = bridgeState.queue.shift();
             bridgeState.current = {
               id: next.id,
+              fen: next.fen,
+              depth: next.depth,
               scoreCp: null,
               mateIn: null,
               pv: [],
@@ -825,7 +827,12 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
           };
 
           window.__archessAnalyze = function(id, fen, depth) {
-            bridgeState.queue.push({ id, fen, depth });
+            bridgeState.queue = [{ id, fen, depth }];
+            if (bridgeState.current) {
+              bridgeStatus('Prioritizing latest board state...');
+              sendEngineCommand('stop');
+              return true;
+            }
             drainAnalysisQueue();
             return true;
           };
@@ -846,13 +853,15 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
 
 @MainActor
 private final class PiecePersonalityDirector: NSObject, ObservableObject, @preconcurrency AVSpeechSynthesizerDelegate {
+  private static let preferredAnalysisDepth = 5
+
   struct Caption {
     let speaker: String
     let line: String
   }
 
   @Published private(set) var caption: Caption?
-  @Published private(set) var analysisStatus = "Stockfish depth 10 warming up..."
+  @Published private(set) var analysisStatus = "Stockfish depth 5 warming up..."
   @Published private(set) var latestAssessment = "Waiting for initial analysis."
   @Published private(set) var suggestedMoveText = "Next best move: waiting on Stockfish..."
 
@@ -873,9 +882,9 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     }
 
     do {
-      let analysis = try await analyzer.analyze(fen: fen, depth: 10)
+      let analysis = try await analyzer.analyze(fen: fen, depth: Self.preferredAnalysisDepth)
       cachedAnalysis = CachedAnalysis(fen: fen, analysis: analysis)
-      analysisStatus = "Stockfish depth 10 ready."
+      analysisStatus = "Stockfish depth \(Self.preferredAnalysisDepth) ready."
       latestAssessment = "Prep eval: \(describe(analysis: analysis, moverColor: state.turn))."
       suggestedMoveText = bestMoveDescription(from: analysis)
     } catch {
@@ -892,7 +901,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     caption = nil
     cachedAnalysis = nil
     analyzer.reset()
-    analysisStatus = "Stockfish depth 10 warming up..."
+    analysisStatus = "Stockfish depth \(Self.preferredAnalysisDepth) warming up..."
     latestAssessment = "Waiting for initial analysis."
     suggestedMoveText = "Next best move: waiting on Stockfish..."
   }
@@ -907,7 +916,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
 
     if let afterAnalysis {
       cachedAnalysis = CachedAnalysis(fen: afterState.fenString, analysis: afterAnalysis)
-      analysisStatus = "Stockfish depth 10 live."
+      analysisStatus = "Stockfish depth \(Self.preferredAnalysisDepth) live."
       suggestedMoveText = bestMoveDescription(from: afterAnalysis)
     } else if analyzer.lastError != nil {
       analysisStatus = "Stockfish unavailable. Last stage: \(analyzer.lastStatus)"
@@ -978,7 +987,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     }
 
     do {
-      let analysis = try await analyzer.analyze(fen: fen, depth: 10)
+      let analysis = try await analyzer.analyze(fen: fen, depth: Self.preferredAnalysisDepth)
       cachedAnalysis = CachedAnalysis(fen: fen, analysis: analysis)
       return analysis
     } catch {
