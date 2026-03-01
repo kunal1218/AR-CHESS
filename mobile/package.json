@@ -7,6 +7,7 @@
     "ios": "expo run:ios",
     "lint": "eslint app src app.config.ts --ext .ts,.tsx",
     "test": "node -e \"console.log('No mobile tests configured yet')\"",
+    "test:stockfish": "node ../scripts/stockfish-harness.mjs",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

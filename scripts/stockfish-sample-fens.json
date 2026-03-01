@@ -1,0 +1,42 @@
+[
+  {
+    "name": "Starting position",
+    "fen": "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+  },
+  {
+    "name": "Ruy Lopez structure",
+    "fen": "r1bqkbnr/1ppp1ppp/p1n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 0 4"
+  },
+  {
+    "name": "Open Sicilian",
+    "fen": "rnbqkb1r/pp2pppp/3p1n2/8/3NP3/8/PPP2PPP/RNBQKB1R w KQkq - 2 5"
+  },
+  {
+    "name": "Balanced middlegame",
+    "fen": "r2q1rk1/ppp2ppp/2npbn2/3Np3/2BPP3/2N5/PPP2PPP/R1BQ1RK1 w - - 2 9"
+  },
+  {
+    "name": "Black to move in check",
+    "fen": "rnbqkbnr/pppp1ppp/8/4Q3/4p3/8/PPPP1PPP/RNB1KBNR b KQkq - 1 2"
+  },
+  {
+    "name": "Queenless king and pawn endgame",
+    "fen": "8/2p5/2P2k2/3K4/8/8/8/8 w - - 0 1"
+  },
+  {
+    "name": "Promotion race",
+    "fen": "8/P7/8/8/8/8/7p/4K2k w - - 0 1"
+  },
+  {
+    "name": "Black to move tactical setup",
+    "fen": "r2q1rk1/pp1b1ppp/2np1n2/2p1p3/2P1P3/2NP1N2/PP1B1PPP/R2Q1RK1 b - - 0 9"
+  },
+  {
+    "name": "Castled middlegame pressure",
+    "fen": "2r2rk1/pp1n1ppp/2pbpn2/q7/3P4/2N1PN2/PPQ1BPPP/2RR2K1 w - - 4 13"
+  },
+  {
+    "name": "Kingside attack",
+    "fen": "r4rk1/1pp1qppp/p1np1n2/4p3/2P1P1b1/2NP1N2/PPQ1BPPP/R1B2RK1 w - - 0 10"
+  }
+]

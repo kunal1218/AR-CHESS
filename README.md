@@ -26,3 +26,31 @@ Monorepo for the AR Chess platform with the existing server and a native iOS app
 - `mobile/` is no longer the active iOS runtime path.
 
 The native iOS UI does not require the server to be running. If you wire networking later, use your Mac's LAN IP instead of `localhost`.
+
+## Stockfish integration
+
+- The active engine integration is native iOS-only and lives in `ios/ARChess/AppDelegate.swift`.
+- Stockfish runs as one long-lived local session per AR game. The controller now enforces a strict UCI lifecycle:
+  - `uci` -> wait for `uciok`
+  - set safe mobile options (`Threads=1`, `Hash=16`, `Ponder=false`)
+  - `isready` -> wait for `readyok`
+  - before each search: `stop` if needed, `isready`, optional `ucinewgame`, `position fen ...`, then `go movetime 80`
+- Searches are time-based by default instead of depth-based for better real-time behavior in AR.
+- Every request carries diagnostics: request id, FEN hash, recent commands sent, recent engine output, and the last controller state.
+
+### Debugging in app
+
+- In the native AR overlay, use `Analyze current position` to manually run a local Stockfish request against the current board without making a move.
+- The overlay shows:
+  - next best move
+  - white eval
+  - black eval
+  - last analysis duration
+- If Stockfish fails, the UI surfaces the last controller stage and error text instead of silently timing out.
+
+### Repro harness
+
+- Run the no-AR harness from the existing JS package root:
+  - `cd mobile && npm run test:stockfish`
+- The harness uses the exact bundled engine artifact from `ios/ARChess/Stockfish/stockfish-nnue-16-single.js`.
+- It runs 10 sample FENs at `movetime` `50/100/200ms`, validates returned `bestmove`, enforces hard timeouts, and dumps actionable diagnostics on failure.

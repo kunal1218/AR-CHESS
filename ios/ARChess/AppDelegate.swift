@@ -1,6 +1,8 @@
 import AVFoundation
 import ARKit
+import CryptoKit
 import Foundation
+import OSLog
 import RealityKit
 import SwiftUI
 import UIKit
@@ -991,6 +993,10 @@ private extension URL {
 }
 
 private struct StockfishAnalysis {
+  let fen: String
+  let sideToMove: ChessColor
+  let requestID: String
+  let durationMs: Int
   let scoreCp: Int?
   let mateIn: Int?
   let pv: [String]
@@ -1004,11 +1010,280 @@ private struct StockfishAnalysis {
 
     return scoreCp ?? 0
   }
+
+  var whitePerspectiveScore: Int {
+    sideToMove == .white ? normalizedScore : -normalizedScore
+  }
+
+  var blackPerspectiveScore: Int {
+    -whitePerspectiveScore
+  }
+
+  func formattedEval(for color: ChessColor) -> String {
+    if let mateIn {
+      let mateForWhite = sideToMove == .white ? mateIn : -mateIn
+      let signedMate = color == .white ? mateForWhite : -mateForWhite
+      return signedMate >= 0 ? "#\(signedMate)" : "-#\(abs(signedMate))"
+    }
+
+    let centipawns = color == .white ? whitePerspectiveScore : blackPerspectiveScore
+    return String(format: "%+.2f", Double(centipawns) / 100.0)
+  }
 }
 
 private struct CachedAnalysis {
   let fen: String
   let analysis: StockfishAnalysis
+}
+
+private struct FixedRingBuffer<Element> {
+  private let capacity: Int
+  private var storage: [Element] = []
+
+  init(capacity: Int) {
+    self.capacity = max(1, capacity)
+  }
+
+  mutating func append(_ element: Element) {
+    storage.append(element)
+    let overflow = storage.count - capacity
+    if overflow > 0 {
+      storage.removeFirst(overflow)
+    }
+  }
+
+  mutating func removeAll() {
+    storage.removeAll(keepingCapacity: true)
+  }
+
+  var elements: [Element] {
+    storage
+  }
+}
+
+private enum StockfishControllerState: String {
+  case initialize = "INIT"
+  case sentUCI = "SENT_UCI"
+  case waitingReady = "WAITING_READY"
+  case ready = "READY"
+  case thinking = "THINKING"
+  case failed = "FAILED"
+  case closed = "CLOSED"
+}
+
+private struct StockfishEngineConfig {
+  var defaultMovetimeMs = 80
+  var hardTimeoutMs = 600
+  var startupTimeoutMs = 2_000
+  var readyTimeoutMs = 1_000
+  var threads = 1
+  var hashMB = 16
+  var strictFENValidation = false
+}
+
+private struct StockfishSearchOptions {
+  var movetimeMs: Int?
+  var debugDepth: Int?
+  var hardTimeoutMs: Int?
+
+  static func realtime(movetimeMs: Int = 80, hardTimeoutMs: Int = 600) -> Self {
+    StockfishSearchOptions(
+      movetimeMs: movetimeMs,
+      debugDepth: nil,
+      hardTimeoutMs: hardTimeoutMs
+    )
+  }
+}
+
+private struct StockfishValidatedFEN {
+  let fen: String
+  let sideToMove: ChessColor
+}
+
+private enum StockfishFENValidationError: LocalizedError {
+  case fieldCount
+  case sideToMove(String)
+  case castlingRights(String)
+  case enPassant(String)
+  case halfmove(String)
+  case fullmove(String)
+  case rankCount(Int)
+  case invalidRankLength(rank: Int, sum: Int)
+  case invalidPieceCharacter(Character)
+  case invalidDigit(Character)
+  case missingKings(white: Int, black: Int)
+  case pawnOnBackRank(rank: Int)
+
+  var errorDescription: String? {
+    switch self {
+    case .fieldCount:
+      return "FEN must contain exactly 6 space-separated fields."
+    case .sideToMove(let value):
+      return "Invalid side-to-move field: \(value)"
+    case .castlingRights(let value):
+      return "Invalid castling rights field: \(value)"
+    case .enPassant(let value):
+      return "Invalid en-passant field: \(value)"
+    case .halfmove(let value):
+      return "Invalid halfmove clock: \(value)"
+    case .fullmove(let value):
+      return "Invalid fullmove number: \(value)"
+    case .rankCount(let count):
+      return "Piece placement must contain 8 ranks. Found \(count)."
+    case .invalidRankLength(let rank, let sum):
+      return "Rank \(rank) does not sum to 8 squares. Found \(sum)."
+    case .invalidPieceCharacter(let character):
+      return "Invalid FEN piece character: \(character)"
+    case .invalidDigit(let character):
+      return "Invalid FEN digit: \(character)"
+    case .missingKings(let white, let black):
+      return "FEN must contain exactly one white king and one black king. Found white=\(white), black=\(black)."
+    case .pawnOnBackRank(let rank):
+      return "Strict FEN validation rejects pawns on rank \(rank)."
+    }
+  }
+}
+
+private enum StockfishFENValidator {
+  static func validate(_ fen: String, strict: Bool = false) throws -> StockfishValidatedFEN {
+    let trimmed = fen.trimmingCharacters(in: .whitespacesAndNewlines)
+    let fields = trimmed.split(separator: " ", omittingEmptySubsequences: false).map(String.init)
+    guard fields.count == 6 else {
+      throw StockfishFENValidationError.fieldCount
+    }
+
+    let placement = fields[0]
+    let sideField = fields[1]
+    let castling = fields[2]
+    let enPassant = fields[3]
+    let halfmove = fields[4]
+    let fullmove = fields[5]
+
+    let sideToMove: ChessColor
+    switch sideField {
+    case "w":
+      sideToMove = .white
+    case "b":
+      sideToMove = .black
+    default:
+      throw StockfishFENValidationError.sideToMove(sideField)
+    }
+
+    let castlingPattern = #"^(?:-|K?Q?k?q?)$"#
+    guard castling.range(of: castlingPattern, options: .regularExpression) != nil else {
+      throw StockfishFENValidationError.castlingRights(castling)
+    }
+
+    let enPassantPattern = #"^(?:-|[a-h][36])$"#
+    guard enPassant.range(of: enPassantPattern, options: .regularExpression) != nil else {
+      throw StockfishFENValidationError.enPassant(enPassant)
+    }
+
+    guard let halfmoveValue = Int(halfmove), halfmoveValue >= 0 else {
+      throw StockfishFENValidationError.halfmove(halfmove)
+    }
+
+    guard let fullmoveValue = Int(fullmove), fullmoveValue >= 1 else {
+      throw StockfishFENValidationError.fullmove(fullmove)
+    }
+
+    let ranks = placement.split(separator: "/", omittingEmptySubsequences: false)
+    guard ranks.count == 8 else {
+      throw StockfishFENValidationError.rankCount(ranks.count)
+    }
+
+    var whiteKings = 0
+    var blackKings = 0
+    let validPieces = Set("prnbqkPRNBQK")
+
+    for (index, rank) in ranks.enumerated() {
+      var squareCount = 0
+      for character in rank {
+        if let digit = character.wholeNumberValue {
+          guard (1...8).contains(digit) else {
+            throw StockfishFENValidationError.invalidDigit(character)
+          }
+          squareCount += digit
+          continue
+        }
+
+        guard validPieces.contains(character) else {
+          throw StockfishFENValidationError.invalidPieceCharacter(character)
+        }
+
+        squareCount += 1
+        if character == "K" {
+          whiteKings += 1
+        } else if character == "k" {
+          blackKings += 1
+        }
+
+        if strict, character.lowercased() == "p", (index == 0 || index == 7) {
+          throw StockfishFENValidationError.pawnOnBackRank(rank: 8 - index)
+        }
+      }
+
+      guard squareCount == 8 else {
+        throw StockfishFENValidationError.invalidRankLength(rank: 8 - index, sum: squareCount)
+      }
+    }
+
+    guard whiteKings == 1, blackKings == 1 else {
+      throw StockfishFENValidationError.missingKings(white: whiteKings, black: blackKings)
+    }
+
+    _ = halfmoveValue
+    _ = fullmoveValue
+    return StockfishValidatedFEN(fen: trimmed, sideToMove: sideToMove)
+  }
+}
+
+private struct StockfishDiagnosticsSnapshot {
+  let requestID: String?
+  let fenHash: String?
+  let state: StockfishControllerState
+  let status: String
+  let error: String?
+  let commands: [String]
+  let lines: [String]
+
+  func render() -> String {
+    var sections: [String] = [
+      "state=\(state.rawValue)",
+      "status=\(status)",
+    ]
+
+    if let requestID {
+      sections.append("request_id=\(requestID)")
+    }
+
+    if let fenHash {
+      sections.append("fen_hash=\(fenHash)")
+    }
+
+    if let error, !error.isEmpty {
+      sections.append("error=\(error)")
+    }
+
+    sections.append("commands_sent:")
+    sections.append(contentsOf: commands.map { "  > \($0)" })
+    sections.append("engine_output:")
+    sections.append(contentsOf: lines.map { "  < \($0)" })
+    return sections.joined(separator: "\n")
+  }
+}
+
+private struct StockfishControllerError: LocalizedError {
+  let message: String
+  let diagnostics: String
+
+  var errorDescription: String? {
+    message
+  }
+
+  var failureReason: String? {
+    diagnostics
+  }
 }
 
 private enum MoveClassification: String {
@@ -1165,90 +1440,215 @@ private enum SpeechPriority: Int {
   case urgent
 }
 
+private final class StockfishAssetSchemeHandler: NSObject, WKURLSchemeHandler {
+  private let indexHTMLProvider: () -> String
+  private let engineData: Data
+  private let wasmData: Data
+
+  init(
+    indexHTMLProvider: @escaping () -> String,
+    engineData: Data,
+    wasmData: Data
+  ) {
+    self.indexHTMLProvider = indexHTMLProvider
+    self.engineData = engineData
+    self.wasmData = wasmData
+    super.init()
+  }
+
+  func webView(_ webView: WKWebView, start urlSchemeTask: WKURLSchemeTask) {
+    guard let url = urlSchemeTask.request.url else {
+      urlSchemeTask.didFailWithError(NSError(domain: NSURLErrorDomain, code: NSURLErrorBadURL))
+      return
+    }
+
+    let path = url.path.isEmpty ? "/index.html" : url.path
+    let responsePayload: (Data, String)?
+
+    switch path {
+    case "/index.html":
+      responsePayload = (Data(indexHTMLProvider().utf8), "text/html")
+    case "/stockfish-nnue-16-single.js":
+      responsePayload = (engineData, "application/javascript")
+    case "/stockfish-nnue-16-single.wasm":
+      responsePayload = (wasmData, "application/wasm")
+    default:
+      responsePayload = nil
+    }
+
+    guard let (data, mimeType) = responsePayload else {
+      urlSchemeTask.didFailWithError(NSError(domain: NSURLErrorDomain, code: NSURLErrorFileDoesNotExist))
+      return
+    }
+
+    let response = URLResponse(
+      url: url,
+      mimeType: mimeType,
+      expectedContentLength: data.count,
+      textEncodingName: mimeType == "text/html" || mimeType == "application/javascript" ? "utf-8" : nil
+    )
+    urlSchemeTask.didReceive(response)
+    urlSchemeTask.didReceive(data)
+    urlSchemeTask.didFinish()
+  }
+
+  func webView(_ webView: WKWebView, stop urlSchemeTask: WKURLSchemeTask) {}
+}
+
+/*
+ The previous bridge mixed startup, readiness, search dispatch, and cancellation in one loose queue.
+ That led to exactly the flakiness we were seeing:
+ - no strict UCI / readyok gating before every search
+ - depth-based searches with non-deterministic latency
+ - no structured diagnostics when bestmove was missing
+ - opaque timeouts with no command/output history
+ This controller keeps a single long-lived engine session and enforces a UCI state machine
+ around every request.
+ */
 @MainActor
 private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
+  private struct PendingSearch {
+    let id: String
+    let fen: String
+    let options: StockfishSearchOptions
+    let sideToMove: ChessColor
+    let fenHash: String
+    let startedAt = Date()
+    let continuation: CheckedContinuation<StockfishAnalysis, Error>
+  }
+
+  private static let scheme = "archess-stockfish"
+  private static let logger = Logger(subsystem: "ARChess", category: "Stockfish")
+
   private let messageHandlerName = "stockfishBridge"
+  private let config: StockfishEngineConfig
   private var webView: WKWebView?
-  private var pendingContinuations: [String: CheckedContinuation<StockfishAnalysis, Error>] = [:]
-  private var timeoutTasks: [String: Task<Void, Never>] = [:]
-  private var readyContinuations: [CheckedContinuation<Void, Error>] = []
-  private var readyTimeoutTask: Task<Void, Never>?
-  private var isEngineReady = false
+  private var schemeHandler: StockfishAssetSchemeHandler?
+  private var engineState: StockfishControllerState = .initialize
+  private var readyWaiters: [UUID: CheckedContinuation<Void, Error>] = [:]
+  private var currentSearch: PendingSearch?
+  private var timeoutTask: Task<Void, Never>?
+  private var commandBuffer = FixedRingBuffer<String>(capacity: 50)
+  private var lineBuffer = FixedRingBuffer<String>(capacity: 300)
+  private var requestCounter = 0
   private(set) var lastError: String?
   private(set) var lastStatus = "Stockfish idle."
-  private let analysisTimeoutNanoseconds: UInt64 = 10_000_000_000
 
-  func analyze(fen: String, depth: Int = 10) async throws -> StockfishAnalysis {
-    ensureWebView()
+  init(config: StockfishEngineConfig = StockfishEngineConfig()) {
+    self.config = config
+    super.init()
+  }
 
-    guard webView != nil else {
-      throw NSError(
-        domain: "ARChess.Stockfish",
-        code: -2,
-        userInfo: [NSLocalizedDescriptionKey: lastError ?? "Bundled Stockfish assets are unavailable."]
+  func analyze(
+    fen: String,
+    options: StockfishSearchOptions = .realtime()
+  ) async throws -> StockfishAnalysis {
+    let validatedFEN: StockfishValidatedFEN
+    do {
+      validatedFEN = try StockfishFENValidator.validate(fen, strict: config.strictFENValidation)
+    } catch {
+      lastError = error.localizedDescription
+      lastStatus = "Rejected invalid FEN before engine call."
+      throw makeError(
+        "Invalid FEN: \(error.localizedDescription)",
+        requestID: nil,
+        fen: fen
       )
     }
 
-    try await waitUntilReady()
+    try await ensureEngineReady()
+    if currentSearch != nil {
+      try await cancelActiveSearchIfNeeded(reason: "superseded by a newer board state")
+    }
 
-    let requestID = UUID().uuidString
-    let requestScript = """
-    window.__archessAnalyze(\(javaScriptStringLiteral(requestID)), \(javaScriptStringLiteral(fen)), \(depth));
-    """
+    let requestID = nextRequestID()
+    let payload = StockfishSearchOptions(
+      movetimeMs: options.movetimeMs ?? config.defaultMovetimeMs,
+      debugDepth: options.debugDepth,
+      hardTimeoutMs: options.hardTimeoutMs ?? max(config.hardTimeoutMs, (options.movetimeMs ?? config.defaultMovetimeMs) * 4)
+    )
+    let fenHash = Self.hashFEN(validatedFEN.fen)
+    lastStatus = payload.debugDepth != nil
+      ? "Preparing depth search for request \(requestID)..."
+      : "Preparing movetime \(payload.movetimeMs ?? config.defaultMovetimeMs)ms search for request \(requestID)..."
 
     return try await withCheckedThrowingContinuation { continuation in
-      pendingContinuations[requestID] = continuation
-      timeoutTasks[requestID] = Task { [weak self] in
-        try? await Task.sleep(nanoseconds: self?.analysisTimeoutNanoseconds ?? 25_000_000_000)
-        await MainActor.run {
-          guard let self,
-                let continuation = self.pendingContinuations.removeValue(forKey: requestID) else {
-            return
-          }
+      let pendingSearch = PendingSearch(
+        id: requestID,
+        fen: validatedFEN.fen,
+        options: payload,
+        sideToMove: validatedFEN.sideToMove,
+        fenHash: fenHash,
+        continuation: continuation
+      )
+      currentSearch = pendingSearch
+      scheduleTimeout(for: pendingSearch)
 
-          self.timeoutTasks[requestID]?.cancel()
-          self.timeoutTasks[requestID] = nil
-          self.lastError = "Stockfish request timed out."
-          self.lastStatus = "Stockfish search timed out at depth \(depth)."
-          self.cancelCurrentAnalysis()
-          continuation.resume(
-            throwing: NSError(
-              domain: "ARChess.Stockfish",
-              code: -1,
-              userInfo: [NSLocalizedDescriptionKey: "Stockfish request timed out."]
-            )
+      let command: [String: Any] = [
+        "id": requestID,
+        "fen": validatedFEN.fen,
+        "movetimeMs": payload.movetimeMs ?? config.defaultMovetimeMs,
+        "debugDepth": payload.debugDepth as Any,
+      ]
+
+      Self.logger.info("Stockfish request \(requestID, privacy: .public) queued state=\(self.engineState.rawValue, privacy: .public) fen_hash=\(fenHash, privacy: .public)")
+
+      evaluate(script: "window.__archessAnalyze(\(jsonLiteral(command)));") { [weak self] result in
+        guard let self else {
+          return
+        }
+
+        switch result {
+        case .success:
+          return
+        case .failure(let error):
+          self.failCurrentSearch(
+            message: "Could not dispatch Stockfish request: \(error.localizedDescription)",
+            requestID: requestID,
+            fen: validatedFEN.fen
           )
         }
-      }
-
-      webView?.evaluateJavaScript(requestScript) { [weak self] _, error in
-        guard let self, let error else {
-          return
-        }
-
-        guard let continuation = self.pendingContinuations.removeValue(forKey: requestID) else {
-          return
-        }
-
-        self.timeoutTasks[requestID]?.cancel()
-        self.timeoutTasks[requestID] = nil
-        self.lastError = error.localizedDescription
-        continuation.resume(throwing: error)
       }
     }
   }
 
+  func newGame() async {
+    do {
+      try await ensureEngineReady()
+    } catch {
+      lastError = error.localizedDescription
+      return
+    }
+
+    evaluate(script: "window.__archessNewGame && window.__archessNewGame();") { _ in }
+  }
+
   func reset() {
+    timeoutTask?.cancel()
+    timeoutTask = nil
+    currentSearch = nil
+    readyWaiters.values.forEach {
+      $0.resume(throwing: makeError("Engine session reset.", requestID: nil, fen: nil))
+    }
+    readyWaiters.removeAll()
+    commandBuffer.removeAll()
+    lineBuffer.removeAll()
     lastError = nil
     lastStatus = "Stockfish idle."
-    readyTimeoutTask?.cancel()
-    readyTimeoutTask = nil
-    readyContinuations.removeAll()
-    pendingContinuations.removeAll()
-    timeoutTasks.values.forEach { $0.cancel() }
-    timeoutTasks.removeAll()
-    isEngineReady = false
+    engineState = .initialize
+
+    if let webView {
+      webView.configuration.userContentController.removeScriptMessageHandler(forName: messageHandlerName)
+      webView.navigationDelegate = nil
+      webView.stopLoading()
+    }
+
     webView = nil
+    schemeHandler = nil
+  }
+
+  func dumpDiagnostics() -> String {
+    diagnosticsSnapshot(requestID: currentSearch?.id, fen: currentSearch?.fen).render()
   }
 
   func userContentController(
@@ -1266,95 +1666,59 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
       if let message = payload["message"] as? String {
         lastStatus = message
       }
+    case "state":
+      if let rawState = payload["state"] as? String,
+         let state = StockfishControllerState(rawValue: rawState) {
+        engineState = state
+      }
+      if let reason = payload["reason"] as? String, !reason.isEmpty {
+        lastStatus = reason
+      }
+    case "command":
+      if let command = payload["command"] as? String {
+        commandBuffer.append(command)
+      }
+    case "line":
+      if let line = payload["line"] as? String {
+        lineBuffer.append(line)
+      }
     case "ready":
-      isEngineReady = true
+      engineState = .ready
       lastError = nil
-      lastStatus = "Stockfish ready."
-      readyTimeoutTask?.cancel()
-      readyTimeoutTask = nil
-      let continuations = readyContinuations
-      readyContinuations.removeAll()
-      continuations.forEach { $0.resume() }
+      if let reason = payload["reason"] as? String, !reason.isEmpty {
+        lastStatus = reason
+      } else {
+        lastStatus = "Stockfish ready."
+      }
+      let waiters = readyWaiters.values
+      readyWaiters.removeAll()
+      waiters.forEach { $0.resume() }
     case "error":
       let message = payload["message"] as? String ?? "Unknown Stockfish bridge error."
       lastError = message
       lastStatus = "Stockfish error: \(message)"
-      if !isEngineReady, !readyContinuations.isEmpty {
-        readyTimeoutTask?.cancel()
-        readyTimeoutTask = nil
-        let continuations = readyContinuations
-        readyContinuations.removeAll()
-        continuations.forEach {
-          $0.resume(
-            throwing: NSError(
-              domain: "ARChess.Stockfish",
-              code: -3,
-              userInfo: [NSLocalizedDescriptionKey: message]
-            )
-          )
-        }
+      engineState = .failed
+      let diagnostics = diagnosticsSnapshot(requestID: currentSearch?.id, fen: currentSearch?.fen).render()
+      let waiters = readyWaiters.values
+      readyWaiters.removeAll()
+      waiters.forEach { $0.resume(throwing: StockfishControllerError(message: message, diagnostics: diagnostics)) }
+      if currentSearch != nil {
+        failCurrentSearch(message: message, requestID: currentSearch?.id, fen: currentSearch?.fen)
       }
     case "result":
-      guard let requestID = payload["id"] as? String,
-            let continuation = pendingContinuations.removeValue(forKey: requestID) else {
+      guard let requestID = payload["id"] as? String else {
         return
       }
-
-      timeoutTasks[requestID]?.cancel()
-      timeoutTasks[requestID] = nil
-
-      continuation.resume(
-        returning: StockfishAnalysis(
-          scoreCp: payload["scoreCp"] as? Int,
-          mateIn: payload["mateIn"] as? Int,
-          pv: payload["pv"] as? [String] ?? [],
-          bestMove: payload["bestMove"] as? String
-        )
-      )
+      handleResult(payload, requestID: requestID)
     default:
       return
     }
   }
 
-  private func ensureWebView() {
-    guard webView == nil else {
-      return
-    }
-
-    guard let payload = Self.stockfishBridgePayload() else {
-      lastError = "Bundled Stockfish assets are missing or unreadable."
-      return
-    }
-
-    let userContentController = WKUserContentController()
-    userContentController.add(self, name: messageHandlerName)
-
-    let configuration = WKWebViewConfiguration()
-    configuration.userContentController = userContentController
-    configuration.defaultWebpagePreferences.allowsContentJavaScript = true
-
-    let webView = WKWebView(frame: .zero, configuration: configuration)
-    webView.isHidden = true
-    webView.navigationDelegate = self
-    lastStatus = "Stockfish booting..."
-    webView.loadHTMLString(
-      Self.stockfishBridgeHTML(
-        messageHandlerName: messageHandlerName,
-        engineSource: payload.engineSource,
-        wasmBase64: payload.wasmBase64
-      ),
-      baseURL: nil
-    )
-    self.webView = webView
-  }
-
-  private func cancelCurrentAnalysis() {
-    webView?.evaluateJavaScript("window.__archessCancelCurrentAnalysis && window.__archessCancelCurrentAnalysis();")
-  }
-
   func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
     lastError = error.localizedDescription
     lastStatus = "Stockfish webview navigation failed."
+    engineState = .failed
   }
 
   func webView(
@@ -1364,83 +1728,269 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
   ) {
     lastError = error.localizedDescription
     lastStatus = "Stockfish webview provisional navigation failed."
+    engineState = .failed
   }
 
-  private func waitUntilReady() async throws {
-    if isEngineReady {
+  private func ensureEngineReady() async throws {
+    ensureWebView()
+    guard webView != nil else {
+      throw makeError(lastError ?? "Bundled Stockfish assets are unavailable.", requestID: nil, fen: nil)
+    }
+
+    try await waitUntilReady(timeoutMs: config.startupTimeoutMs)
+  }
+
+  private func ensureWebView() {
+    guard webView == nil else {
       return
     }
 
-    try await withCheckedThrowingContinuation { continuation in
-      readyContinuations.append(continuation)
-      if readyTimeoutTask == nil {
-        readyTimeoutTask = Task { [weak self] in
-          try? await Task.sleep(nanoseconds: 8_000_000_000)
-          await MainActor.run {
-            guard let self, !self.isEngineReady, !self.readyContinuations.isEmpty else {
-              return
-            }
+    guard let engineURL = Bundle.main.url(forResource: "stockfish-nnue-16-single", withExtension: "js"),
+          let wasmURL = Bundle.main.url(forResource: "stockfish-nnue-16-single", withExtension: "wasm"),
+          let engineData = try? Data(contentsOf: engineURL),
+          let wasmData = try? Data(contentsOf: wasmURL) else {
+      lastError = "Bundled Stockfish assets are missing or unreadable."
+      engineState = .failed
+      return
+    }
 
-            let errorMessage = self.lastError ?? self.lastStatus
-            let continuations = self.readyContinuations
-            self.readyContinuations.removeAll()
-            self.readyTimeoutTask = nil
-            self.lastError = errorMessage
-            continuations.forEach {
-              $0.resume(
-                throwing: NSError(
-                  domain: "ARChess.Stockfish",
-                  code: -4,
-                  userInfo: [NSLocalizedDescriptionKey: errorMessage]
-                )
-              )
-            }
+    let userContentController = WKUserContentController()
+    userContentController.add(self, name: messageHandlerName)
+
+    let configuration = WKWebViewConfiguration()
+    configuration.userContentController = userContentController
+    configuration.defaultWebpagePreferences.allowsContentJavaScript = true
+    configuration.preferences.javaScriptCanOpenWindowsAutomatically = false
+
+    let schemeHandler = StockfishAssetSchemeHandler(
+      indexHTMLProvider: { [weak self] in
+        self?.stockfishBridgeHTML() ?? ""
+      },
+      engineData: engineData,
+      wasmData: wasmData
+    )
+    configuration.setURLSchemeHandler(schemeHandler, forURLScheme: Self.scheme)
+
+    let webView = WKWebView(frame: .zero, configuration: configuration)
+    webView.isHidden = true
+    webView.navigationDelegate = self
+
+    self.webView = webView
+    self.schemeHandler = schemeHandler
+    lastError = nil
+    lastStatus = "Stockfish booting..."
+    engineState = .initialize
+
+    guard let indexURL = URL(string: "\(Self.scheme)://bundle/index.html") else {
+      lastError = "Could not form Stockfish bridge URL."
+      engineState = .failed
+      return
+    }
+
+    webView.load(URLRequest(url: indexURL))
+  }
+
+  private func waitUntilReady(timeoutMs: Int) async throws {
+    if engineState == .ready {
+      return
+    }
+
+    let waiterID = UUID()
+    try await withCheckedThrowingContinuation { continuation in
+      readyWaiters[waiterID] = continuation
+
+      Task { [weak self] in
+        try? await Task.sleep(nanoseconds: UInt64(timeoutMs) * 1_000_000)
+        await MainActor.run {
+          guard let self,
+                let continuation = self.readyWaiters.removeValue(forKey: waiterID),
+                self.engineState != .ready else {
+            return
           }
+
+          let message = "Timed out waiting for readyok."
+          self.lastError = message
+          self.lastStatus = "Stockfish did not reach READY in \(timeoutMs)ms."
+          continuation.resume(
+            throwing: self.makeError(message, requestID: self.currentSearch?.id, fen: self.currentSearch?.fen)
+          )
         }
       }
     }
   }
 
-  private static func stockfishBridgePayload() -> (engineSource: String, wasmBase64: String)? {
-    guard let bundledJSURL = Bundle.main.url(forResource: "stockfish-nnue-16-single", withExtension: "js"),
-          let bundledWASMURL = Bundle.main.url(forResource: "stockfish-nnue-16-single", withExtension: "wasm"),
-          let engineSource = try? String(contentsOf: bundledJSURL, encoding: .utf8),
-          let wasmData = try? Data(contentsOf: bundledWASMURL) else {
-      return nil
+  private func cancelActiveSearchIfNeeded(reason: String) async throws {
+    guard let pending = currentSearch else {
+      return
     }
 
-    let sanitizedEngineSource = engineSource.replacingOccurrences(of: "</script", with: "<\\/script")
-    return (engineSource: sanitizedEngineSource, wasmBase64: wasmData.base64EncodedString())
+    timeoutTask?.cancel()
+    timeoutTask = nil
+    currentSearch = nil
+    pending.continuation.resume(
+      throwing: makeError("Stockfish request \(pending.id) cancelled: \(reason).", requestID: pending.id, fen: pending.fen)
+    )
+
+    lastStatus = "Cancelling request \(pending.id)..."
+    evaluate(script: "window.__archessCancelCurrentAnalysis && window.__archessCancelCurrentAnalysis(\(jsonLiteral(reason)));") { _ in }
+    try await waitUntilReady(timeoutMs: config.readyTimeoutMs)
   }
 
-  private func javaScriptStringLiteral(_ value: String) -> String {
-    let data = try? JSONSerialization.data(withJSONObject: [value])
-    let json = String(data: data ?? Data("[]".utf8), encoding: .utf8) ?? "[\"\"]"
-    return String(json.dropFirst().dropLast())
+  private func scheduleTimeout(for pending: PendingSearch) {
+    timeoutTask?.cancel()
+    let timeoutMs = pending.options.hardTimeoutMs ?? config.hardTimeoutMs
+    timeoutTask = Task { [weak self] in
+      try? await Task.sleep(nanoseconds: UInt64(timeoutMs) * 1_000_000)
+      await MainActor.run {
+        guard let self,
+              let active = self.currentSearch,
+              active.id == pending.id else {
+          return
+        }
+
+        self.lastError = "Stockfish request timed out."
+        self.lastStatus = "Stockfish request \(pending.id) timed out after \(timeoutMs)ms."
+        self.evaluate(
+          script: "window.__archessCancelCurrentAnalysis && window.__archessCancelCurrentAnalysis('timeout');"
+        ) { _ in }
+        self.failCurrentSearch(
+          message: "Stockfish timed out after \(timeoutMs)ms.",
+          requestID: pending.id,
+          fen: pending.fen
+        )
+      }
+    }
   }
 
-  private static func stockfishBridgeHTML(
-    messageHandlerName: String,
-    engineSource: String,
-    wasmBase64: String
-  ) -> String {
-    """
+  private func handleResult(_ payload: [String: Any], requestID: String) {
+    guard let pending = currentSearch else {
+      return
+    }
+
+    guard pending.id == requestID else {
+      Self.logger.debug("Ignoring late Stockfish result for stale request \(requestID, privacy: .public)")
+      return
+    }
+
+    timeoutTask?.cancel()
+    timeoutTask = nil
+    currentSearch = nil
+    engineState = .ready
+
+    let bestMove = payload["bestMove"] as? String
+    guard let bestMove, !bestMove.isEmpty, bestMove != "(none)" else {
+      pending.continuation.resume(
+        throwing: makeError("Stockfish returned no bestmove.", requestID: requestID, fen: pending.fen)
+      )
+      return
+    }
+
+    let durationMs = payload["durationMs"] as? Int
+      ?? max(0, Int(Date().timeIntervalSince(pending.startedAt) * 1_000))
+    let analysis = StockfishAnalysis(
+      fen: pending.fen,
+      sideToMove: pending.sideToMove,
+      requestID: requestID,
+      durationMs: durationMs,
+      scoreCp: payload["scoreCp"] as? Int,
+      mateIn: payload["mateIn"] as? Int,
+      pv: payload["pv"] as? [String] ?? [],
+      bestMove: bestMove
+    )
+
+    lastError = nil
+    lastStatus = payload["status"] as? String ?? "Stockfish returned bestmove in \(durationMs)ms."
+    Self.logger.info("Stockfish request \(requestID, privacy: .public) completed outcome=bestmove duration_ms=\(durationMs, privacy: .public) fen_hash=\(pending.fenHash, privacy: .public)")
+    pending.continuation.resume(returning: analysis)
+  }
+
+  private func failCurrentSearch(message: String, requestID: String?, fen: String?) {
+    timeoutTask?.cancel()
+    timeoutTask = nil
+    guard let pending = currentSearch else {
+      lastError = message
+      return
+    }
+
+    currentSearch = nil
+    lastError = message
+    Self.logger.error("Stockfish request \(pending.id, privacy: .public) failed message=\(message, privacy: .public) fen_hash=\(pending.fenHash, privacy: .public)")
+    pending.continuation.resume(
+      throwing: makeError(message, requestID: requestID ?? pending.id, fen: fen ?? pending.fen)
+    )
+  }
+
+  private func diagnosticsSnapshot(requestID: String?, fen: String?) -> StockfishDiagnosticsSnapshot {
+    StockfishDiagnosticsSnapshot(
+      requestID: requestID,
+      fenHash: fen.map(Self.hashFEN),
+      state: engineState,
+      status: lastStatus,
+      error: lastError,
+      commands: Array(commandBuffer.elements.suffix(50)),
+      lines: Array(lineBuffer.elements.suffix(100))
+    )
+  }
+
+  private func makeError(_ message: String, requestID: String?, fen: String?) -> StockfishControllerError {
+    StockfishControllerError(
+      message: message,
+      diagnostics: diagnosticsSnapshot(requestID: requestID, fen: fen).render()
+    )
+  }
+
+  private func nextRequestID() -> String {
+    requestCounter += 1
+    return "stockfish-\(requestCounter)"
+  }
+
+  private func evaluate(
+    script: String,
+    completion: @escaping (Result<Void, Error>) -> Void
+  ) {
+    webView?.evaluateJavaScript(script) { _, error in
+      if let error {
+        completion(.failure(error))
+      } else {
+        completion(.success(()))
+      }
+    }
+  }
+
+  private func jsonLiteral(_ payload: Any) -> String {
+    let data = try? JSONSerialization.data(withJSONObject: payload, options: [.fragmentsAllowed])
+    return String(data: data ?? Data("{}".utf8), encoding: .utf8) ?? "{}"
+  }
+
+  private func stockfishBridgeHTML() -> String {
+    let wasmURL = "\(Self.scheme)://bundle/stockfish-nnue-16-single.wasm"
+    return """
     <!doctype html>
     <html>
       <head>
         <meta charset="utf-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-        <script id="stockfish-engine">
-        \(engineSource)
-        </script>
+        <script id="stockfish-engine" src="\(Self.scheme)://bundle/stockfish-nnue-16-single.js"></script>
         <script>
+          const wasmURL = \(jsonLiteral(wasmURL));
           const bridgeState = {
+            state: 'INIT',
+            waitingReadyReason: null,
             ready: false,
             engine: null,
-            queue: [],
-            current: null,
+            currentRequest: null,
+            queuedRequest: null,
+            needsNewGame: true,
+            lastCommands: [],
+            lastLines: [],
           };
-          const wasmBase64 = \(jsonStringLiteral(wasmBase64));
+
+          function pushRing(buffer, value, capacity) {
+            buffer.push(value);
+            if (buffer.length > capacity) {
+              buffer.splice(0, buffer.length - capacity);
+            }
+          }
 
           function bridgePost(payload) {
             if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.\(messageHandlerName)) {
@@ -1452,30 +2002,35 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
             bridgePost({ type: 'status', message });
           }
 
-          function decodeBase64ToUint8Array(base64) {
-            const binary = atob(base64);
-            const length = binary.length;
-            const bytes = new Uint8Array(length);
-            for (let index = 0; index < length; index += 1) {
-              bytes[index] = binary.charCodeAt(index);
-            }
-            return bytes;
+          function bridgeStateChange(state, reason) {
+            bridgeState.state = state;
+            bridgePost({ type: 'state', state, reason: reason || null, timestamp: Date.now() });
+          }
+
+          function logCommand(command) {
+            pushRing(bridgeState.lastCommands, command, 50);
+            bridgePost({ type: 'command', command, timestamp: Date.now() });
+          }
+
+          function logLine(line) {
+            pushRing(bridgeState.lastLines, line, 300);
+            bridgePost({ type: 'line', line, timestamp: Date.now() });
           }
 
           function sendEngineCommand(command) {
-            const engine = bridgeState.engine;
-            if (!engine) {
+            if (!bridgeState.engine) {
               bridgePost({ type: 'error', message: 'Stockfish engine missing while sending command.' });
               return false;
             }
 
-            if (typeof engine.onCustomMessage === 'function') {
-              engine.onCustomMessage(command);
+            logCommand(command);
+            if (typeof bridgeState.engine.onCustomMessage === 'function') {
+              bridgeState.engine.onCustomMessage(command);
               return true;
             }
 
-            if (typeof engine.postMessage === 'function') {
-              engine.postMessage(command);
+            if (typeof bridgeState.engine.postMessage === 'function') {
+              bridgeState.engine.postMessage(command);
               return true;
             }
 
@@ -1485,18 +2040,25 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
 
           async function bootStockfish() {
             try {
-              bridgeStatus('Preparing Stockfish engine...');
+              bridgeStatus('Loading bundled Stockfish script...');
               const factory = document.getElementById('stockfish-engine')._exports;
               if (!factory) {
                 bridgePost({ type: 'error', message: 'Stockfish engine factory missing.' });
                 return;
               }
 
-              bridgeStatus('Decoding bundled WASM...');
-              const wasmBinary = decodeBase64ToUint8Array(wasmBase64);
-              bridgeStatus('Instantiating engine...');
+              bridgeStatus('Fetching local WASM...');
+              const wasmResponse = await fetch(wasmURL);
+              if (!wasmResponse.ok) {
+                bridgePost({ type: 'error', message: 'Could not load bundled WASM.' });
+                return;
+              }
+
+              const wasmBinary = new Uint8Array(await wasmResponse.arrayBuffer());
+              bridgeStatus('Instantiating Stockfish locally...');
               const engine = await factory({ wasmBinary });
               bridgeState.engine = engine;
+
               if (typeof engine.addMessageListener === 'function') {
                 engine.addMessageListener(handleEngineLine);
               } else if (typeof engine.onmessage !== 'undefined') {
@@ -1506,111 +2068,219 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
                 return;
               }
 
-              bridgeStatus('Waiting for uciok...');
+              bridgeStateChange('SENT_UCI', 'Waiting for uciok...');
               sendEngineCommand('uci');
             } catch (error) {
               bridgePost({ type: 'error', message: String(error) });
             }
           }
 
-          function handleEngineLine(line) {
-            line = String(line);
+          function requestReady(reason) {
+            bridgeState.waitingReadyReason = reason;
+            bridgeStateChange('WAITING_READY', 'Waiting for readyok (' + reason + ')...');
+            sendEngineCommand('isready');
+          }
+
+          function beginQueuedSearch() {
+            if (!bridgeState.queuedRequest) {
+              bridgeStateChange('READY', 'Stockfish ready.');
+              bridgePost({ type: 'ready', reason: 'Stockfish ready.' });
+              return;
+            }
+
+            if (bridgeState.needsNewGame) {
+              bridgeState.needsNewGame = false;
+              sendEngineCommand('ucinewgame');
+              requestReady('after-ucinewgame');
+              return;
+            }
+
+            requestReady('before-search');
+          }
+
+          function startSearch(request) {
+            bridgeState.currentRequest = {
+              id: request.id,
+              fen: request.fen,
+              movetimeMs: request.movetimeMs,
+              debugDepth: request.debugDepth || null,
+              startedAtMs: Date.now(),
+              scoreCp: null,
+              mateIn: null,
+              pv: [],
+            };
+            bridgeState.queuedRequest = null;
+            const searchLabel = request.debugDepth ? ('Analyzing depth ' + request.debugDepth + '...') : ('Analyzing movetime ' + request.movetimeMs + 'ms...');
+            bridgeStateChange('THINKING', searchLabel);
+            sendEngineCommand('position fen ' + request.fen);
+            if (request.debugDepth) {
+              sendEngineCommand('go depth ' + request.debugDepth);
+            } else {
+              sendEngineCommand('go movetime ' + request.movetimeMs);
+            }
+          }
+
+          function cancelCurrentAnalysis(reason) {
+            bridgeState.queuedRequest = null;
+            if (!bridgeState.currentRequest) {
+              bridgeStateChange('READY', 'Search cancelled before dispatch.');
+              bridgePost({ type: 'ready', reason: 'Search cancelled before dispatch.' });
+              return true;
+            }
+
+            bridgeState.currentRequest.cancelled = true;
+            bridgeStatus('Stopping current search (' + (reason || 'cancelled') + ')...');
+            sendEngineCommand('stop');
+            requestReady('after-stop');
+            return true;
+          }
+
+          function parseInfoLine(line) {
+            const current = bridgeState.currentRequest;
+            if (!current) {
+              return;
+            }
+
+            const cpMatch = line.match(/score cp (-?\\d+)/);
+            if (cpMatch) {
+              current.scoreCp = parseInt(cpMatch[1], 10);
+              current.mateIn = null;
+            }
+
+            const mateMatch = line.match(/score mate (-?\\d+)/);
+            if (mateMatch) {
+              current.mateIn = parseInt(mateMatch[1], 10);
+              current.scoreCp = null;
+            }
+
+            const pvMatch = line.match(/\\spv\\s(.+)/);
+            if (pvMatch) {
+              current.pv = pvMatch[1].trim().split(/\\s+/).filter(Boolean);
+            }
+          }
+
+          function handleEngineLine(message) {
+            const line = String(message && message.data !== undefined ? message.data : message);
+            logLine(line);
 
             if (line === 'uciok') {
-              bridgeStatus('uciok received. Waiting for readyok...');
+              bridgeStateChange('WAITING_READY', 'uciok received. Configuring engine...');
               sendEngineCommand('setoption name UCI_AnalyseMode value true');
-              sendEngineCommand('setoption name Hash value 16');
-              sendEngineCommand('isready');
+              sendEngineCommand('setoption name Threads value \(config.threads)');
+              sendEngineCommand('setoption name Hash value \(config.hashMB)');
+              sendEngineCommand('setoption name Ponder value false');
+              requestReady('startup');
               return;
             }
 
             if (line === 'readyok') {
               bridgeState.ready = true;
-              bridgeStatus('readyok received.');
-              bridgePost({ type: 'ready' });
-              drainAnalysisQueue();
+              const waitingReason = bridgeState.waitingReadyReason;
+              bridgeState.waitingReadyReason = null;
+
+              if (waitingReason === 'startup') {
+                bridgeStateChange('READY', 'Stockfish ready.');
+                bridgePost({ type: 'ready', reason: 'Stockfish ready.' });
+                return;
+              }
+
+              if (waitingReason === 'after-stop') {
+                bridgeState.currentRequest = null;
+                beginQueuedSearch();
+                return;
+              }
+
+              if (waitingReason === 'after-ucinewgame' || waitingReason === 'before-search') {
+                if (!bridgeState.queuedRequest) {
+                  bridgeStateChange('READY', 'Stockfish ready.');
+                  bridgePost({ type: 'ready', reason: 'Stockfish ready.' });
+                  return;
+                }
+
+                startSearch(bridgeState.queuedRequest);
+                return;
+              }
+
+              bridgeStateChange('READY', 'Stockfish ready.');
+              bridgePost({ type: 'ready', reason: 'Stockfish ready.' });
               return;
             }
 
-            if (!bridgeState.current) {
+            if (line.startsWith('info ')) {
+              parseInfoLine(line);
               return;
-            }
-
-            const state = bridgeState.current;
-            const cpMatch = line.match(/score cp (-?\\d+)/);
-            if (cpMatch) {
-              state.scoreCp = parseInt(cpMatch[1], 10);
-              state.mateIn = null;
-            }
-
-            const mateMatch = line.match(/score mate (-?\\d+)/);
-            if (mateMatch) {
-              state.mateIn = parseInt(mateMatch[1], 10);
-              state.scoreCp = null;
-            }
-
-            const pvMatch = line.match(/\\spv\\s(.+)/);
-            if (pvMatch) {
-              state.pv = pvMatch[1].trim().split(/\\s+/).filter(Boolean);
             }
 
             if (line.startsWith('bestmove ')) {
+              const finished = bridgeState.currentRequest;
               const parts = line.trim().split(/\\s+/);
+              bridgeState.currentRequest = null;
+
+              if (!finished) {
+                beginQueuedSearch();
+                return;
+              }
+
+              if (finished.cancelled) {
+                beginQueuedSearch();
+                return;
+              }
+
               bridgePost({
                 type: 'result',
-                id: state.id,
-                scoreCp: state.scoreCp,
-                mateIn: state.mateIn,
-                pv: state.pv || [],
+                id: finished.id,
+                scoreCp: finished.scoreCp,
+                mateIn: finished.mateIn,
+                pv: finished.pv || [],
                 bestMove: parts[1] || null,
+                durationMs: Date.now() - finished.startedAtMs,
+                status: parts[1] ? 'bestmove ' + parts[1] : 'bestmove unavailable',
               });
-              bridgeState.current = null;
-              drainAnalysisQueue();
+              beginQueuedSearch();
             }
           }
 
-          function drainAnalysisQueue() {
-            if (!bridgeState.ready || bridgeState.current || !bridgeState.engine || bridgeState.queue.length === 0) {
-              return;
-            }
-
-            const next = bridgeState.queue.shift();
-            bridgeState.current = {
-              id: next.id,
-              fen: next.fen,
-              depth: next.depth,
-              scoreCp: null,
-              mateIn: null,
-              pv: [],
-            };
-
-            bridgeStatus('Analyzing depth ' + next.depth + '...');
-            sendEngineCommand('stop');
-            sendEngineCommand('position fen ' + next.fen);
-            sendEngineCommand('go depth ' + next.depth);
-          }
-
-          window.__archessCancelCurrentAnalysis = function() {
-            if (bridgeState.engine) {
+          window.__archessAnalyze = function(payload) {
+            const request = typeof payload === 'string' ? JSON.parse(payload) : payload;
+            bridgeState.queuedRequest = request;
+            if (bridgeState.state === 'THINKING' && bridgeState.currentRequest) {
+              bridgeStatus('Stopping previous search for newer board state...');
+              bridgeState.currentRequest.cancelled = true;
               sendEngineCommand('stop');
-            }
-
-            bridgeState.current = null;
-            bridgeState.queue = [];
-            bridgeStatus('Current Stockfish search cancelled.');
-            return true;
-          };
-
-          window.__archessAnalyze = function(id, fen, depth) {
-            bridgeState.queue = [{ id, fen, depth }];
-            if (bridgeState.current) {
-              bridgeStatus('Prioritizing latest board state...');
-              sendEngineCommand('stop');
+              requestReady('after-stop');
               return true;
             }
-            drainAnalysisQueue();
+
+            if (bridgeState.state === 'READY') {
+              beginQueuedSearch();
+              return true;
+            }
+
+            bridgeStatus('Queued analysis request ' + request.id + '.');
             return true;
           };
+
+          window.__archessCancelCurrentAnalysis = function(reason) {
+            return cancelCurrentAnalysis(reason);
+          };
+
+          window.__archessNewGame = function() {
+            bridgeState.needsNewGame = true;
+            bridgeStatus('Marked next analysis as a new game.');
+            return true;
+          };
+
+          window.__archessDumpDiagnostics = function() {
+            return JSON.stringify({
+              state: bridgeState.state,
+              waitingReadyReason: bridgeState.waitingReadyReason,
+              currentRequest: bridgeState.currentRequest,
+              queuedRequest: bridgeState.queuedRequest,
+              commands: bridgeState.lastCommands,
+              lines: bridgeState.lastLines,
+            });
+          };
+
           bootStockfish();
         </script>
       </head>
@@ -1619,16 +2289,16 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
     """
   }
 
-  private static func jsonStringLiteral(_ value: String) -> String {
-    let data = try? JSONSerialization.data(withJSONObject: [value])
-    let json = String(data: data ?? Data("[]".utf8), encoding: .utf8) ?? "[\"\"]"
-    return String(json.dropFirst().dropLast())
+  private static func hashFEN(_ fen: String) -> String {
+    let digest = SHA256.hash(data: Data(fen.utf8))
+    return digest.compactMap { String(format: "%02x", $0) }.joined().prefix(12).description
   }
 }
 
 @MainActor
 private final class PiecePersonalityDirector: NSObject, ObservableObject, @preconcurrency AVSpeechSynthesizerDelegate {
-  private static let preferredAnalysisDepth = 5
+  private static let preferredMovetimeMs = 80
+  private static let preferredHardTimeoutMs = 600
   private static let commentaryIntervalRange = 3...4
   private static let substantialGainThreshold = 120
   private static let substantialDropThreshold = -140
@@ -1652,9 +2322,12 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   }
 
   @Published private(set) var caption: Caption?
-  @Published private(set) var analysisStatus = "Stockfish depth 5 warming up..."
+  @Published private(set) var analysisStatus = "Stockfish movetime 80ms warming up..."
   @Published private(set) var latestAssessment = "Waiting for initial analysis."
   @Published private(set) var suggestedMoveText = "Next best move: waiting on Stockfish..."
+  @Published private(set) var whiteEvalText = "White eval: --"
+  @Published private(set) var blackEvalText = "Black eval: --"
+  @Published private(set) var analysisTimingText = "No completed analysis yet."
 
   private let analyzer = StockfishWASMAnalyzer()
   private let synthesizer = AVSpeechSynthesizer()
@@ -1663,29 +2336,39 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   private var completedPlyCount = 0
   private var nextCommentaryPly = Int.random(in: commentaryIntervalRange)
   private var reactionHandler: ((ReactionCue) -> Void)?
+  private var stateProvider: (() -> ChessGameState?)?
 
   override init() {
     super.init()
     synthesizer.delegate = self
   }
 
-  func prepare(with state: ChessGameState) async {
+  func prepare(with state: ChessGameState, force: Bool = false) async {
     let fen = state.fenString
-    guard cachedAnalysis?.fen != fen else {
+    guard force || cachedAnalysis?.fen != fen else {
       return
     }
 
     do {
-      let analysis = try await analyzer.analyze(fen: fen, depth: Self.preferredAnalysisDepth)
+      let analysis = try await analyzer.analyze(
+        fen: fen,
+        options: .realtime(
+          movetimeMs: Self.preferredMovetimeMs,
+          hardTimeoutMs: Self.preferredHardTimeoutMs
+        )
+      )
       cachedAnalysis = CachedAnalysis(fen: fen, analysis: analysis)
-      analysisStatus = "Stockfish depth \(Self.preferredAnalysisDepth) ready."
+      updateAnalysisPresentation(analysis)
+      analysisStatus = "Stockfish movetime \(Self.preferredMovetimeMs)ms ready."
       latestAssessment = "Prep eval: \(describe(analysis: analysis, moverColor: state.turn))."
-      suggestedMoveText = bestMoveDescription(from: analysis)
     } catch {
       let message = analyzer.lastError ?? error.localizedDescription
       analysisStatus = "Stockfish unavailable. Last stage: \(analyzer.lastStatus)"
       latestAssessment = "Stockfish error: \(message)"
       suggestedMoveText = "Next best move unavailable."
+      whiteEvalText = "White eval: --"
+      blackEvalText = "Black eval: --"
+      analysisTimingText = "Analysis failed."
     }
   }
 
@@ -1697,13 +2380,34 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     completedPlyCount = 0
     nextCommentaryPly = Int.random(in: Self.commentaryIntervalRange)
     analyzer.reset()
-    analysisStatus = "Stockfish depth \(Self.preferredAnalysisDepth) warming up..."
+    analysisStatus = "Stockfish movetime \(Self.preferredMovetimeMs)ms warming up..."
     latestAssessment = "Waiting for initial analysis."
     suggestedMoveText = "Next best move: waiting on Stockfish..."
+    whiteEvalText = "White eval: --"
+    blackEvalText = "Black eval: --"
+    analysisTimingText = "No completed analysis yet."
   }
 
   func noteExternalStatus(_ message: String) {
     latestAssessment = message
+  }
+
+  func bindStateProvider(_ provider: @escaping () -> ChessGameState?) {
+    stateProvider = provider
+  }
+
+  func unbindStateProvider() {
+    stateProvider = nil
+  }
+
+  func analyzeCurrentPosition() async {
+    guard let state = stateProvider?() else {
+      latestAssessment = "No board state available for manual analysis."
+      return
+    }
+
+    analysisStatus = "Manual analysis requested..."
+    await prepare(with: state, force: true)
   }
 
   func bindReactionHandler(_ handler: @escaping (ReactionCue) -> Void) {
@@ -1725,12 +2429,15 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
 
     if let afterAnalysis {
       cachedAnalysis = CachedAnalysis(fen: afterState.fenString, analysis: afterAnalysis)
-      analysisStatus = "Stockfish depth \(Self.preferredAnalysisDepth) live."
-      suggestedMoveText = bestMoveDescription(from: afterAnalysis)
+      updateAnalysisPresentation(afterAnalysis)
+      analysisStatus = "Stockfish movetime \(Self.preferredMovetimeMs)ms live."
     } else if analyzer.lastError != nil {
       analysisStatus = "Stockfish unavailable. Last stage: \(analyzer.lastStatus)"
       latestAssessment = "Stockfish error: \(analyzer.lastError ?? analyzer.lastStatus)"
       suggestedMoveText = "Next best move unavailable."
+      whiteEvalText = "White eval: --"
+      blackEvalText = "Black eval: --"
+      analysisTimingText = "Analysis failed."
     }
 
     let assessment = classifyMove(
@@ -1833,7 +2540,13 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     }
 
     do {
-      let analysis = try await analyzer.analyze(fen: fen, depth: Self.preferredAnalysisDepth)
+      let analysis = try await analyzer.analyze(
+        fen: fen,
+        options: .realtime(
+          movetimeMs: Self.preferredMovetimeMs,
+          hardTimeoutMs: Self.preferredHardTimeoutMs
+        )
+      )
       cachedAnalysis = CachedAnalysis(fen: fen, analysis: analysis)
       return analysis
     } catch {
@@ -1911,6 +2624,13 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
 
     let cp = analysis.scoreCp ?? 0
     return "\(cp) cp"
+  }
+
+  private func updateAnalysisPresentation(_ analysis: StockfishAnalysis) {
+    suggestedMoveText = bestMoveDescription(from: analysis)
+    whiteEvalText = "White eval: \(analysis.formattedEval(for: .white))"
+    blackEvalText = "Black eval: \(analysis.formattedEval(for: .black))"
+    analysisTimingText = "Last analysis: \(analysis.durationMs)ms"
   }
 
   private func bestMoveDescription(from analysis: StockfishAnalysis) -> String {
@@ -2635,6 +3355,30 @@ private struct NativeARExperienceView: View {
           Text(commentary.suggestedMoveText)
             .font(.system(size: 13, weight: .bold, design: .rounded))
             .foregroundStyle(Color.white.opacity(0.92))
+
+          HStack(spacing: 10) {
+            VStack(alignment: .leading, spacing: 4) {
+              Text(commentary.whiteEvalText)
+                .font(.system(size: 12, weight: .bold, design: .rounded))
+                .foregroundStyle(Color.white.opacity(0.94))
+
+              Text(commentary.blackEvalText)
+                .font(.system(size: 12, weight: .bold, design: .rounded))
+                .foregroundStyle(Color.white.opacity(0.88))
+
+              Text(commentary.analysisTimingText)
+                .font(.system(size: 11, weight: .semibold, design: .rounded))
+                .foregroundStyle(Color.white.opacity(0.66))
+            }
+
+            Spacer(minLength: 12)
+
+            NativeActionButton(title: "Analyze current position", style: .outline) {
+              Task {
+                await commentary.analyzeCurrentPosition()
+              }
+            }
+          }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(18)
@@ -2642,7 +3386,6 @@ private struct NativeARExperienceView: View {
           RoundedRectangle(cornerRadius: 26, style: .continuous)
             .fill(.ultraThinMaterial)
         )
-        .allowsHitTesting(false)
 
         Spacer()
 
@@ -2735,6 +3478,8 @@ private struct NativeARExperienceView: View {
     }
     .onDisappear {
       commentary.resetSession()
+      commentary.unbindStateProvider()
+      commentary.unbindReactionHandler()
       switch mode {
       case .passAndPlay(_):
         matchLog.resetSession()
@@ -3696,6 +4441,9 @@ private struct NativeARView: UIViewRepresentable {
 
           self.commentary.bindReactionHandler { [weak self] cue in
             self?.handleReactionCue(cue)
+          }
+          self.commentary.bindStateProvider { [weak self] in
+            self?.gameState
           }
         }
       }
