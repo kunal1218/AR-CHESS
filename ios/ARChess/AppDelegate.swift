@@ -391,11 +391,14 @@ private enum SpeechPriority: Int {
 }
 
 @MainActor
-private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler {
+private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
   private let messageHandlerName = "stockfishBridge"
   private var webView: WKWebView?
   private var pendingContinuations: [String: CheckedContinuation<StockfishAnalysis, Error>] = [:]
   private var timeoutTasks: [String: Task<Void, Never>] = [:]
+  private var bridgeInstallContinuations: [CheckedContinuation<Void, Error>] = []
+  private var bridgeInstallTimeoutTask: Task<Void, Never>?
+  private var isBridgeInstalled = false
   private(set) var lastError: String?
 
   func analyze(fen: String, depth: Int = 10) async throws -> StockfishAnalysis {
@@ -408,6 +411,8 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler {
         userInfo: [NSLocalizedDescriptionKey: lastError ?? "Bundled Stockfish assets are unavailable."]
       )
     }
+
+    try await waitUntilBridgeInstalled()
 
     let requestID = UUID().uuidString
     let requestScript = """
@@ -456,6 +461,8 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler {
 
   func reset() {
     lastError = nil
+    bridgeInstallTimeoutTask?.cancel()
+    bridgeInstallTimeoutTask = nil
   }
 
   func userContentController(
@@ -469,10 +476,34 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler {
     }
 
     switch type {
+    case "bridgeInstalled":
+      isBridgeInstalled = true
+      lastError = nil
+      bridgeInstallTimeoutTask?.cancel()
+      bridgeInstallTimeoutTask = nil
+      let continuations = bridgeInstallContinuations
+      bridgeInstallContinuations.removeAll()
+      continuations.forEach { $0.resume() }
     case "ready":
       lastError = nil
     case "error":
-      lastError = payload["message"] as? String
+      let message = payload["message"] as? String ?? "Unknown Stockfish bridge error."
+      lastError = message
+      if !isBridgeInstalled, !bridgeInstallContinuations.isEmpty {
+        bridgeInstallTimeoutTask?.cancel()
+        bridgeInstallTimeoutTask = nil
+        let continuations = bridgeInstallContinuations
+        bridgeInstallContinuations.removeAll()
+        continuations.forEach {
+          $0.resume(
+            throwing: NSError(
+              domain: "ARChess.Stockfish",
+              code: -3,
+              userInfo: [NSLocalizedDescriptionKey: message]
+            )
+          )
+        }
+      }
     case "result":
       guard let requestID = payload["id"] as? String,
             let continuation = pendingContinuations.removeValue(forKey: requestID) else {
@@ -514,15 +545,92 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler {
 
     let webView = WKWebView(frame: .zero, configuration: configuration)
     webView.isHidden = true
-    webView.loadHTMLString(
-      Self.stockfishBridgeHTML(messageHandlerName: messageHandlerName),
-      baseURL: stockfishDirectory
-    )
+    webView.navigationDelegate = self
+    let htmlURL = stockfishDirectory.appendingPathComponent("stockfish-bridge.html")
+    do {
+      try Self.writeBridgeHTML(to: htmlURL, messageHandlerName: messageHandlerName)
+      webView.loadFileURL(htmlURL, allowingReadAccessTo: stockfishDirectory)
+    } catch {
+      lastError = error.localizedDescription
+      return
+    }
     self.webView = webView
   }
 
+  func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+    lastError = error.localizedDescription
+  }
+
+  func webView(
+    _ webView: WKWebView,
+    didFailProvisionalNavigation navigation: WKNavigation!,
+    withError error: Error
+  ) {
+    lastError = error.localizedDescription
+  }
+
+  private func waitUntilBridgeInstalled() async throws {
+    if isBridgeInstalled {
+      return
+    }
+
+    try await withCheckedThrowingContinuation { continuation in
+      bridgeInstallContinuations.append(continuation)
+      if bridgeInstallTimeoutTask == nil {
+        bridgeInstallTimeoutTask = Task { [weak self] in
+          try? await Task.sleep(nanoseconds: 5_000_000_000)
+          await MainActor.run {
+            guard let self, !self.isBridgeInstalled, !self.bridgeInstallContinuations.isEmpty else {
+              return
+            }
+
+            let errorMessage = self.lastError ?? "Stockfish bridge did not finish loading."
+            let continuations = self.bridgeInstallContinuations
+            self.bridgeInstallContinuations.removeAll()
+            self.bridgeInstallTimeoutTask = nil
+            self.lastError = errorMessage
+            continuations.forEach {
+              $0.resume(
+                throwing: NSError(
+                  domain: "ARChess.Stockfish",
+                  code: -4,
+                  userInfo: [NSLocalizedDescriptionKey: errorMessage]
+                )
+              )
+            }
+          }
+        }
+      }
+    }
+  }
+
   private static func stockfishDirectoryURL() -> URL? {
-    Bundle.main.url(forResource: "stockfish-nnue-16-single", withExtension: "js")?.deletingLastPathComponent()
+    guard let bundledJSURL = Bundle.main.url(forResource: "stockfish-nnue-16-single", withExtension: "js"),
+          let bundledWASMURL = Bundle.main.url(forResource: "stockfish-nnue-16-single", withExtension: "wasm") else {
+      return nil
+    }
+
+    let runtimeDirectory = FileManager.default.temporaryDirectory
+      .appendingPathComponent("ARChessStockfish", isDirectory: true)
+
+    do {
+      try FileManager.default.createDirectory(at: runtimeDirectory, withIntermediateDirectories: true)
+      let runtimeJSURL = runtimeDirectory.appendingPathComponent("stockfish-nnue-16-single.js")
+      let runtimeWASMURL = runtimeDirectory.appendingPathComponent("stockfish-nnue-16-single.wasm")
+
+      if FileManager.default.fileExists(atPath: runtimeJSURL.path) {
+        try FileManager.default.removeItem(at: runtimeJSURL)
+      }
+      if FileManager.default.fileExists(atPath: runtimeWASMURL.path) {
+        try FileManager.default.removeItem(at: runtimeWASMURL)
+      }
+
+      try FileManager.default.copyItem(at: bundledJSURL, to: runtimeJSURL)
+      try FileManager.default.copyItem(at: bundledWASMURL, to: runtimeWASMURL)
+      return runtimeDirectory
+    } catch {
+      return nil
+    }
   }
 
   private func javaScriptStringLiteral(_ value: String) -> String {
@@ -531,8 +639,8 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler {
     return String(json.dropFirst().dropLast())
   }
 
-  private static func stockfishBridgeHTML(messageHandlerName: String) -> String {
-    """
+  private static func writeBridgeHTML(to url: URL, messageHandlerName: String) throws {
+    let html = """
     <!doctype html>
     <html>
       <head>
@@ -564,7 +672,9 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler {
                   return;
                 }
 
-                const engine = await factory();
+                const engine = await factory({
+                  locateFile: (path) => new URL(path, window.location.href).toString(),
+                });
                 bridgeState.engine = engine;
                 if (typeof engine.addMessageListener === 'function') {
                   engine.addMessageListener(handleEngineLine);
@@ -658,12 +768,15 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler {
             return true;
           };
 
+          bridgePost({ type: 'bridgeInstalled' });
           bootStockfish();
         </script>
       </head>
       <body></body>
     </html>
     """
+
+    try html.write(to: url, atomically: true, encoding: .utf8)
   }
 }
 
@@ -702,8 +815,9 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       latestAssessment = "Prep eval: \(describe(analysis: analysis, moverColor: state.turn))."
       suggestedMoveText = bestMoveDescription(from: analysis)
     } catch {
+      let message = analyzer.lastError ?? error.localizedDescription
       analysisStatus = "Stockfish unavailable. Falling back to local board events."
-      latestAssessment = "Local commentary only."
+      latestAssessment = "Stockfish error: \(message)"
       suggestedMoveText = "Next best move unavailable."
     }
   }
@@ -733,6 +847,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       suggestedMoveText = bestMoveDescription(from: afterAnalysis)
     } else if analyzer.lastError != nil {
       analysisStatus = "Stockfish unavailable. Falling back to local board events."
+      latestAssessment = "Stockfish error: \(analyzer.lastError ?? "Unknown Stockfish error.")"
       suggestedMoveText = "Next best move unavailable."
     }
 
