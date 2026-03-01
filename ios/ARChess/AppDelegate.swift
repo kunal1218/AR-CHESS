@@ -531,8 +531,8 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
       return
     }
 
-    guard let stockfishDirectory = Self.stockfishDirectoryURL() else {
-      lastError = "Bundled Stockfish assets are missing from the app bundle."
+    guard let runtimeDirectory = Self.stockfishRuntimeDirectoryURL() else {
+      lastError = "Bundled Stockfish assets are missing or unreadable."
       return
     }
 
@@ -546,10 +546,14 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
     let webView = WKWebView(frame: .zero, configuration: configuration)
     webView.isHidden = true
     webView.navigationDelegate = self
-    let htmlURL = stockfishDirectory.appendingPathComponent("stockfish-bridge.html")
+    let htmlURL = runtimeDirectory.appendingPathComponent("stockfish-bridge.html")
     do {
-      try Self.writeBridgeHTML(to: htmlURL, messageHandlerName: messageHandlerName)
-      webView.loadFileURL(htmlURL, allowingReadAccessTo: stockfishDirectory)
+      try Self.stockfishBridgeHTML(messageHandlerName: messageHandlerName).write(
+        to: htmlURL,
+        atomically: true,
+        encoding: .utf8
+      )
+      webView.loadFileURL(htmlURL, allowingReadAccessTo: runtimeDirectory)
     } catch {
       lastError = error.localizedDescription
       return
@@ -604,7 +608,7 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
     }
   }
 
-  private static func stockfishDirectoryURL() -> URL? {
+  private static func stockfishRuntimeDirectoryURL() -> URL? {
     guard let bundledJSURL = Bundle.main.url(forResource: "stockfish-nnue-16-single", withExtension: "js"),
           let bundledWASMURL = Bundle.main.url(forResource: "stockfish-nnue-16-single", withExtension: "wasm") else {
       return nil
@@ -639,8 +643,8 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
     return String(json.dropFirst().dropLast())
   }
 
-  private static func writeBridgeHTML(to url: URL, messageHandlerName: String) throws {
-    let html = """
+  private static func stockfishBridgeHTML(messageHandlerName: String) -> String {
+    """
     <!doctype html>
     <html>
       <head>
@@ -661,39 +665,18 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
           }
 
           function bootStockfish() {
-            const script = document.createElement('script');
-            script.src = 'stockfish-nnue-16-single.js';
-            script.async = true;
-            script.onload = async () => {
-              try {
-                const factory = script._exports || window.STOCKFISH || window.Stockfish || window.stockfish;
-                if (!factory) {
-                  bridgePost({ type: 'error', message: 'Stockfish factory missing in bridge.' });
-                  return;
-                }
-
-                const engine = await factory({
-                  locateFile: (path) => new URL(path, window.location.href).toString(),
-                });
-                bridgeState.engine = engine;
-                if (typeof engine.addMessageListener === 'function') {
-                  engine.addMessageListener(handleEngineLine);
-                } else if (typeof engine.onmessage !== 'undefined') {
-                  engine.onmessage = handleEngineLine;
-                } else {
-                  bridgePost({ type: 'error', message: 'Stockfish engine listener API missing.' });
-                  return;
-                }
-                engine.postMessage('uci');
-                engine.postMessage('isready');
-              } catch (error) {
-                bridgePost({ type: 'error', message: String(error) });
-              }
-            };
-            script.onerror = () => {
-              bridgePost({ type: 'error', message: 'Failed to load Stockfish WASM bridge.' });
-            };
-            document.head.appendChild(script);
+            try {
+              const engine = new Worker('stockfish-nnue-16-single.js');
+              bridgeState.engine = engine;
+              engine.onmessage = (event) => handleEngineLine(event.data);
+              engine.onerror = (event) => {
+                bridgePost({ type: 'error', message: event.message || 'Stockfish worker failed.' });
+              };
+              engine.postMessage('uci');
+              engine.postMessage('isready');
+            } catch (error) {
+              bridgePost({ type: 'error', message: String(error) });
+            }
           }
 
           function handleEngineLine(line) {
@@ -775,8 +758,6 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
       <body></body>
     </html>
     """
-
-    try html.write(to: url, atomically: true, encoding: .utf8)
   }
 }
 
