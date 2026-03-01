@@ -46,7 +46,7 @@
 		<true/>
 	</dict>
 	<key>ARChessAPIBaseURL</key>
-	<string></string>
+	<string>https://ar-chess-production.up.railway.app</string>
 	<key>NSCameraUsageDescription</key>
 	<string>Allow AR Chess to use your camera for board placement and gameplay.</string>
     <key>NSMicrophoneUsageDescription</key>
