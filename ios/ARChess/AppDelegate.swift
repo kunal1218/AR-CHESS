@@ -1630,6 +1630,17 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
 private final class PiecePersonalityDirector: NSObject, ObservableObject, @preconcurrency AVSpeechSynthesizerDelegate {
   private static let preferredAnalysisDepth = 5
   private static let commentaryIntervalRange = 3...4
+  private static let substantialGainThreshold = 120
+  private static let substantialDropThreshold = -140
+
+  struct ReactionCue {
+    enum Kind {
+      case enemyKingPrays(color: ChessColor)
+      case currentKingCries(color: ChessColor)
+    }
+
+    let kind: Kind
+  }
 
   struct Caption {
     let speaker: PersonalitySpeaker
@@ -1651,6 +1662,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   private var cachedAnalysis: CachedAnalysis?
   private var completedPlyCount = 0
   private var nextCommentaryPly = Int.random(in: commentaryIntervalRange)
+  private var reactionHandler: ((ReactionCue) -> Void)?
 
   override init() {
     super.init()
@@ -1692,6 +1704,14 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
 
   func noteExternalStatus(_ message: String) {
     latestAssessment = message
+  }
+
+  func bindReactionHandler(_ handler: @escaping (ReactionCue) -> Void) {
+    reactionHandler = handler
+  }
+
+  func unbindReactionHandler() {
+    reactionHandler = nil
   }
 
   func handleMove(
@@ -1736,6 +1756,29 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
         scheduleNextCommentaryWindow()
       }
       return
+    }
+
+    if let swing = evalSwing(before: beforeAnalysis, after: afterAnalysis, moverColor: beforeState.turn) {
+      if swing >= Self.substantialGainThreshold {
+        reactionHandler?(ReactionCue(kind: .enemyKingPrays(color: beforeState.turn.opponent)))
+      } else if swing <= Self.substantialDropThreshold {
+        reactionHandler?(ReactionCue(kind: .currentKingCries(color: beforeState.turn)))
+        if speakRandomLine(
+          from: [
+            SpokenLine(
+              speaker: .king,
+              text: "I'm cooked.",
+              pitch: 1.18,
+              rate: 0.46,
+              volume: 1.0
+            )
+          ],
+          priority: .urgent
+        ) {
+          scheduleNextCommentaryWindow()
+        }
+        return
+      }
     }
 
     guard completedPlyCount >= nextCommentaryPly else {
@@ -1803,13 +1846,9 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     after: StockfishAnalysis?,
     moverColor: ChessColor
   ) -> MoveClassification? {
-    guard let before, let after else {
+    guard let swing = evalSwing(before: before, after: after, moverColor: moverColor) else {
       return nil
     }
-
-    let beforeScore = scoreForMoverPerspective(before, moverColor: moverColor, isPostMove: false)
-    let afterScore = scoreForMoverPerspective(after, moverColor: moverColor, isPostMove: true)
-    let swing = afterScore - beforeScore
 
     switch swing {
     case 160...:
@@ -1832,15 +1871,25 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     after: StockfishAnalysis?,
     moverColor: ChessColor
   ) -> String {
-    guard let before, let after else {
+    guard let swing = evalSwing(before: before, after: after, moverColor: moverColor) else {
       return "Stockfish unavailable"
+    }
+    let sign = swing >= 0 ? "+" : ""
+    return "\(sign)\(swing) cp swing"
+  }
+
+  private func evalSwing(
+    before: StockfishAnalysis?,
+    after: StockfishAnalysis?,
+    moverColor: ChessColor
+  ) -> Int? {
+    guard let before, let after else {
+      return nil
     }
 
     let beforeScore = scoreForMoverPerspective(before, moverColor: moverColor, isPostMove: false)
     let afterScore = scoreForMoverPerspective(after, moverColor: moverColor, isPostMove: true)
-    let swing = afterScore - beforeScore
-    let sign = swing >= 0 ? "+" : ""
-    return "\(sign)\(swing) cp swing"
+    return afterScore - beforeScore
   }
 
   private func scoreForMoverPerspective(_ analysis: StockfishAnalysis, moverColor: ChessColor, isPostMove: Bool) -> Int {
@@ -3587,6 +3636,7 @@ private struct NativeARView: UIViewRepresentable {
     private var selectedMoves: [ChessMove] = []
     private var syncedQueueMoves: [QueueMatchMovePayload] = []
     private var queueAssignedColor: ChessColor?
+    private var hasBoundReactionHandler = false
 
     init(
       matchLog: MatchLogStore,
@@ -3636,6 +3686,19 @@ private struct NativeARView: UIViewRepresentable {
 
       arView.session.delegate = self
       arView.session.run(configuration, options: [.resetTracking, .removeExistingAnchors])
+
+      if !hasBoundReactionHandler {
+        hasBoundReactionHandler = true
+        Task { @MainActor [weak self] in
+          guard let self else {
+            return
+          }
+
+          self.commentary.bindReactionHandler { [weak self] cue in
+            self?.handleReactionCue(cue)
+          }
+        }
+      }
 
       if case .queueMatch = mode {
         Task { @MainActor [weak self] in
@@ -3875,6 +3938,15 @@ private struct NativeARView: UIViewRepresentable {
       }
     }
 
+    private func handleReactionCue(_ cue: PiecePersonalityDirector.ReactionCue) {
+      switch cue.kind {
+      case .enemyKingPrays(let color):
+        animateKingPrayer(for: color)
+      case .currentKingCries(let color):
+        animateKingCrying(for: color)
+      }
+    }
+
     private func canControlPiece(_ piece: ChessPieceState, at square: BoardSquare) -> Bool {
       guard piece.color == gameState.turn else {
         return false
@@ -3891,6 +3963,130 @@ private struct NativeARView: UIViewRepresentable {
         }
         return piece.color == assignedColor
       }
+    }
+
+    private func animateKingPrayer(for color: ChessColor) {
+      guard let kingEntity = kingEntity(for: color),
+            let leftHand = kingEntity.findEntity(named: "king_hand_left"),
+            let rightHand = kingEntity.findEntity(named: "king_hand_right") else {
+        return
+      }
+
+      let originalKingTransform = kingEntity.transform
+      let originalLeftTransform = leftHand.transform
+      let originalRightTransform = rightHand.transform
+
+      var bowedTransform = originalKingTransform
+      bowedTransform.rotation = simd_normalize(
+        simd_quatf(angle: -.pi / 12, axis: SIMD3<Float>(1, 0, 0)) * originalKingTransform.rotation
+      )
+
+      var prayingLeftTransform = originalLeftTransform
+      prayingLeftTransform.translation = SIMD3<Float>(-0.006, 0.038, -0.007)
+      prayingLeftTransform.rotation = simd_quatf(angle: .pi / 7, axis: SIMD3<Float>(0, 0, 1))
+
+      var prayingRightTransform = originalRightTransform
+      prayingRightTransform.translation = SIMD3<Float>(0.006, 0.038, -0.007)
+      prayingRightTransform.rotation = simd_quatf(angle: -.pi / 7, axis: SIMD3<Float>(0, 0, 1))
+
+      kingEntity.move(to: bowedTransform, relativeTo: kingEntity.parent, duration: 0.24, timingFunction: .easeInOut)
+      leftHand.move(to: prayingLeftTransform, relativeTo: kingEntity, duration: 0.22, timingFunction: .easeInOut)
+      rightHand.move(to: prayingRightTransform, relativeTo: kingEntity, duration: 0.22, timingFunction: .easeInOut)
+
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.72) { [weak kingEntity, weak leftHand, weak rightHand] in
+        guard let kingEntity, let leftHand, let rightHand else {
+          return
+        }
+
+        kingEntity.move(to: originalKingTransform, relativeTo: kingEntity.parent, duration: 0.26, timingFunction: .easeInOut)
+        leftHand.move(to: originalLeftTransform, relativeTo: kingEntity, duration: 0.24, timingFunction: .easeInOut)
+        rightHand.move(to: originalRightTransform, relativeTo: kingEntity, duration: 0.24, timingFunction: .easeInOut)
+      }
+    }
+
+    private func animateKingCrying(for color: ChessColor) {
+      guard let kingEntity = kingEntity(for: color),
+            let leftHand = kingEntity.findEntity(named: "king_hand_left"),
+            let rightHand = kingEntity.findEntity(named: "king_hand_right"),
+            let leftTear = kingEntity.findEntity(named: "king_tear_left"),
+            let rightTear = kingEntity.findEntity(named: "king_tear_right") else {
+        return
+      }
+
+      let originalKingTransform = kingEntity.transform
+      let originalLeftTransform = leftHand.transform
+      let originalRightTransform = rightHand.transform
+      let originalLeftTearTransform = leftTear.transform
+      let originalRightTearTransform = rightTear.transform
+
+      var droopTransform = originalKingTransform
+      droopTransform.rotation = simd_normalize(
+        simd_quatf(angle: .pi / 13, axis: SIMD3<Float>(0, 0, 1)) *
+          simd_quatf(angle: .pi / 16, axis: SIMD3<Float>(1, 0, 0)) *
+          originalKingTransform.rotation
+      )
+      droopTransform.translation += SIMD3<Float>(0, -0.004, 0)
+
+      var leftHandTransform = originalLeftTransform
+      leftHandTransform.translation = SIMD3<Float>(-0.026, 0.021, -0.002)
+      leftHandTransform.rotation = simd_quatf(angle: -.pi / 10, axis: SIMD3<Float>(0, 0, 1))
+
+      var rightHandTransform = originalRightTransform
+      rightHandTransform.translation = SIMD3<Float>(0.026, 0.021, -0.002)
+      rightHandTransform.rotation = simd_quatf(angle: .pi / 10, axis: SIMD3<Float>(0, 0, 1))
+
+      var leftTearTransform = originalLeftTearTransform
+      leftTearTransform.scale = SIMD3<Float>(repeating: 1.0)
+      leftTearTransform.translation = SIMD3<Float>(-0.009, 0.020, -0.013)
+
+      var rightTearTransform = originalRightTearTransform
+      rightTearTransform.scale = SIMD3<Float>(repeating: 1.0)
+      rightTearTransform.translation = SIMD3<Float>(0.009, 0.020, -0.013)
+
+      kingEntity.move(to: droopTransform, relativeTo: kingEntity.parent, duration: 0.20, timingFunction: .easeInOut)
+      leftHand.move(to: leftHandTransform, relativeTo: kingEntity, duration: 0.18, timingFunction: .easeInOut)
+      rightHand.move(to: rightHandTransform, relativeTo: kingEntity, duration: 0.18, timingFunction: .easeInOut)
+      leftTear.move(to: leftTearTransform, relativeTo: kingEntity, duration: 0.12, timingFunction: .easeInOut)
+      rightTear.move(to: rightTearTransform, relativeTo: kingEntity, duration: 0.12, timingFunction: .easeInOut)
+
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.32) { [weak kingEntity, weak leftTear, weak rightTear] in
+        guard let kingEntity, let leftTear, let rightTear else {
+          return
+        }
+
+        var fallingLeft = leftTear.transform
+        fallingLeft.translation += SIMD3<Float>(-0.004, -0.028, 0.002)
+        fallingLeft.scale = SIMD3<Float>(repeating: 0.78)
+
+        var fallingRight = rightTear.transform
+        fallingRight.translation += SIMD3<Float>(0.004, -0.028, 0.002)
+        fallingRight.scale = SIMD3<Float>(repeating: 0.78)
+
+        leftTear.move(to: fallingLeft, relativeTo: kingEntity, duration: 0.28, timingFunction: .easeIn)
+        rightTear.move(to: fallingRight, relativeTo: kingEntity, duration: 0.28, timingFunction: .easeIn)
+      }
+
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.82) { [weak kingEntity, weak leftHand, weak rightHand, weak leftTear, weak rightTear] in
+        guard let kingEntity, let leftHand, let rightHand, let leftTear, let rightTear else {
+          return
+        }
+
+        kingEntity.move(to: originalKingTransform, relativeTo: kingEntity.parent, duration: 0.28, timingFunction: .easeInOut)
+        leftHand.move(to: originalLeftTransform, relativeTo: kingEntity, duration: 0.24, timingFunction: .easeInOut)
+        rightHand.move(to: originalRightTransform, relativeTo: kingEntity, duration: 0.24, timingFunction: .easeInOut)
+        leftTear.move(to: originalLeftTearTransform, relativeTo: kingEntity, duration: 0.20, timingFunction: .easeInOut)
+        rightTear.move(to: originalRightTearTransform, relativeTo: kingEntity, duration: 0.20, timingFunction: .easeInOut)
+      }
+    }
+
+    private func kingEntity(for color: ChessColor) -> Entity? {
+      guard let kingSquare = gameState.board.first(where: {
+        $0.value.color == color && $0.value.kind == .king
+      })?.key else {
+        return nil
+      }
+
+      return piecesContainer.children.first(where: { $0.name == pieceName(kingSquare) })
     }
 
     private func updateBoardPlacement(session: ARSession, anchors: [ARAnchor]) {
@@ -4267,6 +4463,16 @@ private struct NativeARView: UIViewRepresentable {
         body.position.y = 0.023
         root.addChild(body)
 
+        let leftHand = ModelEntity(mesh: .generateSphere(radius: 0.0048), materials: [material])
+        leftHand.name = "king_hand_left"
+        leftHand.position = SIMD3<Float>(-0.022, 0.029, 0.001)
+        root.addChild(leftHand)
+
+        let rightHand = ModelEntity(mesh: .generateSphere(radius: 0.0048), materials: [material])
+        rightHand.name = "king_hand_right"
+        rightHand.position = SIMD3<Float>(0.022, 0.029, 0.001)
+        root.addChild(rightHand)
+
         let crossStem = ModelEntity(mesh: .generateBox(size: SIMD3<Float>(0.004, 0.014, 0.004)), materials: [material])
         crossStem.position.y = 0.046
         root.addChild(crossStem)
@@ -4274,6 +4480,24 @@ private struct NativeARView: UIViewRepresentable {
         let crossBar = ModelEntity(mesh: .generateBox(size: SIMD3<Float>(0.012, 0.004, 0.004)), materials: [material])
         crossBar.position.y = 0.048
         root.addChild(crossBar)
+
+        let tearMaterial = SimpleMaterial(
+          color: UIColor(red: 0.46, green: 0.76, blue: 0.96, alpha: 0.88),
+          roughness: 0.18,
+          isMetallic: false
+        )
+
+        let leftTear = ModelEntity(mesh: .generateSphere(radius: 0.0035), materials: [tearMaterial])
+        leftTear.name = "king_tear_left"
+        leftTear.position = SIMD3<Float>(-0.009, 0.032, -0.011)
+        leftTear.scale = SIMD3<Float>(repeating: 0.001)
+        root.addChild(leftTear)
+
+        let rightTear = ModelEntity(mesh: .generateSphere(radius: 0.0035), materials: [tearMaterial])
+        rightTear.name = "king_tear_right"
+        rightTear.position = SIMD3<Float>(0.009, 0.032, -0.011)
+        rightTear.scale = SIMD3<Float>(repeating: 0.001)
+        root.addChild(rightTear)
       }
 
       return root
