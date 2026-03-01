@@ -81,15 +81,18 @@ private enum NativeScreen {
 
 private struct AppRuntimeConfig {
   let apiBaseURL: URL?
+  let geminiAPIKey: String?
 
   static let current = AppRuntimeConfig()
 
   init() {
+    let bundledSecrets = Self.loadBundledSecrets()
     let sources = [
       Bundle.main.object(forInfoDictionaryKey: "ARChessAPIBaseURL") as? String,
       ProcessInfo.processInfo.environment["AR_CHESS_API_BASE_URL"],
     ]
 
+    var resolvedAPIBaseURL: URL?
     for candidate in sources {
       guard let candidate else {
         continue
@@ -100,11 +103,268 @@ private struct AppRuntimeConfig {
         continue
       }
 
-      apiBaseURL = url.deletingTrailingSlash()
-      return
+      resolvedAPIBaseURL = url.deletingTrailingSlash()
+      break
     }
 
-    apiBaseURL = nil
+    apiBaseURL = resolvedAPIBaseURL
+
+    let geminiSources = [
+      bundledSecrets["GEMINI_API_KEY"],
+      Bundle.main.object(forInfoDictionaryKey: "ARChessGeminiAPIKey") as? String,
+      ProcessInfo.processInfo.environment["GEMINI_API_KEY"],
+    ]
+
+    geminiAPIKey = geminiSources
+      .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+      .first(where: { !$0.isEmpty })
+  }
+
+  private static func loadBundledSecrets() -> [String: String] {
+    guard let url = Bundle.main.url(forResource: "AppSecrets", withExtension: "env"),
+          let raw = try? String(contentsOf: url, encoding: .utf8) else {
+      return [:]
+    }
+
+    var values: [String: String] = [:]
+    for line in raw.split(whereSeparator: \.isNewline) {
+      let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+      guard !trimmed.isEmpty, !trimmed.hasPrefix("#"), let separatorIndex = trimmed.firstIndex(of: "=") else {
+        continue
+      }
+
+      let key = String(trimmed[..<separatorIndex]).trimmingCharacters(in: .whitespacesAndNewlines)
+      var value = String(trimmed[trimmed.index(after: separatorIndex)...]).trimmingCharacters(in: .whitespacesAndNewlines)
+      if value.hasPrefix("\""), value.hasSuffix("\""), value.count >= 2 {
+        value.removeFirst()
+        value.removeLast()
+      } else if value.hasPrefix("'"), value.hasSuffix("'"), value.count >= 2 {
+        value.removeFirst()
+        value.removeLast()
+      }
+
+      values[key] = value
+    }
+
+    return values
+  }
+}
+
+private struct GeminiHintRequestPayload: Encodable {
+  struct Content: Encodable {
+    struct Part: Encodable {
+      let text: String
+    }
+
+    let parts: [Part]
+  }
+
+  struct GenerationConfig: Encodable {
+    let temperature: Double
+    let topP: Double
+    let topK: Int
+    let maxOutputTokens: Int
+  }
+
+  let contents: [Content]
+  let generationConfig: GenerationConfig
+
+  init(prompt: String) {
+    contents = [Content(parts: [Content.Part(text: prompt)])]
+    generationConfig = GenerationConfig(
+      temperature: 0.95,
+      topP: 0.9,
+      topK: 32,
+      maxOutputTokens: 48
+    )
+  }
+}
+
+private struct GeminiHintResponsePayload: Decodable {
+  struct Candidate: Decodable {
+    struct Content: Decodable {
+      struct Part: Decodable {
+        let text: String?
+      }
+
+      let parts: [Part]?
+    }
+
+    let content: Content?
+    let finishReason: String?
+  }
+
+  let candidates: [Candidate]?
+}
+
+private struct GeminiHintContext {
+  let fen: String
+  let bestMove: String
+  let sideToMove: ChessColor
+  let movingPiece: ChessPieceKind?
+  let isCapture: Bool
+  let givesCheck: Bool
+  let themes: [String]
+}
+
+private final class GeminiHintService {
+  private static let logger = Logger(subsystem: "ARChess", category: "GeminiHint")
+
+  private let apiKey: String?
+  private let session: URLSession
+  private let modelName: String
+
+  init(
+    apiKey: String? = AppRuntimeConfig.current.geminiAPIKey,
+    modelName: String = "gemini-1.5-flash",
+    session: URLSession = .shared
+  ) {
+    self.apiKey = apiKey
+    self.modelName = modelName
+    self.session = session
+  }
+
+  var isConfigured: Bool {
+    guard let apiKey else {
+      return false
+    }
+
+    return !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+  }
+
+  func fetchHint(for context: GeminiHintContext) async throws -> String {
+    guard let apiKey, !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+      throw NSError(
+        domain: "ARChess.GeminiHint",
+        code: -1001,
+        userInfo: [NSLocalizedDescriptionKey: "Gemini hints are disabled until GEMINI_API_KEY is set in .env and the app is rebuilt."]
+      )
+    }
+
+    guard let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/\(modelName):generateContent") else {
+      throw NSError(
+        domain: "ARChess.GeminiHint",
+        code: -1002,
+        userInfo: [NSLocalizedDescriptionKey: "Could not build the Gemini API URL."]
+      )
+    }
+
+    var request = URLRequest(url: url)
+    request.httpMethod = "POST"
+    request.timeoutInterval = 4.0
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.setValue("application/json", forHTTPHeaderField: "Accept")
+    request.setValue(apiKey, forHTTPHeaderField: "x-goog-api-key")
+    request.httpBody = try JSONEncoder().encode(GeminiHintRequestPayload(prompt: prompt(for: context)))
+
+    let startedAt = Date()
+    let (data, response) = try await session.data(for: request)
+    let durationMs = Int(Date().timeIntervalSince(startedAt) * 1_000)
+    guard let httpResponse = response as? HTTPURLResponse else {
+      throw NSError(
+        domain: "ARChess.GeminiHint",
+        code: -1003,
+        userInfo: [NSLocalizedDescriptionKey: "Gemini did not return an HTTP response."]
+      )
+    }
+
+    guard (200..<300).contains(httpResponse.statusCode) else {
+      let message = String(data: data, encoding: .utf8) ?? "Unexpected Gemini response."
+      Self.logger.error("Gemini hint request failed status=\(httpResponse.statusCode, privacy: .public) duration_ms=\(durationMs, privacy: .public)")
+      throw NSError(
+        domain: "ARChess.GeminiHint",
+        code: httpResponse.statusCode,
+        userInfo: [NSLocalizedDescriptionKey: message]
+      )
+    }
+
+    let payload = try JSONDecoder().decode(GeminiHintResponsePayload.self, from: data)
+    let rawText = payload.candidates?
+      .compactMap { $0.content?.parts?.compactMap(\.text).joined(separator: " ") }
+      .first(where: { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty })
+
+    guard let rawText else {
+      throw NSError(
+        domain: "ARChess.GeminiHint",
+        code: -1004,
+        userInfo: [NSLocalizedDescriptionKey: "Gemini returned no hint text."]
+      )
+    }
+
+    let sanitized = sanitize(rawText, fallback: fallbackHint(for: context))
+    Self.logger.info("Gemini hint ready duration_ms=\(durationMs, privacy: .public) model=\(self.modelName, privacy: .public)")
+    return sanitized
+  }
+
+  private func prompt(for context: GeminiHintContext) -> String {
+    let pieceName = context.movingPiece?.displayName.lowercased() ?? "piece"
+    let captureText = context.isCapture ? "yes" : "no"
+    let checkText = context.givesCheck ? "yes" : "no"
+    let themes = context.themes.isEmpty ? "general activity" : context.themes.joined(separator: ", ")
+
+    return """
+    You write one short, fun, creative, beginner-friendly chess hint.
+    Never mention board squares, coordinates, algebraic notation, or the raw move text.
+    Never say files, ranks, e2e4, d2d4, or any square names.
+    Keep it to one sentence, around 6 to 14 words.
+    Make it playful and helpful, like a coach whispering a vibe.
+    Return plain text only.
+
+    Side to move: \(context.sideToMove.displayName)
+    Suggested move text: \(context.bestMove)
+    Moving piece: \(pieceName)
+    Is capture: \(captureText)
+    Gives check: \(checkText)
+    Themes: \(themes)
+    """
+  }
+
+  private func sanitize(_ raw: String, fallback: String) -> String {
+    let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    let movePattern = #"\b[a-h][1-8][a-h][1-8][qrbn]?\b|\b[a-h][1-8]\b"#
+
+    guard trimmed.range(of: movePattern, options: .regularExpression) == nil else {
+      return fallback
+    }
+
+    let condensed = trimmed.replacingOccurrences(
+      of: #"\s+"#,
+      with: " ",
+      options: .regularExpression
+    )
+    let final = condensed.trimmingCharacters(in: .whitespacesAndNewlines)
+    return final.isEmpty ? fallback : final
+  }
+
+  private func fallbackHint(for context: GeminiHintContext) -> String {
+    if context.givesCheck {
+      return "The enemy king looks a little exposed."
+    }
+
+    if context.themes.contains("fight for the center") {
+      switch context.movingPiece {
+      case .knight:
+        return "Your knight dreams of the center."
+      case .pawn:
+        return "A brave pawn wants to claim more space."
+      default:
+        return "This move helps seize the center."
+      }
+    }
+
+    if context.themes.contains("develop a new piece") {
+      return "A sleepy piece is ready to join the adventure."
+    }
+
+    if context.isCapture {
+      return "A clean trade could swing the momentum."
+    }
+
+    if context.themes.contains("improve king safety") {
+      return "Your king would sleep better after this."
+    }
+
+    return "There is a tidy move that improves your position."
   }
 }
 
@@ -2397,8 +2657,12 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   @Published private(set) var whiteEvalText = "White eval: --"
   @Published private(set) var blackEvalText = "Black eval: --"
   @Published private(set) var analysisTimingText = "No completed analysis yet."
+  @Published private(set) var hintStatusText = "Fun hints warm up in the background when it is your turn."
+  @Published private(set) var visibleHintText: String?
+  @Published private(set) var isHintLoading = false
 
   private let analyzer = StockfishWASMAnalyzer()
+  private let hintService = GeminiHintService()
   private let synthesizer = AVSpeechSynthesizer()
   private var utteranceCaptions: [ObjectIdentifier: Caption] = [:]
   private var cachedAnalysis: CachedAnalysis?
@@ -2406,6 +2670,11 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   private var nextCommentaryPly = Int.random(in: commentaryIntervalRange)
   private var reactionHandler: ((ReactionCue) -> Void)?
   private var stateProvider: (() -> ChessGameState?)?
+  private var hintAvailabilityProvider: (() -> Bool)?
+  private var hintTask: Task<Void, Never>?
+  private var hintCache: [String: String] = [:]
+  private var currentHintKey: String?
+  private var pendingHintReveal = false
 
   override init() {
     super.init()
@@ -2434,6 +2703,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       updateAnalysisPresentation(analysis)
       analysisStatus = "Stockfish movetime \(Self.preferredMovetimeMs)ms ready."
       latestAssessment = "Prep eval: \(describe(analysis: analysis, moverColor: state.turn))."
+      prefetchHint(for: state, analysis: analysis)
     } catch {
       let message = analyzer.lastError ?? error.localizedDescription
       analysisStatus = "Stockfish unavailable. Last stage: \(analyzer.lastStatus)"
@@ -2442,6 +2712,11 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       whiteEvalText = "White eval: --"
       blackEvalText = "Black eval: --"
       analysisTimingText = "Analysis failed."
+      visibleHintText = nil
+      isHintLoading = false
+      hintStatusText = hintService.isConfigured
+        ? "Hint unavailable until Stockfish finishes."
+        : defaultHintStatus()
     }
   }
 
@@ -2450,6 +2725,13 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     utteranceCaptions.removeAll()
     caption = nil
     cachedAnalysis = nil
+    hintTask?.cancel()
+    hintTask = nil
+    hintCache.removeAll()
+    currentHintKey = nil
+    pendingHintReveal = false
+    visibleHintText = nil
+    isHintLoading = false
     completedPlyCount = 0
     nextCommentaryPly = Int.random(in: Self.commentaryIntervalRange)
     analyzer.reset()
@@ -2459,6 +2741,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     whiteEvalText = "White eval: --"
     blackEvalText = "Black eval: --"
     analysisTimingText = "No completed analysis yet."
+    hintStatusText = defaultHintStatus()
   }
 
   func noteExternalStatus(_ message: String) {
@@ -2481,6 +2764,14 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     stateProvider = nil
   }
 
+  func bindHintAvailabilityProvider(_ provider: @escaping () -> Bool) {
+    hintAvailabilityProvider = provider
+  }
+
+  func unbindHintAvailabilityProvider() {
+    hintAvailabilityProvider = nil
+  }
+
   func analyzeCurrentPosition() async {
     guard let state = stateProvider?() else {
       latestAssessment = "No board state available for manual analysis."
@@ -2489,6 +2780,49 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
 
     analysisStatus = "Manual analysis requested..."
     await prepare(with: state, force: true)
+  }
+
+  func revealHint() {
+    guard hintService.isConfigured else {
+      visibleHintText = nil
+      isHintLoading = false
+      hintStatusText = "Set GEMINI_API_KEY in .env and rebuild to enable Gemini hints."
+      return
+    }
+
+    guard let state = stateProvider?() else {
+      visibleHintText = nil
+      hintStatusText = "No board state available for a hint yet."
+      return
+    }
+
+    guard shouldPrefetchHint(for: state) else {
+      visibleHintText = nil
+      isHintLoading = false
+      hintStatusText = "Hints wake up when it is your turn."
+      return
+    }
+
+    pendingHintReveal = true
+
+    if let analysis = cachedAnalysis?.analysis, cachedAnalysis?.fen == state.fenString {
+      prefetchHint(for: state, analysis: analysis, revealWhenReady: true)
+      return
+    }
+
+    visibleHintText = nil
+    isHintLoading = true
+    hintStatusText = "Loading hint..."
+    Task { @MainActor [weak self] in
+      guard let self else {
+        return
+      }
+
+      await self.prepare(with: state, force: true)
+      if let analysis = self.cachedAnalysis?.analysis, self.cachedAnalysis?.fen == state.fenString {
+        self.prefetchHint(for: state, analysis: analysis, revealWhenReady: true)
+      }
+    }
   }
 
   func bindReactionHandler(_ handler: @escaping (ReactionCue) -> Void) {
@@ -2512,6 +2846,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       cachedAnalysis = CachedAnalysis(fen: afterState.fenString, analysis: afterAnalysis)
       updateAnalysisPresentation(afterAnalysis)
       analysisStatus = "Stockfish movetime \(Self.preferredMovetimeMs)ms live."
+      prefetchHint(for: afterState, analysis: afterAnalysis)
     } else if analyzer.lastError != nil {
       analysisStatus = "Stockfish unavailable. Last stage: \(analyzer.lastStatus)"
       latestAssessment = "Stockfish error: \(analyzer.lastError ?? analyzer.lastStatus)"
@@ -2519,6 +2854,11 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       whiteEvalText = "White eval: --"
       blackEvalText = "Black eval: --"
       analysisTimingText = "Analysis failed."
+      visibleHintText = nil
+      isHintLoading = false
+      hintStatusText = hintService.isConfigured
+        ? "Hint unavailable until Stockfish finishes."
+        : defaultHintStatus()
     }
 
     let assessment = classifyMove(
@@ -2708,10 +3048,179 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   }
 
   private func updateAnalysisPresentation(_ analysis: StockfishAnalysis) {
-    suggestedMoveText = bestMoveDescription(from: analysis)
+    suggestedMoveText = analysis.bestMove == nil || analysis.bestMove == "(none)"
+      ? "Engine suggestion unavailable."
+      : "Engine suggestion prepared."
     whiteEvalText = "White eval: \(analysis.formattedEval(for: .white))"
     blackEvalText = "Black eval: \(analysis.formattedEval(for: .black))"
     analysisTimingText = "Last analysis: \(analysis.durationMs)ms"
+  }
+
+  private func prefetchHint(
+    for state: ChessGameState,
+    analysis: StockfishAnalysis,
+    revealWhenReady: Bool = false
+  ) {
+    guard hintService.isConfigured else {
+      visibleHintText = nil
+      isHintLoading = false
+      hintStatusText = defaultHintStatus()
+      return
+    }
+
+    guard shouldPrefetchHint(for: state) else {
+      hintTask?.cancel()
+      hintTask = nil
+      currentHintKey = nil
+      pendingHintReveal = false
+      visibleHintText = nil
+      isHintLoading = false
+      hintStatusText = "Hints wake up when it is your turn."
+      return
+    }
+
+    guard let context = makeHintContext(for: state, analysis: analysis) else {
+      visibleHintText = nil
+      isHintLoading = false
+      hintStatusText = "Hint unavailable for this position."
+      return
+    }
+
+    let key = hintKey(for: context)
+    let keyChanged = currentHintKey != key
+    if keyChanged {
+      visibleHintText = nil
+      pendingHintReveal = false
+    }
+
+    currentHintKey = key
+    pendingHintReveal = pendingHintReveal || revealWhenReady
+
+    if let cached = hintCache[key] {
+      isHintLoading = false
+      hintStatusText = "Hint ready. Tap Hint."
+      if pendingHintReveal {
+        visibleHintText = cached
+        pendingHintReveal = false
+      }
+      return
+    }
+
+    isHintLoading = true
+    hintStatusText = pendingHintReveal ? "Loading hint..." : "Preparing a playful hint..."
+
+    hintTask?.cancel()
+    hintTask = Task { [weak self] in
+      guard let self else {
+        return
+      }
+
+      do {
+        let hint = try await self.hintService.fetchHint(for: context)
+        await MainActor.run {
+          guard self.currentHintKey == key else {
+            return
+          }
+
+          self.hintTask = nil
+          self.hintCache[key] = hint
+          self.isHintLoading = false
+          self.hintStatusText = "Hint ready. Tap Hint."
+          if self.pendingHintReveal {
+            self.visibleHintText = hint
+            self.pendingHintReveal = false
+          }
+        }
+      } catch is CancellationError {
+        return
+      } catch {
+        await MainActor.run {
+          guard self.currentHintKey == key else {
+            return
+          }
+
+          self.hintTask = nil
+          self.isHintLoading = false
+          self.visibleHintText = nil
+          self.pendingHintReveal = false
+          self.hintStatusText = "Hint unavailable right now."
+        }
+      }
+    }
+  }
+
+  private func defaultHintStatus() -> String {
+    hintService.isConfigured
+      ? "Fun hints warm up in the background when it is your turn."
+      : "Set GEMINI_API_KEY in .env and rebuild to enable Gemini hints."
+  }
+
+  private func shouldPrefetchHint(for _: ChessGameState) -> Bool {
+    hintAvailabilityProvider?() ?? true
+  }
+
+  private func makeHintContext(for state: ChessGameState, analysis: StockfishAnalysis) -> GeminiHintContext? {
+    guard let bestMove = analysis.bestMove, bestMove != "(none)",
+          let move = state.move(forUCI: bestMove) else {
+      return nil
+    }
+
+    let afterState = state.applying(move)
+    return GeminiHintContext(
+      fen: state.fenString,
+      bestMove: bestMove,
+      sideToMove: state.turn,
+      movingPiece: move.piece.kind,
+      isCapture: move.captured != nil || move.isEnPassant,
+      givesCheck: afterState.isInCheck(for: afterState.turn),
+      themes: hintThemes(for: move, before: state, after: afterState)
+    )
+  }
+
+  private func hintKey(for context: GeminiHintContext) -> String {
+    context.fen + "|" + context.bestMove
+  }
+
+  private func hintThemes(
+    for move: ChessMove,
+    before: ChessGameState,
+    after: ChessGameState
+  ) -> [String] {
+    var themes: [String] = []
+
+    let centralFiles = 2...5
+    let centralRanks = 2...5
+    if centralFiles.contains(move.to.file), centralRanks.contains(move.to.rank) {
+      themes.append("fight for the center")
+    }
+
+    if move.captured != nil || move.isEnPassant {
+      themes.append("win material")
+    }
+
+    if move.rookMove != nil {
+      themes.append("improve king safety")
+    }
+
+    if [.knight, .bishop, .rook, .queen].contains(move.piece.kind),
+       before.fullmoveNumber <= 10,
+       move.captured == nil {
+      themes.append("develop a new piece")
+    }
+
+    if move.piece.kind == .pawn, abs(move.to.rank - move.from.rank) == 2 {
+      themes.append("gain space")
+    }
+
+    if after.isInCheck(for: after.turn) {
+      themes.append("pressure the enemy king")
+    }
+
+    if themes.isEmpty {
+      themes.append("improve piece activity")
+    }
+
+    return Array(Set(themes)).sorted()
   }
 
   private func bestMoveDescription(from analysis: StockfishAnalysis) -> String {
@@ -3436,9 +3945,27 @@ private struct NativeARExperienceView: View {
               .font(.system(size: 12, weight: .semibold, design: .rounded))
               .foregroundStyle(Color(red: 0.88, green: 0.82, blue: 0.70))
 
-            Text(commentary.suggestedMoveText)
+            Text(commentary.hintStatusText)
               .font(.system(size: 13, weight: .bold, design: .rounded))
               .foregroundStyle(Color.white.opacity(0.92))
+
+            if commentary.isHintLoading {
+              HStack(spacing: 10) {
+                ProgressView()
+                  .tint(Color.white.opacity(0.92))
+
+                Text("Loading hint...")
+                  .font(.system(size: 12, weight: .semibold, design: .rounded))
+                  .foregroundStyle(Color.white.opacity(0.78))
+              }
+            }
+
+            if let visibleHintText = commentary.visibleHintText {
+              Text(visibleHintText)
+                .font(.system(size: 15, weight: .semibold, design: .rounded))
+                .foregroundStyle(Color(red: 0.96, green: 0.92, blue: 0.82))
+                .lineSpacing(3)
+            }
 
             HStack(spacing: 10) {
               VStack(alignment: .leading, spacing: 4) {
@@ -3457,9 +3984,15 @@ private struct NativeARExperienceView: View {
 
               Spacer(minLength: 12)
 
-              NativeActionButton(title: "Analyze current position", style: .outline) {
-                Task {
-                  await commentary.analyzeCurrentPosition()
+              VStack(spacing: 8) {
+                NativeActionButton(title: "Hint", style: .outline) {
+                  commentary.revealHint()
+                }
+
+                NativeActionButton(title: "Analyze current position", style: .outline) {
+                  Task {
+                    await commentary.analyzeCurrentPosition()
+                  }
                 }
               }
             }
@@ -3591,6 +4124,7 @@ private struct NativeARExperienceView: View {
     .onDisappear {
       commentary.resetSession()
       commentary.unbindStateProvider()
+      commentary.unbindHintAvailabilityProvider()
       commentary.unbindReactionHandler()
       switch mode {
       case .passAndPlay(_):
@@ -3819,6 +4353,23 @@ private enum ChessPieceKind {
   case bishop
   case queen
   case king
+
+  var displayName: String {
+    switch self {
+    case .pawn:
+      return "Pawn"
+    case .rook:
+      return "Rook"
+    case .knight:
+      return "Knight"
+    case .bishop:
+      return "Bishop"
+    case .queen:
+      return "Queen"
+    case .king:
+      return "King"
+    }
+  }
 
   var fenSymbol: Character {
     switch self {
@@ -4598,6 +5149,18 @@ private struct NativeARView: UIViewRepresentable {
           }
           self.commentary.bindStateProvider { [weak self] in
             self?.gameState
+          }
+          self.commentary.bindHintAvailabilityProvider { [weak self] in
+            guard let self else {
+              return false
+            }
+
+            switch self.mode {
+            case .passAndPlay(_):
+              return true
+            case .queueMatch:
+              return self.queueAssignedColor == self.gameState.turn
+            }
           }
         }
       }

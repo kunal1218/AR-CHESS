@@ -158,6 +158,7 @@
 				13B07F871A680F5B00A75B9A /* Sources */,
 				13B07F8C1A680F5B00A75B9A /* Frameworks */,
 				13B07F8E1A680F5B00A75B9A /* Resources */,
+				F1B5E6A12F0E000100A1C001 /* Inject Gemini secrets */,
 				00DD1BFF1BD5951E006B06BC /* Bundle React Native code and images */,
 				800E24972A6A228C8D4807E9 /* [CP] Copy Pods Resources */,
 				D0EF583298F7E52BE5721B21 /* [CP] Embed Pods Frameworks */,
@@ -330,6 +331,24 @@
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
 			shellScript = "\"${PODS_ROOT}/Target Support Files/Pods-ARChess/Pods-ARChess-frameworks.sh\"\n";
+			showEnvVarsInLog = 0;
+		};
+		F1B5E6A12F0E000100A1C001 /* Inject Gemini secrets */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputPaths = (
+				"$(SRCROOT)/../.env",
+			);
+			name = "Inject Gemini secrets";
+			outputPaths = (
+				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/AppSecrets.env",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "set -eu\nROOT_ENV=\"$SRCROOT/../.env\"\nOUT_DIR=\"$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH\"\nOUT_FILE=\"$OUT_DIR/AppSecrets.env\"\nmkdir -p \"$OUT_DIR\"\n: > \"$OUT_FILE\"\n\nif [ ! -f \"$ROOT_ENV\" ]; then\n  exit 0\nfi\n\nVALUE=\"$(grep -E '^[[:space:]]*GEMINI_API_KEY=' \"$ROOT_ENV\" | tail -n 1 | cut -d= -f2- | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^\"//' -e 's/\"$//' -e \"s/^'//\" -e \"s/'$//\")\"\nif [ -n \"$VALUE\" ]; then\n  printf 'GEMINI_API_KEY=%s\\n' \"$VALUE\" > \"$OUT_FILE\"\nfi\n";
 			showEnvVarsInLog = 0;
 		};
 /* End PBXShellScriptBuildPhase section */
