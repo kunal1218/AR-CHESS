@@ -1,8 +1,10 @@
+import AVFoundation
 import ARKit
 import Foundation
 import RealityKit
 import SwiftUI
 import UIKit
+import WebKit
 import simd
 
 @UIApplicationMain
@@ -264,6 +266,673 @@ private extension URL {
   }
 }
 
+private struct StockfishAnalysis {
+  let scoreCp: Int?
+  let mateIn: Int?
+  let pv: [String]
+  let bestMove: String?
+
+  var normalizedScore: Int {
+    if let mateIn {
+      let magnitude = max(1, 100_000 - (abs(mateIn) * 1_000))
+      return mateIn >= 0 ? magnitude : -magnitude
+    }
+
+    return scoreCp ?? 0
+  }
+}
+
+private struct CachedAnalysis {
+  let fen: String
+  let analysis: StockfishAnalysis
+}
+
+private enum MoveClassification: String {
+  case brilliant
+  case good
+  case ok
+  case inaccuracy
+  case mistake
+  case blunder
+
+  var label: String {
+    rawValue.capitalized
+  }
+}
+
+private enum PersonalitySpeaker {
+  case pawn
+  case rook
+  case knight
+  case bishop
+  case queen
+  case king
+
+  var displayName: String {
+    switch self {
+    case .pawn:
+      return "Pawn"
+    case .rook:
+      return "Rook"
+    case .knight:
+      return "Knight"
+    case .bishop:
+      return "Bishop"
+    case .queen:
+      return "Queen"
+    case .king:
+      return "King"
+    }
+  }
+
+  var defaultPitch: Float {
+    switch self {
+    case .pawn:
+      return 0.94
+    case .rook:
+      return 1.72
+    case .knight:
+      return 1.46
+    case .bishop:
+      return 0.86
+    case .queen:
+      return 0.68
+    case .king:
+      return 1.28
+    }
+  }
+
+  var defaultRate: Float {
+    switch self {
+    case .pawn:
+      return 0.46
+    case .rook:
+      return 0.60
+    case .knight:
+      return 0.62
+    case .bishop:
+      return 0.38
+    case .queen:
+      return 0.30
+    case .king:
+      return 0.56
+    }
+  }
+
+  var defaultVolume: Float {
+    switch self {
+    case .pawn:
+      return 0.82
+    case .rook:
+      return 1.0
+    case .knight:
+      return 0.96
+    case .bishop:
+      return 0.88
+    case .queen:
+      return 0.92
+    case .king:
+      return 0.98
+    }
+  }
+}
+
+private struct SpokenLine {
+  let speaker: PersonalitySpeaker
+  let text: String
+  let pitch: Float?
+  let rate: Float?
+  let volume: Float?
+}
+
+private enum SpeechPriority: Int {
+  case normal
+  case urgent
+}
+
+@MainActor
+private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler {
+  private let messageHandlerName = "stockfishBridge"
+  private var webView: WKWebView?
+  private var pendingContinuations: [String: CheckedContinuation<StockfishAnalysis, Error>] = [:]
+  private var timeoutTasks: [String: Task<Void, Never>] = [:]
+  private(set) var lastError: String?
+
+  func analyze(fen: String, depth: Int = 10) async throws -> StockfishAnalysis {
+    ensureWebView()
+
+    let requestID = UUID().uuidString
+    let requestScript = """
+    window.__archessAnalyze(\(javaScriptStringLiteral(requestID)), \(javaScriptStringLiteral(fen)), \(depth));
+    """
+
+    return try await withCheckedThrowingContinuation { continuation in
+      pendingContinuations[requestID] = continuation
+      timeoutTasks[requestID] = Task { [weak self] in
+        try? await Task.sleep(nanoseconds: 12_000_000_000)
+        await MainActor.run {
+          guard let self,
+                let continuation = self.pendingContinuations.removeValue(forKey: requestID) else {
+            return
+          }
+
+          self.timeoutTasks[requestID]?.cancel()
+          self.timeoutTasks[requestID] = nil
+          self.lastError = "Stockfish request timed out."
+          continuation.resume(
+            throwing: NSError(
+              domain: "ARChess.Stockfish",
+              code: -1,
+              userInfo: [NSLocalizedDescriptionKey: "Stockfish request timed out."]
+            )
+          )
+        }
+      }
+
+      webView?.evaluateJavaScript(requestScript) { [weak self] _, error in
+        guard let self, let error else {
+          return
+        }
+
+        guard let continuation = self.pendingContinuations.removeValue(forKey: requestID) else {
+          return
+        }
+
+        self.timeoutTasks[requestID]?.cancel()
+        self.timeoutTasks[requestID] = nil
+        self.lastError = error.localizedDescription
+        continuation.resume(throwing: error)
+      }
+    }
+  }
+
+  func reset() {
+    lastError = nil
+  }
+
+  func userContentController(
+    _ userContentController: WKUserContentController,
+    didReceive message: WKScriptMessage
+  ) {
+    guard message.name == messageHandlerName,
+          let payload = message.body as? [String: Any],
+          let type = payload["type"] as? String else {
+      return
+    }
+
+    switch type {
+    case "ready":
+      lastError = nil
+    case "error":
+      lastError = payload["message"] as? String
+    case "result":
+      guard let requestID = payload["id"] as? String,
+            let continuation = pendingContinuations.removeValue(forKey: requestID) else {
+        return
+      }
+
+      timeoutTasks[requestID]?.cancel()
+      timeoutTasks[requestID] = nil
+
+      continuation.resume(
+        returning: StockfishAnalysis(
+          scoreCp: payload["scoreCp"] as? Int,
+          mateIn: payload["mateIn"] as? Int,
+          pv: payload["pv"] as? [String] ?? [],
+          bestMove: payload["bestMove"] as? String
+        )
+      )
+    default:
+      return
+    }
+  }
+
+  private func ensureWebView() {
+    guard webView == nil else {
+      return
+    }
+
+    let userContentController = WKUserContentController()
+    userContentController.add(self, name: messageHandlerName)
+
+    let configuration = WKWebViewConfiguration()
+    configuration.userContentController = userContentController
+    configuration.defaultWebpagePreferences.allowsContentJavaScript = true
+
+    let webView = WKWebView(frame: .zero, configuration: configuration)
+    webView.isHidden = true
+    webView.loadHTMLString(
+      Self.stockfishBridgeHTML(messageHandlerName: messageHandlerName),
+      baseURL: URL(string: "https://unpkg.com")
+    )
+    self.webView = webView
+  }
+
+  private func javaScriptStringLiteral(_ value: String) -> String {
+    let data = try? JSONSerialization.data(withJSONObject: [value])
+    let json = String(data: data ?? Data("[]".utf8), encoding: .utf8) ?? "[\"\"]"
+    return String(json.dropFirst().dropLast())
+  }
+
+  private static func stockfishBridgeHTML(messageHandlerName: String) -> String {
+    """
+    <!doctype html>
+    <html>
+      <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <script>
+          const bridgeState = {
+            ready: false,
+            engine: null,
+            queue: [],
+            current: null,
+          };
+
+          function bridgePost(payload) {
+            if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.\(messageHandlerName)) {
+              window.webkit.messageHandlers.\(messageHandlerName).postMessage(payload);
+            }
+          }
+
+          function bootStockfish() {
+            const script = document.createElement('script');
+            script.src = 'https://unpkg.com/stockfish@16.0.0/src/stockfish-nnue-16-single.js';
+            script.async = true;
+            script.onload = async () => {
+              try {
+                const factory = script._exports || window.STOCKFISH || window.Stockfish || window.stockfish;
+                if (!factory) {
+                  bridgePost({ type: 'error', message: 'Stockfish factory missing in bridge.' });
+                  return;
+                }
+
+                const engine = await factory();
+                bridgeState.engine = engine;
+                if (typeof engine.addMessageListener === 'function') {
+                  engine.addMessageListener(handleEngineLine);
+                } else if (typeof engine.onmessage !== 'undefined') {
+                  engine.onmessage = handleEngineLine;
+                } else {
+                  bridgePost({ type: 'error', message: 'Stockfish engine listener API missing.' });
+                  return;
+                }
+                engine.postMessage('uci');
+                engine.postMessage('isready');
+              } catch (error) {
+                bridgePost({ type: 'error', message: String(error) });
+              }
+            };
+            script.onerror = () => {
+              bridgePost({ type: 'error', message: 'Failed to load Stockfish WASM bridge.' });
+            };
+            document.head.appendChild(script);
+          }
+
+          function handleEngineLine(line) {
+            line = String(line);
+
+            if (line === 'readyok') {
+              bridgeState.ready = true;
+              bridgePost({ type: 'ready' });
+              drainAnalysisQueue();
+              return;
+            }
+
+            if (!bridgeState.current) {
+              return;
+            }
+
+            const state = bridgeState.current;
+            const cpMatch = line.match(/score cp (-?\\d+)/);
+            if (cpMatch) {
+              state.scoreCp = parseInt(cpMatch[1], 10);
+              state.mateIn = null;
+            }
+
+            const mateMatch = line.match(/score mate (-?\\d+)/);
+            if (mateMatch) {
+              state.mateIn = parseInt(mateMatch[1], 10);
+              state.scoreCp = null;
+            }
+
+            const pvMatch = line.match(/\\spv\\s(.+)/);
+            if (pvMatch) {
+              state.pv = pvMatch[1].trim().split(/\\s+/).filter(Boolean);
+            }
+
+            if (line.startsWith('bestmove ')) {
+              const parts = line.trim().split(/\\s+/);
+              bridgePost({
+                type: 'result',
+                id: state.id,
+                scoreCp: state.scoreCp,
+                mateIn: state.mateIn,
+                pv: state.pv || [],
+                bestMove: parts[1] || null,
+              });
+              bridgeState.current = null;
+              drainAnalysisQueue();
+            }
+          }
+
+          function drainAnalysisQueue() {
+            if (!bridgeState.ready || bridgeState.current || !bridgeState.engine || bridgeState.queue.length === 0) {
+              return;
+            }
+
+            const next = bridgeState.queue.shift();
+            bridgeState.current = {
+              id: next.id,
+              scoreCp: null,
+              mateIn: null,
+              pv: [],
+            };
+
+            bridgeState.engine.postMessage('stop');
+            bridgeState.engine.postMessage('ucinewgame');
+            bridgeState.engine.postMessage('position fen ' + next.fen);
+            bridgeState.engine.postMessage('go depth ' + next.depth);
+          }
+
+          window.__archessAnalyze = function(id, fen, depth) {
+            bridgeState.queue.push({ id, fen, depth });
+            drainAnalysisQueue();
+            return true;
+          };
+
+          bootStockfish();
+        </script>
+      </head>
+      <body></body>
+    </html>
+    """
+  }
+}
+
+@MainActor
+private final class PiecePersonalityDirector: NSObject, ObservableObject, @preconcurrency AVSpeechSynthesizerDelegate {
+  struct Caption {
+    let speaker: String
+    let line: String
+  }
+
+  @Published private(set) var caption: Caption?
+  @Published private(set) var analysisStatus = "Stockfish depth 10 warming up..."
+  @Published private(set) var latestAssessment = "Waiting for initial analysis."
+
+  private let analyzer = StockfishWASMAnalyzer()
+  private let synthesizer = AVSpeechSynthesizer()
+  private var utteranceCaptions: [ObjectIdentifier: Caption] = [:]
+  private var cachedAnalysis: CachedAnalysis?
+
+  override init() {
+    super.init()
+    synthesizer.delegate = self
+  }
+
+  func prepare(with state: ChessGameState) async {
+    let fen = state.fenString
+    guard cachedAnalysis?.fen != fen else {
+      return
+    }
+
+    do {
+      let analysis = try await analyzer.analyze(fen: fen, depth: 10)
+      cachedAnalysis = CachedAnalysis(fen: fen, analysis: analysis)
+      analysisStatus = "Stockfish depth 10 ready."
+      latestAssessment = "Prep eval: \(describe(analysis: analysis, moverColor: state.turn))."
+    } catch {
+      analysisStatus = "Stockfish unavailable. Falling back to local board events."
+      latestAssessment = "Local commentary only."
+    }
+  }
+
+  func resetSession() {
+    synthesizer.stopSpeaking(at: .immediate)
+    utteranceCaptions.removeAll()
+    caption = nil
+    cachedAnalysis = nil
+    analyzer.reset()
+    analysisStatus = "Stockfish depth 10 warming up..."
+    latestAssessment = "Waiting for initial analysis."
+  }
+
+  func handleMove(
+    move: ChessMove,
+    before beforeState: ChessGameState,
+    after afterState: ChessGameState
+  ) async {
+    let beforeAnalysis = await analysisForCurrentTurn(state: beforeState)
+    let afterAnalysis = await analysisForCurrentTurn(state: afterState)
+
+    if let afterAnalysis {
+      cachedAnalysis = CachedAnalysis(fen: afterState.fenString, analysis: afterAnalysis)
+      analysisStatus = "Stockfish depth 10 live."
+    } else if analyzer.lastError != nil {
+      analysisStatus = "Stockfish unavailable. Falling back to local board events."
+    }
+
+    let assessment = classifyMove(
+      before: beforeAnalysis,
+      after: afterAnalysis,
+      moverColor: beforeState.turn
+    )
+
+    if let assessment {
+      latestAssessment = "\(assessment.label): \(swingDescription(before: beforeAnalysis, after: afterAnalysis, moverColor: beforeState.turn))"
+    } else {
+      latestAssessment = "Local event commentary only."
+    }
+
+    if let assessment {
+      speak(lines: lines(for: assessment), priority: .normal)
+    }
+
+    if let captured = move.captured {
+      speak(lines: captureLines(for: captured.kind), priority: .urgent)
+    }
+
+    if afterState.isCheckmate(for: afterState.turn) {
+      latestAssessment = "Checkmate."
+      speak(lines: checkmateLines(), priority: .urgent)
+      return
+    }
+
+    if afterState.isInCheck(for: afterState.turn) {
+      latestAssessment = "Check."
+      speak(lines: checkLines(), priority: .urgent)
+    }
+  }
+
+  func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didStart utterance: AVSpeechUtterance) {
+    caption = utteranceCaptions[ObjectIdentifier(utterance)]
+  }
+
+  func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
+    utteranceCaptions[ObjectIdentifier(utterance)] = nil
+    if !synthesizer.isSpeaking {
+      caption = nil
+    }
+  }
+
+  func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
+    utteranceCaptions[ObjectIdentifier(utterance)] = nil
+    if !synthesizer.isSpeaking {
+      caption = nil
+    }
+  }
+
+  private func analysisForCurrentTurn(state: ChessGameState) async -> StockfishAnalysis? {
+    let fen = state.fenString
+
+    if cachedAnalysis?.fen == fen {
+      return cachedAnalysis?.analysis
+    }
+
+    do {
+      let analysis = try await analyzer.analyze(fen: fen, depth: 10)
+      cachedAnalysis = CachedAnalysis(fen: fen, analysis: analysis)
+      return analysis
+    } catch {
+      return nil
+    }
+  }
+
+  private func classifyMove(
+    before: StockfishAnalysis?,
+    after: StockfishAnalysis?,
+    moverColor: ChessColor
+  ) -> MoveClassification? {
+    guard let before, let after else {
+      return nil
+    }
+
+    let beforeScore = scoreForMoverPerspective(before, moverColor: moverColor, isPostMove: false)
+    let afterScore = scoreForMoverPerspective(after, moverColor: moverColor, isPostMove: true)
+    let swing = afterScore - beforeScore
+
+    switch swing {
+    case 160...:
+      return .brilliant
+    case 45...:
+      return .good
+    case -44...44:
+      return .ok
+    case -139 ... -45:
+      return .inaccuracy
+    case -299 ... -140:
+      return .mistake
+    default:
+      return .blunder
+    }
+  }
+
+  private func swingDescription(
+    before: StockfishAnalysis?,
+    after: StockfishAnalysis?,
+    moverColor: ChessColor
+  ) -> String {
+    guard let before, let after else {
+      return "Stockfish unavailable"
+    }
+
+    let beforeScore = scoreForMoverPerspective(before, moverColor: moverColor, isPostMove: false)
+    let afterScore = scoreForMoverPerspective(after, moverColor: moverColor, isPostMove: true)
+    let swing = afterScore - beforeScore
+    let sign = swing >= 0 ? "+" : ""
+    return "\(sign)\(swing) cp swing"
+  }
+
+  private func scoreForMoverPerspective(_ analysis: StockfishAnalysis, moverColor: ChessColor, isPostMove: Bool) -> Int {
+    let sideToMoveScore = analysis.normalizedScore
+    _ = moverColor
+    if isPostMove {
+      return -sideToMoveScore
+    }
+
+    return sideToMoveScore
+  }
+
+  private func describe(analysis: StockfishAnalysis, moverColor: ChessColor) -> String {
+    if let mateIn = analysis.mateIn {
+      return moverColor == .white
+        ? "mate \(mateIn)"
+        : "mate \(mateIn)"
+    }
+
+    let cp = analysis.scoreCp ?? 0
+    return "\(cp) cp"
+  }
+
+  private func lines(for classification: MoveClassification) -> [SpokenLine] {
+    switch classification {
+    case .brilliant:
+      return [
+        SpokenLine(speaker: .knight, text: "THAT was disgusting. I am unreal.", pitch: 1.52, rate: 0.64, volume: 0.98),
+        SpokenLine(speaker: .queen, text: "Yes. Naturally. My influence.", pitch: 0.62, rate: 0.28, volume: 0.95),
+      ]
+    case .good:
+      return [
+        SpokenLine(speaker: .knight, text: "We are so back. That move was clean.", pitch: 1.42, rate: 0.60, volume: 0.96),
+        SpokenLine(speaker: .queen, text: "A good move. Exactly as I intended.", pitch: 0.68, rate: 0.30, volume: 0.92),
+      ]
+    case .ok:
+      return [
+        SpokenLine(speaker: .pawn, text: "solid enough. we move.", pitch: 0.96, rate: 0.45, volume: 0.82),
+      ]
+    case .inaccuracy:
+      return [
+        SpokenLine(speaker: .bishop, text: "mmm. not ideal. but continue.", pitch: 0.84, rate: 0.38, volume: 0.88),
+      ]
+    case .mistake:
+      return [
+        SpokenLine(speaker: .bishop, text: "did you even look at the board", pitch: 0.74, rate: 0.31, volume: 0.92),
+      ]
+    case .blunder:
+      return [
+        SpokenLine(speaker: .bishop, text: "did you even look at the board", pitch: 0.70, rate: 0.27, volume: 0.96),
+      ]
+    }
+  }
+
+  private func captureLines(for kind: ChessPieceKind) -> [SpokenLine] {
+    switch kind {
+    case .rook:
+      return [SpokenLine(speaker: .rook, text: "NOOOOO WHY", pitch: 1.85, rate: 0.64, volume: 1.0)]
+    case .queen:
+      return [SpokenLine(speaker: .queen, text: "how... dare... you", pitch: 0.62, rate: 0.22, volume: 0.95)]
+    case .bishop:
+      return [SpokenLine(speaker: .bishop, text: "well. I suppose that is what happens", pitch: 0.88, rate: 0.38, volume: 0.88)]
+    case .knight:
+      return [SpokenLine(speaker: .knight, text: "bruh bruh bruh BRUH", pitch: 1.48, rate: 0.66, volume: 0.96)]
+    case .pawn:
+      return [SpokenLine(speaker: .pawn, text: "tell them I pushed with honor", pitch: 0.96, rate: 0.43, volume: 0.86)]
+    case .king:
+      return [SpokenLine(speaker: .king, text: "i should not be capturable. this is concerning.", pitch: 1.10, rate: 0.36, volume: 0.94)]
+    }
+  }
+
+  private func checkLines() -> [SpokenLine] {
+    [
+      SpokenLine(speaker: .king, text: "WAIT WAIT WAIT IM IN CHECK", pitch: 1.66, rate: 0.60, volume: 1.0),
+    ]
+  }
+
+  private func checkmateLines() -> [SpokenLine] {
+    [
+      SpokenLine(speaker: .king, text: "no. no no no.", pitch: 1.22, rate: 0.34, volume: 1.0),
+      SpokenLine(speaker: .king, text: "so this... is how my kingdom ends.", pitch: 0.96, rate: 0.28, volume: 0.94),
+      SpokenLine(speaker: .king, text: "remember me as majestic.", pitch: 0.72, rate: 0.22, volume: 0.88),
+    ]
+  }
+
+  private func speak(lines: [SpokenLine], priority: SpeechPriority) {
+    guard !lines.isEmpty else {
+      return
+    }
+
+    if priority == .urgent {
+      _ = synthesizer.stopSpeaking(at: .immediate)
+      utteranceCaptions.removeAll()
+    }
+
+    for line in lines {
+      let utterance = AVSpeechUtterance(string: line.text)
+      utterance.voice = AVSpeechSynthesisVoice(language: "en-US")
+      utterance.pitchMultiplier = min(max(line.pitch ?? line.speaker.defaultPitch, 0.5), 2.0)
+      utterance.rate = min(max(line.rate ?? line.speaker.defaultRate, 0.1), 0.65)
+      utterance.volume = min(max(line.volume ?? line.speaker.defaultVolume, 0.0), 1.0)
+      utterance.preUtteranceDelay = 0.02
+      utteranceCaptions[ObjectIdentifier(utterance)] = Caption(
+        speaker: line.speaker.displayName,
+        line: line.text
+      )
+      synthesizer.speak(utterance)
+    }
+  }
+}
+
 private struct ARChessRootView: View {
   @State private var screen: NativeScreen = .landing
 
@@ -433,10 +1102,11 @@ private struct NativeARExperienceView: View {
   let mode: PlayerMode
   let closeExperience: () -> Void
   @StateObject private var matchLog = MatchLogStore()
+  @StateObject private var commentary = PiecePersonalityDirector()
 
   var body: some View {
     ZStack {
-      NativeARView(matchLog: matchLog)
+      NativeARView(matchLog: matchLog, commentary: commentary)
         .ignoresSafeArea()
 
       LinearGradient(
@@ -466,6 +1136,10 @@ private struct NativeARExperienceView: View {
             .font(.system(size: 15, weight: .medium, design: .rounded))
             .foregroundStyle(Color.white.opacity(0.86))
             .lineSpacing(3)
+
+          Text(commentary.analysisStatus)
+            .font(.system(size: 12, weight: .semibold, design: .rounded))
+            .foregroundStyle(Color(red: 0.88, green: 0.82, blue: 0.70))
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(18)
@@ -477,6 +1151,32 @@ private struct NativeARExperienceView: View {
 
         Spacer()
 
+        if let caption = commentary.caption {
+          VStack(alignment: .leading, spacing: 6) {
+            Text(caption.speaker)
+              .font(.system(size: 12, weight: .bold, design: .rounded))
+              .tracking(1.8)
+              .foregroundStyle(Color(red: 0.95, green: 0.88, blue: 0.74))
+
+            Text(caption.line)
+              .font(.system(size: 17, weight: .bold, design: .rounded))
+              .foregroundStyle(.white)
+              .lineSpacing(2)
+          }
+          .frame(maxWidth: .infinity, alignment: .leading)
+          .padding(16)
+          .background(
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+              .fill(Color(red: 0.08, green: 0.10, blue: 0.15).opacity(0.88))
+              .overlay(
+                RoundedRectangle(cornerRadius: 22, style: .continuous)
+                  .stroke(Color.white.opacity(0.12), lineWidth: 1)
+              )
+          )
+          .allowsHitTesting(false)
+          .transition(.move(edge: .bottom).combined(with: .opacity))
+        }
+
         ZStack(alignment: .bottom) {
           VStack(alignment: .leading, spacing: 10) {
             Text("Match log")
@@ -487,6 +1187,10 @@ private struct NativeARExperienceView: View {
             Text(matchLog.syncStatus)
               .font(.system(size: 15, weight: .medium, design: .rounded))
               .foregroundStyle(Color.white.opacity(0.86))
+
+            Text(commentary.latestAssessment)
+              .font(.system(size: 13, weight: .semibold, design: .rounded))
+              .foregroundStyle(Color.white.opacity(0.70))
 
             if let remoteGameID = matchLog.remoteGameID {
               Text("Game ID: \(remoteGameID)")
@@ -544,9 +1248,11 @@ private struct NativeARExperienceView: View {
       .padding(.vertical, 24)
     }
     .task {
+      await commentary.prepare(with: ChessGameState.initial())
       await matchLog.prepareRemoteGameIfNeeded()
     }
     .onDisappear {
+      commentary.resetSession()
       matchLog.resetSession()
     }
   }
@@ -663,6 +1369,15 @@ private enum ChessColor {
       return .white
     }
   }
+
+  var fenSymbol: String {
+    switch self {
+    case .white:
+      return "w"
+    case .black:
+      return "b"
+    }
+  }
 }
 
 private enum ChessPieceKind {
@@ -672,6 +1387,23 @@ private enum ChessPieceKind {
   case bishop
   case queen
   case king
+
+  var fenSymbol: Character {
+    switch self {
+    case .pawn:
+      return "p"
+    case .rook:
+      return "r"
+    case .knight:
+      return "n"
+    case .bishop:
+      return "b"
+    case .queen:
+      return "q"
+    case .king:
+      return "k"
+    }
+  }
 }
 
 private struct BoardSquare: Hashable {
@@ -742,6 +1474,8 @@ private struct ChessGameState {
   var turn: ChessColor
   var castlingRights: CastlingRights
   var enPassantTarget: BoardSquare?
+  var halfmoveClock: Int
+  var fullmoveNumber: Int
 
   static func initial() -> ChessGameState {
     let backRank: [ChessPieceKind] = [.rook, .knight, .bishop, .queen, .king, .bishop, .knight, .rook]
@@ -758,8 +1492,61 @@ private struct ChessGameState {
       board: board,
       turn: .white,
       castlingRights: CastlingRights(),
-      enPassantTarget: nil
+      enPassantTarget: nil,
+      halfmoveClock: 0,
+      fullmoveNumber: 1
     )
+  }
+
+  var fenString: String {
+    let boardField = (0..<8).reversed().map { rank -> String in
+      var row = ""
+      var emptyCount = 0
+
+      for file in 0..<8 {
+        let square = BoardSquare(file: file, rank: rank)
+        if let piece = board[square] {
+          if emptyCount > 0 {
+            row.append(String(emptyCount))
+            emptyCount = 0
+          }
+
+          let symbol = piece.kind.fenSymbol
+          row.append(piece.color == .white ? Character(String(symbol).uppercased()) : symbol)
+        } else {
+          emptyCount += 1
+        }
+      }
+
+      if emptyCount > 0 {
+        row.append(String(emptyCount))
+      }
+
+      return row
+    }.joined(separator: "/")
+
+    let castlingField = castlingFieldString
+    let enPassantField = enPassantTarget?.algebraic ?? "-"
+    return "\(boardField) \(turn.fenSymbol) \(castlingField) \(enPassantField) \(halfmoveClock) \(fullmoveNumber)"
+  }
+
+  private var castlingFieldString: String {
+    var field = ""
+
+    if castlingRights.whiteKingside {
+      field.append("K")
+    }
+    if castlingRights.whiteQueenside {
+      field.append("Q")
+    }
+    if castlingRights.blackKingside {
+      field.append("k")
+    }
+    if castlingRights.blackQueenside {
+      field.append("q")
+    }
+
+    return field.isEmpty ? "-" : field
   }
 
   func piece(at square: BoardSquare) -> ChessPieceState? {
@@ -778,6 +1565,20 @@ private struct ChessGameState {
 
   func legalMove(from: BoardSquare, to: BoardSquare) -> ChessMove? {
     legalMoves(from: from).first { $0.to == to }
+  }
+
+  func hasLegalMoves(for color: ChessColor) -> Bool {
+    for (square, piece) in board where piece.color == color {
+      if !legalMoves(from: square, for: color).isEmpty {
+        return true
+      }
+    }
+
+    return false
+  }
+
+  func isCheckmate(for color: ChessColor) -> Bool {
+    isInCheck(for: color) && !hasLegalMoves(for: color)
   }
 
   func applying(_ move: ChessMove) -> ChessGameState {
@@ -804,6 +1605,7 @@ private struct ChessGameState {
 
     next.board[move.to] = movingPiece
     next.enPassantTarget = nil
+    next.halfmoveClock = (move.piece.kind == .pawn || move.captured != nil) ? 0 : (halfmoveClock + 1)
 
     if move.piece.kind == .pawn, abs(move.to.rank - move.from.rank) == 2 {
       next.enPassantTarget = BoardSquare(file: move.from.file, rank: (move.from.rank + move.to.rank) / 2)
@@ -811,6 +1613,7 @@ private struct ChessGameState {
 
     next.updateCastlingRights(for: move)
     next.turn = turn.opponent
+    next.fullmoveNumber = fullmoveNumber + (turn == .black ? 1 : 0)
     return next
   }
 
@@ -820,6 +1623,16 @@ private struct ChessGameState {
     }
 
     return isSquareAttacked(kingSquare, by: color.opponent)
+  }
+
+  private func legalMoves(from square: BoardSquare, for color: ChessColor) -> [ChessMove] {
+    guard let piece = board[square], piece.color == color else {
+      return []
+    }
+
+    return pseudoLegalMoves(from: square, piece: piece).filter { move in
+      !applying(move).isInCheck(for: color)
+    }
   }
 
   private func pseudoLegalMoves(from square: BoardSquare, piece: ChessPieceState) -> [ChessMove] {
@@ -1175,9 +1988,10 @@ private struct ChessGameState {
 
 private struct NativeARView: UIViewRepresentable {
   @ObservedObject var matchLog: MatchLogStore
+  @ObservedObject var commentary: PiecePersonalityDirector
 
   func makeCoordinator() -> Coordinator {
-    Coordinator(matchLog: matchLog)
+    Coordinator(matchLog: matchLog, commentary: commentary)
   }
 
   func makeUIView(context: Context) -> ARView {
@@ -1192,6 +2006,7 @@ private struct NativeARView: UIViewRepresentable {
     private let boardSize: Float = 0.40
     private let boardInset: Float = 0.08
     private let matchLog: MatchLogStore
+    private let commentary: PiecePersonalityDirector
     private weak var arView: ARView?
     private var boardAnchor: AnchorEntity?
     private var boardWorldTransform: simd_float4x4?
@@ -1203,8 +2018,9 @@ private struct NativeARView: UIViewRepresentable {
     private var selectedSquare: BoardSquare?
     private var selectedMoves: [ChessMove] = []
 
-    init(matchLog: MatchLogStore) {
+    init(matchLog: MatchLogStore, commentary: PiecePersonalityDirector) {
       self.matchLog = matchLog
+      self.commentary = commentary
     }
 
     func configure(_ arView: ARView) {
@@ -1393,12 +2209,15 @@ private struct NativeARView: UIViewRepresentable {
 
     private func apply(_ move: ChessMove) {
       let movingColor = gameState.turn
-      gameState = gameState.applying(move)
+      let beforeState = gameState
+      let afterState = gameState.applying(move)
+      gameState = afterState
       selectedSquare = nil
       selectedMoves = []
       refreshBoardPresentation()
       Task { @MainActor in
         matchLog.recordMove(move.uciString, color: movingColor)
+        await commentary.handleMove(move: move, before: beforeState, after: afterState)
       }
     }
 
