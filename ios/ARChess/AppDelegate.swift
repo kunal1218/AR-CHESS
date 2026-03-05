@@ -81,12 +81,10 @@ private enum NativeScreen {
 
 private struct AppRuntimeConfig {
   let apiBaseURL: URL?
-  let geminiAPIKey: String?
 
   static let current = AppRuntimeConfig()
 
   init() {
-    let bundledSecrets = Self.loadBundledSecrets()
     let sources = [
       Bundle.main.object(forInfoDictionaryKey: "ARChessAPIBaseURL") as? String,
       ProcessInfo.processInfo.environment["AR_CHESS_API_BASE_URL"],
@@ -108,97 +106,40 @@ private struct AppRuntimeConfig {
     }
 
     apiBaseURL = resolvedAPIBaseURL
-
-    let geminiSources = [
-      bundledSecrets["GEMINI_API_KEY"],
-      Bundle.main.object(forInfoDictionaryKey: "ARChessGeminiAPIKey") as? String,
-      ProcessInfo.processInfo.environment["GEMINI_API_KEY"],
-    ]
-
-    geminiAPIKey = geminiSources
-      .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
-      .first(where: { !$0.isEmpty })
-  }
-
-  private static func loadBundledSecrets() -> [String: String] {
-    guard let url = Bundle.main.url(forResource: "AppSecrets", withExtension: "env"),
-          let raw = try? String(contentsOf: url, encoding: .utf8) else {
-      return [:]
-    }
-
-    var values: [String: String] = [:]
-    for line in raw.split(whereSeparator: \.isNewline) {
-      let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-      guard !trimmed.isEmpty, !trimmed.hasPrefix("#"), let separatorIndex = trimmed.firstIndex(of: "=") else {
-        continue
-      }
-
-      let key = String(trimmed[..<separatorIndex]).trimmingCharacters(in: .whitespacesAndNewlines)
-      var value = String(trimmed[trimmed.index(after: separatorIndex)...]).trimmingCharacters(in: .whitespacesAndNewlines)
-      if value.hasPrefix("\""), value.hasSuffix("\""), value.count >= 2 {
-        value.removeFirst()
-        value.removeLast()
-      } else if value.hasPrefix("'"), value.hasSuffix("'"), value.count >= 2 {
-        value.removeFirst()
-        value.removeLast()
-      }
-
-      values[key] = value
-    }
-
-    return values
   }
 }
 
 private struct GeminiHintRequestPayload: Encodable {
-  struct Content: Encodable {
-    struct Part: Encodable {
-      let text: String
-    }
-
-    let parts: [Part]
-  }
-
-  struct GenerationConfig: Encodable {
-    let temperature: Double
-    let topP: Double
-    let topK: Int
-    let maxOutputTokens: Int
-  }
-
-  let contents: [Content]
-  let generationConfig: GenerationConfig
-
-  init(prompt: String) {
-    contents = [Content(parts: [Content.Part(text: prompt)])]
-    generationConfig = GenerationConfig(
-      temperature: 0.95,
-      topP: 0.9,
-      topK: 32,
-      maxOutputTokens: 48
-    )
-  }
+  let fen: String
+  let recent_history: String?
+  let best_move: String
+  let side_to_move: String
+  let moving_piece: String?
+  let is_capture: Bool
+  let gives_check: Bool
+  let themes: [String]
 }
 
 private struct GeminiHintResponsePayload: Decodable {
-  struct Candidate: Decodable {
-    struct Content: Decodable {
-      struct Part: Decodable {
-        let text: String?
-      }
+  let hint: String
+}
 
-      let parts: [Part]?
-    }
-
-    let content: Content?
-    let finishReason: String?
+private struct GeminiLiveStatusPayload: Decodable, Equatable {
+  enum ConnectionState: String, Decodable {
+    case disconnected = "DISCONNECTED"
+    case connecting = "CONNECTING"
+    case connected = "CONNECTED"
+    case error = "ERROR"
   }
 
-  let candidates: [Candidate]?
+  let state: ConnectionState
+  let lastError: String?
+  let since: String?
 }
 
 private struct GeminiHintContext {
   let fen: String
+  let recentHistory: String?
   let bestMove: String
   let sideToMove: ChessColor
   let movingPiece: ChessPieceKind?
@@ -210,52 +151,52 @@ private struct GeminiHintContext {
 private final class GeminiHintService {
   private static let logger = Logger(subsystem: "ARChess", category: "GeminiHint")
 
-  private let apiKey: String?
+  private let apiBaseURL: URL?
   private let session: URLSession
-  private let modelName: String
 
   init(
-    apiKey: String? = AppRuntimeConfig.current.geminiAPIKey,
-    modelName: String = "gemini-2.0-flash",
+    apiBaseURL: URL? = AppRuntimeConfig.current.apiBaseURL,
     session: URLSession = .shared
   ) {
-    self.apiKey = apiKey
-    self.modelName = modelName
+    self.apiBaseURL = apiBaseURL
     self.session = session
   }
 
   var isConfigured: Bool {
-    guard let apiKey else {
-      return false
-    }
-
-    return !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    apiBaseURL != nil
   }
 
   func fetchHint(for context: GeminiHintContext) async throws -> String {
-    guard let apiKey, !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+    guard let baseURL = apiBaseURL else {
       throw NSError(
         domain: "ARChess.GeminiHint",
         code: -1001,
-        userInfo: [NSLocalizedDescriptionKey: "Gemini hints are disabled until GEMINI_API_KEY is set in .env and the app is rebuilt."]
+        userInfo: [NSLocalizedDescriptionKey: "Gemini hints are disabled until ARChessAPIBaseURL is configured."]
       )
     }
 
-    guard let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/\(modelName):generateContent") else {
-      throw NSError(
-        domain: "ARChess.GeminiHint",
-        code: -1002,
-        userInfo: [NSLocalizedDescriptionKey: "Could not build the Gemini API URL."]
-      )
-    }
-
-    var request = URLRequest(url: url)
+    var request = URLRequest(
+      url: baseURL
+        .appendingPathComponent("v1")
+        .appendingPathComponent("gemini")
+        .appendingPathComponent("hint")
+    )
     request.httpMethod = "POST"
-    request.timeoutInterval = 4.0
+    request.timeoutInterval = 8.0
     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
     request.setValue("application/json", forHTTPHeaderField: "Accept")
-    request.setValue(apiKey, forHTTPHeaderField: "x-goog-api-key")
-    request.httpBody = try JSONEncoder().encode(GeminiHintRequestPayload(prompt: prompt(for: context)))
+    request.httpBody = try JSONEncoder().encode(
+      GeminiHintRequestPayload(
+        fen: context.fen,
+        recent_history: context.recentHistory,
+        best_move: context.bestMove,
+        side_to_move: context.sideToMove.displayName.lowercased(),
+        moving_piece: context.movingPiece?.displayName.lowercased(),
+        is_capture: context.isCapture,
+        gives_check: context.givesCheck,
+        themes: context.themes
+      )
+    )
 
     let startedAt = Date()
     let (data, response) = try await session.data(for: request)
@@ -270,7 +211,7 @@ private final class GeminiHintService {
 
     guard (200..<300).contains(httpResponse.statusCode) else {
       let message = String(data: data, encoding: .utf8) ?? "Unexpected Gemini response."
-      Self.logger.error("Gemini hint request failed status=\(httpResponse.statusCode, privacy: .public) duration_ms=\(durationMs, privacy: .public)")
+      Self.logger.error("Gemini backend hint request failed status=\(httpResponse.statusCode, privacy: .public) duration_ms=\(durationMs, privacy: .public)")
       throw NSError(
         domain: "ARChess.GeminiHint",
         code: httpResponse.statusCode,
@@ -279,44 +220,58 @@ private final class GeminiHintService {
     }
 
     let payload = try JSONDecoder().decode(GeminiHintResponsePayload.self, from: data)
-    let rawText = payload.candidates?
-      .compactMap { $0.content?.parts?.compactMap(\.text).joined(separator: " ") }
-      .first(where: { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty })
-
-    guard let rawText else {
+    let rawText = payload.hint.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !rawText.isEmpty else {
       throw NSError(
         domain: "ARChess.GeminiHint",
         code: -1004,
-        userInfo: [NSLocalizedDescriptionKey: "Gemini returned no hint text."]
+        userInfo: [NSLocalizedDescriptionKey: "Gemini backend returned no hint text."]
       )
     }
 
     let sanitized = sanitize(rawText, fallback: fallbackHint(for: context))
-    Self.logger.info("Gemini hint ready duration_ms=\(durationMs, privacy: .public) model=\(self.modelName, privacy: .public)")
+    Self.logger.info("Gemini hint ready via backend duration_ms=\(durationMs, privacy: .public)")
     return sanitized
   }
 
-  private func prompt(for context: GeminiHintContext) -> String {
-    let pieceName = context.movingPiece?.displayName.lowercased() ?? "piece"
-    let captureText = context.isCapture ? "yes" : "no"
-    let checkText = context.givesCheck ? "yes" : "no"
-    let themes = context.themes.isEmpty ? "general activity" : context.themes.joined(separator: ", ")
+  func fetchConnectionStatus() async throws -> GeminiLiveStatusPayload {
+    guard let baseURL = apiBaseURL else {
+      throw NSError(
+        domain: "ARChess.GeminiHint",
+        code: -1005,
+        userInfo: [NSLocalizedDescriptionKey: "Gemini hints are disabled until ARChessAPIBaseURL is configured."]
+      )
+    }
 
-    return """
-    You write one short, fun, creative, beginner-friendly chess hint.
-    Never mention board squares, coordinates, algebraic notation, or the raw move text.
-    Never say files, ranks, e2e4, d2d4, or any square names.
-    Keep it to one sentence, around 6 to 14 words.
-    Make it playful and helpful, like a coach whispering a vibe.
-    Return plain text only.
+    var request = URLRequest(
+      url: baseURL
+        .appendingPathComponent("v1")
+        .appendingPathComponent("gemini")
+        .appendingPathComponent("status")
+    )
+    request.httpMethod = "GET"
+    request.timeoutInterval = 3.0
+    request.setValue("application/json", forHTTPHeaderField: "Accept")
 
-    Side to move: \(context.sideToMove.displayName)
-    Suggested move text: \(context.bestMove)
-    Moving piece: \(pieceName)
-    Is capture: \(captureText)
-    Gives check: \(checkText)
-    Themes: \(themes)
-    """
+    let (data, response) = try await session.data(for: request)
+    guard let httpResponse = response as? HTTPURLResponse else {
+      throw NSError(
+        domain: "ARChess.GeminiHint",
+        code: -1006,
+        userInfo: [NSLocalizedDescriptionKey: "Gemini status endpoint did not return HTTP."]
+      )
+    }
+
+    guard (200..<300).contains(httpResponse.statusCode) else {
+      let message = String(data: data, encoding: .utf8) ?? "Unexpected Gemini status response."
+      throw NSError(
+        domain: "ARChess.GeminiHint",
+        code: httpResponse.statusCode,
+        userInfo: [NSLocalizedDescriptionKey: message]
+      )
+    }
+
+    return try JSONDecoder().decode(GeminiLiveStatusPayload.self, from: data)
   }
 
   private func sanitize(_ raw: String, fallback: String) -> String {
@@ -1729,6 +1684,7 @@ private final class CaptureSoundEffectEngine {
   private let format = AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 1)!
   private lazy var buffers: [CaptureImpactSound: AVAudioPCMBuffer] = Self.buildBuffers(format: format)
   private lazy var moveBuffers: [PieceMoveSound: AVAudioPCMBuffer] = Self.buildMoveBuffers(format: format)
+  private var activeFilePlayers: [AVAudioPlayer] = []
 
   init() {
     engine.attach(mixer)
@@ -1737,6 +1693,26 @@ private final class CaptureSoundEffectEngine {
   }
 
   func play(_ effect: CaptureImpactSound) {
+    if effect == .pawnSword {
+      playFileResource(named: "pawnSword", extension: "mp3", volume: 0.88)
+      return
+    }
+
+    if effect == .bishopGunshot {
+      playFileResource(named: "bishopBell", extension: "mp3", volume: 0.84)
+      return
+    }
+
+    if effect == .knightThud {
+      playFileResource(named: "knightHorse", extension: "mp3", volume: 0.90)
+      return
+    }
+
+    if effect == .queenLaser {
+      playFileResource(named: "queenBlast", extension: "mp3", volume: 0.92)
+      return
+    }
+
     playBuffer(buffers[effect])
   }
 
@@ -1792,6 +1768,39 @@ private final class CaptureSoundEffectEngine {
         }
       }
       player.play()
+    }
+  }
+
+  private func playFileResource(named name: String, extension ext: String, volume: Float) {
+    queue.async { [weak self] in
+      guard let self else {
+        return
+      }
+
+      do {
+        try self.ensureRunning()
+        guard let url = Bundle.main.url(forResource: name, withExtension: ext) else {
+          Self.logger.error("Capture SFX file missing: \(name, privacy: .public).\(ext, privacy: .public)")
+          return
+        }
+
+        let player = try AVAudioPlayer(contentsOf: url)
+        player.volume = volume
+        player.prepareToPlay()
+        self.activeFilePlayers.append(player)
+        player.play()
+
+        let cleanupDelay = player.duration + 0.25
+        self.queue.asyncAfter(deadline: .now() + cleanupDelay) { [weak self, weak player] in
+          guard let self, let player else {
+            return
+          }
+
+          self.activeFilePlayers.removeAll { $0 === player }
+        }
+      } catch {
+        Self.logger.error("Capture SFX file playback failed: \(error.localizedDescription, privacy: .public)")
+      }
     }
   }
 
@@ -1955,6 +1964,87 @@ private final class CaptureSoundEffectEngine {
 
   private static func clampSample(_ sample: Float) -> Float {
     min(max(sample, -1), 1)
+  }
+}
+
+private final class AmbientMusicController {
+  static let shared = AmbientMusicController()
+
+  private static let logger = Logger(subsystem: "ARChess", category: "AmbientMusic")
+
+  private let queue = DispatchQueue(label: "ARChess.AmbientMusic")
+  private var player: AVAudioPlayer?
+  private let idleVolume: Float = 0.09
+  private let speechDuckedVolume: Float = 0.045
+  private var isSpeechActive = false
+  private var isPlayingRequested = false
+
+  private init() {}
+
+  func playLoopIfNeeded() {
+    queue.async { [weak self] in
+      guard let self else {
+        return
+      }
+
+      self.isPlayingRequested = true
+      do {
+        try self.preparePlayerIfNeeded()
+        self.player?.volume = self.isSpeechActive ? self.speechDuckedVolume : self.idleVolume
+        if self.player?.isPlaying != true {
+          self.player?.play()
+        }
+      } catch {
+        Self.logger.error("Ambient music failed to start: \(error.localizedDescription, privacy: .public)")
+      }
+    }
+  }
+
+  func stop() {
+    queue.async { [weak self] in
+      guard let self else {
+        return
+      }
+
+      self.isPlayingRequested = false
+      self.player?.stop()
+      self.player?.currentTime = 0
+    }
+  }
+
+  func setSpeechActive(_ active: Bool) {
+    queue.async { [weak self] in
+      guard let self else {
+        return
+      }
+
+      self.isSpeechActive = active
+      self.player?.setVolume(active ? self.speechDuckedVolume : self.idleVolume, fadeDuration: 0.18)
+    }
+  }
+
+  private func preparePlayerIfNeeded() throws {
+    let session = AVAudioSession.sharedInstance()
+    try session.setCategory(.ambient, mode: .default, options: [.mixWithOthers])
+    try session.setActive(true, options: [])
+
+    if player != nil {
+      return
+    }
+
+    guard let url = Bundle.main.url(forResource: "doom_at_dooms_gate", withExtension: "mp3") else {
+      throw NSError(
+        domain: "ARChess.AmbientMusic",
+        code: -2001,
+        userInfo: [NSLocalizedDescriptionKey: "Bundled ambient track was not found in the app resources."]
+      )
+    }
+
+    let nextPlayer = try AVAudioPlayer(contentsOf: url)
+    nextPlayer.numberOfLoops = -1
+    nextPlayer.volume = idleVolume
+    nextPlayer.prepareToPlay()
+    player = nextPlayer
   }
 }
 
@@ -2929,6 +3019,9 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   @Published private(set) var visibleHintText: String?
   @Published private(set) var isHintLoading = false
   @Published private(set) var geminiDebugLines: [String] = []
+  @Published private(set) var geminiConnectionState: GeminiLiveStatusPayload.ConnectionState = .disconnected
+  @Published private(set) var geminiConnectionLastError: String?
+  @Published private(set) var geminiConnectionSince: String?
 
   private let analyzer = StockfishWASMAnalyzer()
   private let hintService = GeminiHintService()
@@ -2940,17 +3033,22 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   private var reactionHandler: ((ReactionCue) -> Void)?
   private var stateProvider: (() -> ChessGameState?)?
   private var hintAvailabilityProvider: (() -> Bool)?
+  private var recentHistoryProvider: (() -> String?)?
   private var hintTask: Task<Void, Never>?
+  private var geminiStatusTask: Task<Void, Never>?
   private var hintCache: [String: String] = [:]
   private var currentHintKey: String?
   private var pendingHintReveal = false
   private var pendingHintNarration = false
   private var narratedHintKeys: Set<String> = []
   private var nextKingCookedAllowedPly: [ChessColor: Int] = [:]
+  private var lastGeminiStatusSnapshot: GeminiLiveStatusPayload?
 
   override init() {
     super.init()
     synthesizer.delegate = self
+    hintStatusText = defaultHintStatus()
+    startGeminiStatusMonitoring()
   }
 
   func attachEngineHost(to view: UIView) {
@@ -2999,11 +3097,15 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     cachedAnalysis = nil
     hintTask?.cancel()
     hintTask = nil
+    geminiStatusTask?.cancel()
+    geminiStatusTask = nil
+    recentHistoryProvider = nil
     hintCache.removeAll()
     currentHintKey = nil
     pendingHintReveal = false
     pendingHintNarration = false
     narratedHintKeys.removeAll()
+    lastGeminiStatusSnapshot = nil
     geminiDebugLines = []
     visibleHintText = nil
     isHintLoading = false
@@ -3018,6 +3120,9 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     blackEvalText = "Black eval: --"
     analysisTimingText = "No completed analysis yet."
     hintStatusText = defaultHintStatus()
+    geminiConnectionState = hintService.isConfigured ? .disconnected : .error
+    geminiConnectionLastError = hintService.isConfigured ? nil : "ARChessAPIBaseURL is not configured."
+    geminiConnectionSince = nil
   }
 
   func noteExternalStatus(_ message: String) {
@@ -3034,6 +3139,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
 
   func bindStateProvider(_ provider: @escaping () -> ChessGameState?) {
     stateProvider = provider
+    startGeminiStatusMonitoring()
   }
 
   func unbindStateProvider() {
@@ -3046,6 +3152,14 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
 
   func unbindHintAvailabilityProvider() {
     hintAvailabilityProvider = nil
+  }
+
+  func bindRecentHistoryProvider(_ provider: @escaping () -> String?) {
+    recentHistoryProvider = provider
+  }
+
+  func unbindRecentHistoryProvider() {
+    recentHistoryProvider = nil
   }
 
   func analyzeCurrentPosition() async {
@@ -3062,8 +3176,8 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     guard hintService.isConfigured else {
       visibleHintText = nil
       isHintLoading = false
-      hintStatusText = "Set GEMINI_API_KEY in .env and rebuild to enable Gemini hints."
-      appendGeminiDebug("Hint tap ignored because GEMINI_API_KEY is not configured.")
+      hintStatusText = "Set ARChessAPIBaseURL to enable Gemini hints."
+      appendGeminiDebug("Hint tap ignored because ARChessAPIBaseURL is not configured.")
       return
     }
 
@@ -3083,10 +3197,11 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     }
 
     pendingHintReveal = true
+    pendingHintNarration = true
 
     if let analysis = cachedAnalysis?.analysis, cachedAnalysis?.fen == state.fenString {
-      appendGeminiDebug("Hint tapped with cached Stockfish analysis ready; attempting instant reveal.")
-      prefetchHint(for: state, analysis: analysis, revealWhenReady: true)
+      appendGeminiDebug("Hint tapped with cached Stockfish analysis ready; attempting instant reveal and narration.")
+      prefetchHint(for: state, analysis: analysis, revealWhenReady: true, narrateWhenReady: true, allowRepeatNarration: true)
       return
     }
 
@@ -3101,7 +3216,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
 
       await self.prepare(with: state, force: true)
       if let analysis = self.cachedAnalysis?.analysis, self.cachedAnalysis?.fen == state.fenString {
-        self.prefetchHint(for: state, analysis: analysis, revealWhenReady: true)
+        self.prefetchHint(for: state, analysis: analysis, revealWhenReady: true, narrateWhenReady: true, allowRepeatNarration: true)
       }
     }
   }
@@ -3127,7 +3242,13 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       cachedAnalysis = CachedAnalysis(fen: afterState.fenString, analysis: afterAnalysis)
       updateAnalysisPresentation(afterAnalysis)
       analysisStatus = "Stockfish movetime \(Self.preferredMovetimeMs)ms live."
-      prefetchHint(for: afterState, analysis: afterAnalysis)
+      let shouldNarrateHintOnDrop: Bool
+      if let swing = evalSwing(before: beforeAnalysis, after: afterAnalysis, moverColor: beforeState.turn) {
+        shouldNarrateHintOnDrop = swing >= Self.substantialGainThreshold
+      } else {
+        shouldNarrateHintOnDrop = false
+      }
+      prefetchHint(for: afterState, analysis: afterAnalysis, narrateWhenReady: shouldNarrateHintOnDrop)
     } else if analyzer.lastError != nil {
       analysisStatus = "Stockfish unavailable. Last stage: \(analyzer.lastStatus)"
       latestAssessment = "Stockfish error: \(analyzer.lastError ?? analyzer.lastStatus)"
@@ -3216,12 +3337,14 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   }
 
   func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didStart utterance: AVSpeechUtterance) {
+    AmbientMusicController.shared.setSpeechActive(true)
     caption = utteranceCaptions[ObjectIdentifier(utterance)]
   }
 
   func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
     utteranceCaptions[ObjectIdentifier(utterance)] = nil
     if !synthesizer.isSpeaking {
+      AmbientMusicController.shared.setSpeechActive(false)
       caption = nil
     }
   }
@@ -3229,6 +3352,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
     utteranceCaptions[ObjectIdentifier(utterance)] = nil
     if !synthesizer.isSpeaking {
+      AmbientMusicController.shared.setSpeechActive(false)
       caption = nil
     }
   }
@@ -3339,13 +3463,15 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   private func prefetchHint(
     for state: ChessGameState,
     analysis: StockfishAnalysis,
-    revealWhenReady: Bool = false
+    revealWhenReady: Bool = false,
+    narrateWhenReady: Bool = false,
+    allowRepeatNarration: Bool = false
   ) {
     guard hintService.isConfigured else {
       visibleHintText = nil
       isHintLoading = false
       hintStatusText = defaultHintStatus()
-      appendGeminiDebug("Skipped prefetch because GEMINI_API_KEY is not configured.")
+      appendGeminiDebug("Skipped prefetch because ARChessAPIBaseURL is not configured.")
       return
     }
 
@@ -3374,10 +3500,12 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     if keyChanged {
       visibleHintText = nil
       pendingHintReveal = false
+      pendingHintNarration = false
     }
 
     currentHintKey = key
     pendingHintReveal = pendingHintReveal || revealWhenReady
+    pendingHintNarration = pendingHintNarration || narrateWhenReady
 
     if let cached = hintCache[key] {
       isHintLoading = false
@@ -3386,6 +3514,10 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       if pendingHintReveal {
         visibleHintText = cached
         pendingHintReveal = false
+      }
+      if pendingHintNarration {
+        pendingHintNarration = false
+        narrateGeminiHintIfNeeded(text: cached, key: key, allowRepeat: allowRepeatNarration)
       }
       return
     }
@@ -3401,6 +3533,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       }
 
       do {
+        await self.refreshGeminiStatus()
         let hint = try await self.hintService.fetchHint(for: context)
         await MainActor.run {
           guard self.currentHintKey == key else {
@@ -3417,13 +3550,19 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
             self.pendingHintReveal = false
             self.appendGeminiDebug("Gemini hint revealed instantly from the completed prefetch.")
           }
+          if self.pendingHintNarration {
+            self.pendingHintNarration = false
+            self.narrateGeminiHintIfNeeded(text: hint, key: key, allowRepeat: allowRepeatNarration)
+          }
         }
+        await self.refreshGeminiStatus()
       } catch is CancellationError {
         await MainActor.run {
           self.appendGeminiDebug("Gemini hint request was cancelled because a newer turn replaced it.")
         }
         return
       } catch {
+        await self.refreshGeminiStatus()
         await MainActor.run {
           guard self.currentHintKey == key else {
             return
@@ -3440,10 +3579,87 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     }
   }
 
+  private func narrateGeminiHintIfNeeded(text: String, key: String, allowRepeat: Bool = false) {
+    guard allowRepeat || !narratedHintKeys.contains(key) else {
+      appendGeminiDebug("Skipped Gemini narration because this hint was already narrated for the current turn.")
+      return
+    }
+
+    narratedHintKeys.insert(key)
+    appendGeminiDebug(
+      allowRepeat
+        ? "Narrating Gemini hint because the hint button was pressed."
+        : "Narrating Gemini hint because the side to move just lost eval."
+    )
+    _ = speakHintNarration(text: text, priority: .urgent)
+  }
+
+  private func startGeminiStatusMonitoring() {
+    geminiStatusTask?.cancel()
+    geminiStatusTask = nil
+
+    guard hintService.isConfigured else {
+      let unavailable = GeminiLiveStatusPayload(
+        state: .error,
+        lastError: "ARChessAPIBaseURL is not configured.",
+        since: nil
+      )
+      applyGeminiStatus(unavailable, emitDebugLog: false)
+      return
+    }
+
+    geminiStatusTask = Task { [weak self] in
+      guard let self else {
+        return
+      }
+
+      while !Task.isCancelled {
+        await self.refreshGeminiStatus()
+        try? await Task.sleep(nanoseconds: 1_000_000_000)
+      }
+    }
+  }
+
+  private func refreshGeminiStatus(emitDebugLog: Bool = true) async {
+    guard hintService.isConfigured else {
+      return
+    }
+
+    do {
+      let status = try await hintService.fetchConnectionStatus()
+      applyGeminiStatus(status, emitDebugLog: emitDebugLog)
+    } catch {
+      let failed = GeminiLiveStatusPayload(
+        state: .error,
+        lastError: error.localizedDescription,
+        since: nil
+      )
+      applyGeminiStatus(failed, emitDebugLog: emitDebugLog)
+    }
+  }
+
+  private func applyGeminiStatus(_ status: GeminiLiveStatusPayload, emitDebugLog: Bool) {
+    let previous = lastGeminiStatusSnapshot
+    lastGeminiStatusSnapshot = status
+    geminiConnectionState = status.state
+    geminiConnectionLastError = status.lastError
+    geminiConnectionSince = status.since
+
+    guard emitDebugLog, previous != status else {
+      return
+    }
+
+    if let error = status.lastError, !error.isEmpty {
+      appendGeminiDebug("Gemini Live status -> \(status.state.rawValue): \(error)")
+    } else {
+      appendGeminiDebug("Gemini Live status -> \(status.state.rawValue)")
+    }
+  }
+
   private func defaultHintStatus() -> String {
     hintService.isConfigured
       ? "Fun hints warm up in the background when it is your turn."
-      : "Set GEMINI_API_KEY in .env and rebuild to enable Gemini hints."
+      : "Set ARChessAPIBaseURL to enable Gemini hints."
   }
 
   private func appendGeminiDebug(_ message: String) {
@@ -3469,6 +3685,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     let afterState = state.applying(move)
     return GeminiHintContext(
       fen: state.fenString,
+      recentHistory: recentHistoryProvider?(),
       bestMove: bestMove,
       sideToMove: state.turn,
       movingPiece: move.piece.kind,
@@ -3479,7 +3696,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   }
 
   private func hintKey(for context: GeminiHintContext) -> String {
-    context.fen + "|" + context.bestMove
+    context.fen + "|" + (context.recentHistory ?? "") + "|" + context.bestMove
   }
 
   private func hintThemes(
@@ -3630,7 +3847,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       ]
     case .pawn:
       return [
-        SpokenLine(speaker: .pawn, text: "I would have taken blood with me.", pitch: 0.98, rate: 0.42, volume: 0.86),
+        SpokenLine(speaker: .pawn, text: "Goodbye my friends.", pitch: 0.98, rate: 0.42, volume: 0.86),
         SpokenLine(speaker: .pawn, text: "A soldier falls. The file stays thirsty.", pitch: 0.96, rate: 0.40, volume: 0.84),
       ]
     case .king:
@@ -3752,9 +3969,29 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     utterance.rate = min(max(line.rate ?? line.speaker.defaultRate, 0.1), 0.65)
     utterance.volume = min(max(line.volume ?? line.speaker.defaultVolume, 0.0), 1.0)
     utterance.preUtteranceDelay = 0.02
+    utteranceCaptions[ObjectIdentifier(utterance)] = Caption(speaker: line.speaker, line: line.text)
+    synthesizer.speak(utterance)
+    return true
+  }
+
+  private func speakHintNarration(text: String, priority: SpeechPriority) -> Bool {
+    if priority == .urgent {
+      _ = synthesizer.stopSpeaking(at: .immediate)
+      utteranceCaptions.removeAll()
+    } else if synthesizer.isSpeaking {
+      return false
+    }
+
+    let utterance = AVSpeechUtterance(string: text)
+    utterance.voice = AVSpeechSynthesisVoice(language: "en-US")
+    utterance.pitchMultiplier = 1.02
+    utterance.rate = 0.47
+    utterance.volume = 0.92
+    utterance.preUtteranceDelay = 0.02
     utteranceCaptions[ObjectIdentifier(utterance)] = Caption(
-      speaker: line.speaker,
-      line: line.text
+      title: "Gemini Hint",
+      line: text,
+      imageAssetName: "GeminiNarratorPortrait"
     )
     synthesizer.speak(utterance)
     return true
@@ -3777,7 +4014,11 @@ private struct PieceSpeechBubble: View {
 
   var body: some View {
     HStack(alignment: .center, spacing: 14) {
-      PiecePortraitView(speaker: caption.speaker)
+      if let imageAssetName = caption.imageAssetName {
+        NarrationPortraitView(imageAssetName: imageAssetName)
+      } else if let speaker = caption.speaker {
+        PiecePortraitView(speaker: speaker)
+      }
 
       VStack(alignment: .leading, spacing: 6) {
         Text(caption.speakerName)
@@ -3803,6 +4044,27 @@ private struct PieceSpeechBubble: View {
             .stroke(Color.white.opacity(0.12), lineWidth: 1)
         )
     )
+  }
+}
+
+private struct NarrationPortraitView: View {
+  let imageAssetName: String
+
+  var body: some View {
+    ZStack {
+      RoundedRectangle(cornerRadius: 18, style: .continuous)
+        .fill(Color.white.opacity(0.10))
+
+      RoundedRectangle(cornerRadius: 18, style: .continuous)
+        .stroke(Color.white.opacity(0.16), lineWidth: 1)
+
+      Image(imageAssetName)
+        .resizable()
+        .scaledToFill()
+        .frame(width: 62, height: 62)
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+    }
+    .frame(width: 66, height: 66)
   }
 }
 
@@ -3940,9 +4202,7 @@ private struct ModeSelectionView: View {
             .tracking(2.2)
             .foregroundStyle(Color(red: 0.85, green: 0.78, blue: 0.64))
 
-          Text("AR Chess")
-            .font(.system(size: 50, weight: .heavy, design: .rounded))
-            .foregroundStyle(.white)
+          WarChessTitle()
 
           Text("Choose a local pass-and-play board or a synced queue match.")
             .font(.system(size: 18, weight: .medium, design: .rounded))
@@ -4008,9 +4268,7 @@ private struct LandingView: View {
             .tracking(2.2)
             .foregroundStyle(Color(red: 0.85, green: 0.78, blue: 0.64))
 
-          Text("AR Chess")
-            .font(.system(size: 50, weight: .heavy, design: .rounded))
-            .foregroundStyle(.white)
+          WarChessTitle()
 
           Text("Place boards in rooms • Play together")
             .font(.system(size: 18, weight: .medium, design: .rounded))
@@ -4040,6 +4298,20 @@ private struct LandingView: View {
       .padding(.horizontal, 24)
       .padding(.vertical, 30)
     }
+  }
+}
+
+private struct WarChessTitle: View {
+  var body: some View {
+    (
+      Text("W")
+        .foregroundColor(.white)
+      + Text("AR")
+        .foregroundColor(Color(red: 0.89, green: 0.54, blue: 0.32))
+      + Text(" CHESS")
+        .foregroundColor(.white)
+    )
+    .font(.system(size: 50, weight: .heavy, design: .rounded))
   }
 }
 
@@ -4346,6 +4618,23 @@ private struct NativeARExperienceView: View {
               .font(.system(size: 14, weight: .semibold, design: .rounded))
               .foregroundStyle(Color.white.opacity(0.86))
 
+            HStack(spacing: 8) {
+              Text("Live:")
+                .font(.system(size: 13, weight: .bold, design: .monospaced))
+                .foregroundStyle(Color.white.opacity(0.76))
+
+              Text(commentary.geminiConnectionState.rawValue)
+                .font(.system(size: 13, weight: .bold, design: .monospaced))
+                .foregroundStyle(connectionStateColor)
+            }
+
+            if let connectionError = commentary.geminiConnectionLastError {
+              Text(connectionError)
+                .font(.system(size: 12, weight: .medium, design: .rounded))
+                .foregroundStyle(Color(red: 0.95, green: 0.70, blue: 0.62))
+                .lineLimit(2)
+            }
+
             if commentary.geminiDebugLines.isEmpty {
               Text("No Gemini activity yet.")
                 .font(.system(size: 13, weight: .medium, design: .rounded))
@@ -4492,6 +4781,7 @@ private struct NativeARExperienceView: View {
       commentary.resetSession()
       commentary.unbindStateProvider()
       commentary.unbindHintAvailabilityProvider()
+      commentary.unbindRecentHistoryProvider()
       commentary.unbindReactionHandler()
       switch mode {
       case .passAndPlay(_):
@@ -4561,28 +4851,46 @@ private struct NativeARExperienceView: View {
       return queueMatch.statusText
     }
   }
+
+  private var connectionStateColor: Color {
+    switch commentary.geminiConnectionState {
+    case .connected:
+      return Color(red: 0.56, green: 0.91, blue: 0.69)
+    case .connecting:
+      return Color(red: 0.96, green: 0.82, blue: 0.54)
+    case .error:
+      return Color(red: 0.95, green: 0.66, blue: 0.62)
+    case .disconnected:
+      return Color.white.opacity(0.70)
+    }
+  }
 }
 
 private struct ChessboardBackdrop: View {
   private let rows = 14
   private let columns = 10
+  private let overdraw = 2
 
   var body: some View {
     GeometryReader { geometry in
       let squareSize = max(geometry.size.width / CGFloat(columns), geometry.size.height / CGFloat(rows))
+      let renderedRows = rows + overdraw
+      let renderedColumns = columns + overdraw
 
       ZStack {
         Color(red: 0.07, green: 0.10, blue: 0.13)
           .ignoresSafeArea()
 
-        ForEach(0..<rows, id: \.self) { row in
-          ForEach(0..<columns, id: \.self) { column in
+        ForEach(0..<renderedRows, id: \.self) { row in
+          ForEach(0..<renderedColumns, id: \.self) { column in
+            let gridRow = row - (overdraw / 2)
+            let gridColumn = column - (overdraw / 2)
             Rectangle()
-              .fill(squareColor(row: row, column: column))
+              .fill(squareColor(row: gridRow, column: gridColumn))
               .frame(width: squareSize, height: squareSize)
               .position(
-                x: (CGFloat(column) + 0.5) * squareSize,
-                y: (CGFloat(row) + 0.5) * squareSize
+                x: (CGFloat(gridColumn) + 0.5) * squareSize,
+                y: (CGFloat(gridRow) + 0.5) * squareSize
               )
           }
         }
@@ -4752,6 +5060,23 @@ private enum ChessPieceKind {
       return "q"
     case .king:
       return "k"
+    }
+  }
+
+  var sanSymbol: String {
+    switch self {
+    case .pawn:
+      return ""
+    case .rook:
+      return "R"
+    case .knight:
+      return "N"
+    case .bishop:
+      return "B"
+    case .queen:
+      return "Q"
+    case .king:
+      return "K"
     }
   }
 }
@@ -5025,6 +5350,35 @@ private struct ChessGameState {
     next.turn = turn.opponent
     next.fullmoveNumber = fullmoveNumber + (turn == .black ? 1 : 0)
     return next
+  }
+
+  func sanNotation(for move: ChessMove) -> String {
+    let baseNotation: String
+    if move.rookMove != nil {
+      baseNotation = move.to.file == 6 ? "O-O" : "O-O-O"
+    } else {
+      let isCapture = move.captured != nil || move.isEnPassant
+      let destination = move.to.algebraic
+      let promotionSuffix = move.promotion.map { "=\($0.sanSymbol)" } ?? ""
+
+      if move.piece.kind == .pawn {
+        let capturePrefix = isCapture ? String(move.from.algebraic.prefix(1)) + "x" : ""
+        baseNotation = capturePrefix + destination + promotionSuffix
+      } else {
+        let disambiguation = sanDisambiguation(for: move)
+        let captureMarker = isCapture ? "x" : ""
+        baseNotation = move.piece.kind.sanSymbol + disambiguation + captureMarker + destination + promotionSuffix
+      }
+    }
+
+    let afterState = applying(move)
+    if afterState.isCheckmate(for: afterState.turn) {
+      return baseNotation + "#"
+    }
+    if afterState.isInCheck(for: afterState.turn) {
+      return baseNotation + "+"
+    }
+    return baseNotation
   }
 
   func isInCheck(for color: ChessColor) -> Bool {
@@ -5359,6 +5713,38 @@ private struct ChessGameState {
     return false
   }
 
+  private func sanDisambiguation(for move: ChessMove) -> String {
+    let competingOrigins = board.compactMap { square, piece -> BoardSquare? in
+      guard square != move.from,
+            piece.color == move.piece.color,
+            piece.kind == move.piece.kind else {
+        return nil
+      }
+
+      let matchingMove = legalMoves(from: square).contains { candidate in
+        candidate.to == move.to && candidate.promotion == move.promotion
+      }
+      return matchingMove ? square : nil
+    }
+
+    guard !competingOrigins.isEmpty else {
+      return ""
+    }
+
+    let sameFileExists = competingOrigins.contains { $0.file == move.from.file }
+    let sameRankExists = competingOrigins.contains { $0.rank == move.from.rank }
+    let fileToken = String(move.from.algebraic.prefix(1))
+    let rankToken = String(move.from.rank + 1)
+
+    if !sameFileExists {
+      return fileToken
+    }
+    if !sameRankExists {
+      return rankToken
+    }
+    return fileToken + rankToken
+  }
+
   private mutating func updateCastlingRights(for move: ChessMove) {
     if move.piece.kind == .king {
       switch move.piece.color {
@@ -5415,6 +5801,11 @@ private struct NativeARView: UIViewRepresentable {
   func updateUIView(_ uiView: ARView, context: Context) {}
 
   final class Coordinator: NSObject, ARSessionDelegate {
+    private struct NarrativeMove {
+      let ply: Int
+      let san: String
+    }
+
     private struct AnimatedMoveContext {
       let move: ChessMove
       let beforeState: ChessGameState
@@ -5451,6 +5842,7 @@ private struct NativeARView: UIViewRepresentable {
     private var lastWarmupStatusMessage: String?
     private var pendingAnimatedMoves: [AnimatedMoveContext] = []
     private var moveAnimationTask: Task<Void, Never>?
+    private var narrativeHistory: [NarrativeMove] = []
     private let captureSoundEffects = CaptureSoundEffectEngine()
 
     init(
@@ -5468,6 +5860,7 @@ private struct NativeARView: UIViewRepresentable {
     deinit {
       initialAnalysisTask?.cancel()
       moveAnimationTask?.cancel()
+      AmbientMusicController.shared.stop()
     }
 
     func configure(_ arView: ARView) {
@@ -5517,6 +5910,9 @@ private struct NativeARView: UIViewRepresentable {
           }
           self.commentary.bindStateProvider { [weak self] in
             self?.gameState
+          }
+          self.commentary.bindRecentHistoryProvider { [weak self] in
+            self?.recentNarrativeSequence()
           }
           self.commentary.bindHintAvailabilityProvider { [weak self] in
             guard let self else {
@@ -5781,6 +6177,7 @@ private struct NativeARView: UIViewRepresentable {
             }
 
             self.matchLog.recordMove(move.uciString, color: movingColor)
+            self.recordNarrativeMove(move, before: beforeState)
             await self.commentary.handleMove(move: move, before: beforeState, after: afterState)
           }
         )
@@ -5795,6 +6192,7 @@ private struct NativeARView: UIViewRepresentable {
 
       let previousMoveCount = syncedQueueMoves.count
       var rebuiltState = ChessGameState.initial()
+      var rebuiltNarrativeHistory: [NarrativeMove] = []
       var newMoves: [(move: ChessMove, before: ChessGameState, after: ChessGameState)] = []
 
       for payload in orderedMoves {
@@ -5807,6 +6205,9 @@ private struct NativeARView: UIViewRepresentable {
 
         let beforeState = rebuiltState
         let afterState = rebuiltState.applying(move)
+        rebuiltNarrativeHistory.append(
+          NarrativeMove(ply: payload.ply, san: beforeState.sanNotation(for: move))
+        )
         if payload.ply > previousMoveCount {
           newMoves.append((move: move, before: beforeState, after: afterState))
         }
@@ -5814,6 +6215,7 @@ private struct NativeARView: UIViewRepresentable {
       }
 
       syncedQueueMoves = orderedMoves
+      narrativeHistory = Array(rebuiltNarrativeHistory.suffix(10))
       guard !newMoves.isEmpty else {
         gameState = rebuiltState
         selectedSquare = nil
@@ -5845,6 +6247,33 @@ private struct NativeARView: UIViewRepresentable {
           )
         )
       }
+    }
+
+    private func recordNarrativeMove(_ move: ChessMove, before state: ChessGameState) {
+      let entry = NarrativeMove(ply: ply(for: state), san: state.sanNotation(for: move))
+      narrativeHistory.append(entry)
+      if narrativeHistory.count > 10 {
+        narrativeHistory.removeFirst(narrativeHistory.count - 10)
+      }
+    }
+
+    private func recentNarrativeSequence() -> String? {
+      guard !narrativeHistory.isEmpty else {
+        return nil
+      }
+
+      return narrativeHistory.map { entry in
+        let moveNumber = (entry.ply + 1) / 2
+        if entry.ply.isMultiple(of: 2) {
+          return "\(moveNumber)... \(entry.san)"
+        }
+        return "\(moveNumber). \(entry.san)"
+      }.joined(separator: " ")
+    }
+
+    private func ply(for state: ChessGameState) -> Int {
+      let basePly = (state.fullmoveNumber - 1) * 2
+      return basePly + (state.turn == .white ? 1 : 2)
     }
 
     private func enqueueMoveAnimation(_ context: AnimatedMoveContext) {
@@ -6395,6 +6824,7 @@ private struct NativeARView: UIViewRepresentable {
         self.boardAnchor = boardAnchor
         boardWorldTransform = transform
         refreshBoardPresentation()
+        AmbientMusicController.shared.playLoopIfNeeded()
       }
 
       trackedPlaneID = selectedPlane.identifier
@@ -6654,6 +7084,9 @@ private struct NativeARView: UIViewRepresentable {
         let pieceEntity = makePieceEntity(kind: piece.kind, material: pieceMaterial(for: piece.color))
         pieceEntity.name = pieceName(square)
         pieceEntity.position = boardPosition(square, squareSize: squareSize)
+        if piece.color == .black {
+          pieceEntity.orientation = simd_quatf(angle: .pi, axis: SIMD3<Float>(0, 1, 0))
+        }
 
         if selectedSquare == square {
           pieceEntity.position.y += 0.016
