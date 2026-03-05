@@ -338,6 +338,57 @@ def test_get_match_moves_supports_after_ply(monkeypatch) -> None:
     assert [item["ply"] for item in response.json()["moves"]] == [3, 4]
 
 
+def test_get_gemini_status_returns_live_state(monkeypatch) -> None:
+    monkeypatch.setattr("main.GEMINI_LIVE_CLIENT.ensure_connection_background", lambda: None)
+    monkeypatch.setattr(
+        "main.GEMINI_LIVE_CLIENT.get_status",
+        lambda: {
+            "state": "CONNECTED",
+            "lastError": None,
+            "since": "2026-03-01T12:00:00+00:00",
+        },
+    )
+
+    client = TestClient(app)
+    response = client.get("/v1/gemini/status")
+
+    assert response.status_code == 200
+    assert response.json()["state"] == "CONNECTED"
+    assert response.json()["lastError"] is None
+    assert response.json()["since"].startswith("2026-03-01T12:00:00")
+
+
+def test_create_gemini_hint_returns_sanitized_hint(monkeypatch) -> None:
+    async def fake_run_turn(prompt: str, *, metadata=None, timeout_seconds: float = 0.0) -> str:
+        assert "Provide one short beginner-friendly hint" in prompt
+        assert metadata["current_fen"].startswith("rnbqkbnr")
+        assert metadata["recent_history"] == "13. Re1 b5 14. Bb3 Nf6 15. O-O"
+        assert metadata["best_move"] == "e2e4"
+        _ = timeout_seconds
+        return "Play e2e4 and own the center!"
+
+    monkeypatch.setattr("main.GEMINI_LIVE_CLIENT.run_turn", fake_run_turn)
+
+    client = TestClient(app)
+    response = client.post(
+        "/v1/gemini/hint",
+        json={
+            "fen": "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "recent_history": "13. Re1 b5 14. Bb3 Nf6 15. O-O",
+            "best_move": "e2e4",
+            "side_to_move": "white",
+            "moving_piece": "pawn",
+            "is_capture": False,
+            "gives_check": False,
+            "themes": ["fight for the center"],
+        },
+    )
+
+    assert response.status_code == 200
+    # Coordinates are stripped via fallback to keep hints beginner-friendly.
+    assert response.json()["hint"] == "A brave pawn wants to claim more space."
+
+
 def test_get_postgres_dsn_prefers_railway_private_url(monkeypatch) -> None:
     monkeypatch.setenv("DATABASE_PRIVATE_URL", "postgres://user:pass@private-host:5432/railway")
     monkeypatch.setenv("DATABASE_URL", "postgresql://user:pass@public-host:5432/railway")

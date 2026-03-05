@@ -8,10 +8,20 @@ from typing import Any
 from urllib.parse import urlparse
 
 import psycopg
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
+from services.gemini_live import (
+    GeminiLiveBusyError,
+    GeminiLiveClient,
+    GeminiLiveConfigurationError,
+    GeminiLiveConnectionError,
+)
+
+
+load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("archess.server")
@@ -94,6 +104,164 @@ class MatchMovesResponse(BaseModel):
     latest_ply: int
     next_turn: str
     moves: list[MatchMoveRecord]
+
+
+class GeminiHintRequest(BaseModel):
+    fen: str = Field(..., min_length=1, max_length=256)
+    recent_history: str | None = Field(default=None, max_length=512)
+    best_move: str
+    side_to_move: str
+    moving_piece: str | None = None
+    is_capture: bool = False
+    gives_check: bool = False
+    themes: list[str] = Field(default_factory=list)
+
+    @field_validator("best_move")
+    @classmethod
+    def validate_best_move(cls, value: str) -> str:
+        move = value.strip().lower()
+        if not UCI_MOVE_PATTERN.match(move):
+            raise ValueError("best_move must use UCI notation such as e2e4.")
+        return move
+
+    @field_validator("side_to_move")
+    @classmethod
+    def validate_side_to_move(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"white", "black"}:
+            raise ValueError("side_to_move must be 'white' or 'black'.")
+        return normalized
+
+    @field_validator("recent_history")
+    @classmethod
+    def validate_recent_history(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        return normalized or None
+
+    @field_validator("moving_piece")
+    @classmethod
+    def validate_moving_piece(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip().lower()
+        if normalized not in {"pawn", "knight", "bishop", "rook", "queen", "king"}:
+            raise ValueError("moving_piece must be one of pawn, knight, bishop, rook, queen, king.")
+        return normalized
+
+
+class GeminiHintResponse(BaseModel):
+    hint: str
+
+
+class GeminiLiveStatusResponse(BaseModel):
+    state: str
+    lastError: str | None
+    since: datetime
+
+
+GEMINI_HINT_SYSTEM_PROMPT = """
+You are a Grandmaster Chess Consultant. You will receive a FEN and a short PGN sequence.
+Use the FEN to identify tactical geometry (x-rays, pins, hanging pieces) and the PGN to identify strategic momentum and player intent.
+Prioritize identifying blunders and high-level strategic objectives over deep engine-line calculations.
+Each turn arrives as a structured text packet in this format:
+Current FEN: [FEN] | Recent Sequence: [PGN] | User Query: [request]
+If recent move history is unavailable, rely on the FEN as the authoritative board reset.
+You write one short, fun, creative, beginner-friendly chess hint.
+Never mention board squares, coordinates, algebraic notation, or raw move text.
+Never output files, ranks, e2e4, d2d4, or any square names.
+Keep it to one sentence, around 6 to 14 words.
+Make it playful and helpful, like a coach whispering a vibe.
+Return plain text only.
+""".strip()
+GEMINI_HINT_MOVE_PATTERN = re.compile(r"\b[a-h][1-8][a-h][1-8][qrbn]?\b|\b[a-h][1-8]\b", re.IGNORECASE)
+
+
+def env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    with suppress(ValueError):
+        return float(raw)
+    logger.warning("Invalid float for %s: %s. Falling back to %s.", name, raw, default)
+    return default
+
+
+def env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    with suppress(ValueError):
+        return int(raw)
+    logger.warning("Invalid int for %s: %s. Falling back to %s.", name, raw, default)
+    return default
+
+
+def gemini_fallback_hint(payload: GeminiHintRequest) -> str:
+    if payload.gives_check:
+        return "The enemy king looks a little exposed."
+
+    if "fight for the center" in payload.themes:
+        if payload.moving_piece == "knight":
+            return "Your knight dreams of the center."
+        if payload.moving_piece == "pawn":
+            return "A brave pawn wants to claim more space."
+        return "This move helps seize the center."
+
+    if "develop a new piece" in payload.themes:
+        return "A sleepy piece is ready to join the adventure."
+
+    if payload.is_capture:
+        return "A clean trade could swing the momentum."
+
+    if "improve king safety" in payload.themes:
+        return "Your king would sleep better after this."
+
+    return "There is a tidy move that improves your position."
+
+
+def sanitize_hint_text(raw_text: str, fallback: str) -> str:
+    trimmed = raw_text.strip()
+    if not trimmed:
+        return fallback
+    if GEMINI_HINT_MOVE_PATTERN.search(trimmed):
+        return fallback
+    condensed = re.sub(r"\s+", " ", trimmed).strip()
+    return condensed or fallback
+
+
+def build_gemini_user_query(payload: GeminiHintRequest) -> str:
+    piece_name = payload.moving_piece or "piece"
+    capture_text = "yes" if payload.is_capture else "no"
+    check_text = "yes" if payload.gives_check else "no"
+    themes = ", ".join(payload.themes) if payload.themes else "general activity"
+    return (
+        "Provide one short beginner-friendly hint for the side to move. "
+        "Explain the biggest tactical or strategic idea without deep engine lines, "
+        "board coordinates, or raw move notation. "
+        f"Suggested move candidate: {payload.best_move}. "
+        f"Moving piece: {piece_name}. "
+        f"Is capture: {capture_text}. "
+        f"Gives check: {check_text}. "
+        f"Themes: {themes}."
+    )
+
+
+GEMINI_LIVE_CLIENT = GeminiLiveClient(
+    api_key=os.getenv("GEMINI_API_KEY"),
+    model=os.getenv("GEMINI_LIVE_MODEL", "models/gemini-2.0-flash-live-001"),
+    system_prompt=os.getenv("GEMINI_LIVE_SYSTEM_PROMPT", GEMINI_HINT_SYSTEM_PROMPT).strip(),
+    generation_config={
+        "temperature": env_float("GEMINI_LIVE_TEMPERATURE", 0.95),
+        "top_p": env_float("GEMINI_LIVE_TOP_P", 0.9),
+        "top_k": env_int("GEMINI_LIVE_TOP_K", 32),
+        "max_output_tokens": env_int("GEMINI_LIVE_MAX_OUTPUT_TOKENS", 64),
+    },
+    ws_url=os.getenv("GEMINI_LIVE_WS_URL") or None,
+    logger=logging.getLogger("archess.server.gemini_live"),
+)
+GEMINI_LIVE_TURN_TIMEOUT_SECONDS = env_float("GEMINI_LIVE_TURN_TIMEOUT_SECONDS", 12.0)
 
 
 def utcnow() -> datetime:
@@ -754,6 +922,16 @@ def get_queue_match_moves(
         }
 
 
+@app.on_event("startup")
+async def startup_gemini_live() -> None:
+    GEMINI_LIVE_CLIENT.ensure_connection_background()
+
+
+@app.on_event("shutdown")
+async def shutdown_gemini_live() -> None:
+    await GEMINI_LIVE_CLIENT.disconnect()
+
+
 @app.get("/health/ping")
 def health_ping() -> dict[str, Any]:
     postgres_ok, postgres_message = ping_postgres()
@@ -766,6 +944,45 @@ def health_ping() -> dict[str, Any]:
         ],
     }
     return JSONResponse(content=payload, status_code=status_code)
+
+
+@app.get("/v1/gemini/status", response_model=GeminiLiveStatusResponse)
+async def get_gemini_live_status() -> dict[str, Any]:
+    GEMINI_LIVE_CLIENT.ensure_connection_background()
+    return GEMINI_LIVE_CLIENT.get_status()
+
+
+@app.post("/v1/gemini/hint", response_model=GeminiHintResponse)
+async def create_gemini_hint(payload: GeminiHintRequest) -> dict[str, Any]:
+    fallback = gemini_fallback_hint(payload)
+    query = build_gemini_user_query(payload)
+    metadata = {
+        "current_fen": payload.fen,
+        "recent_history": payload.recent_history,
+        "best_move": payload.best_move,
+        "side_to_move": payload.side_to_move,
+        "themes": payload.themes,
+    }
+
+    try:
+        raw_hint = await GEMINI_LIVE_CLIENT.run_turn(
+            query,
+            metadata=metadata,
+            timeout_seconds=GEMINI_LIVE_TURN_TIMEOUT_SECONDS,
+        )
+    except GeminiLiveConfigurationError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except GeminiLiveBusyError as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
+    except GeminiLiveConnectionError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:  # pragma: no cover - integration guarded
+        logger.exception("Gemini Live hint request failed unexpectedly")
+        raise HTTPException(status_code=503, detail=f"Gemini Live hint failed: {exc}") from exc
+
+    return {
+        "hint": sanitize_hint_text(raw_hint, fallback),
+    }
 
 
 @app.post("/v1/games")

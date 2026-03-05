@@ -21,6 +21,11 @@ Backend owned by Person 1.
 - Prefer `DATABASE_URL` on Railway private networking.
 - `DATABASE_PRIVATE_URL` and `DATABASE_PUBLIC_URL` are also accepted if that is how your service variables are wired.
 - The app also supports Railway `PG*` variables and finally falls back to `POSTGRES_*` variables.
+- Gemini Live uses backend-only secrets:
+  - `GEMINI_API_KEY` (required)
+  - `GEMINI_LIVE_MODEL` (optional, default `models/gemini-2.0-flash-live-001`)
+  - `GEMINI_LIVE_TEMPERATURE`, `GEMINI_LIVE_TOP_P`, `GEMINI_LIVE_TOP_K`, `GEMINI_LIVE_MAX_OUTPUT_TOKENS` (optional tuning)
+  - `GEMINI_LIVE_TURN_TIMEOUT_SECONDS` (optional)
 
 ## Health ping
 
@@ -76,3 +81,34 @@ Moves are stored in Postgres table `game_moves`, keyed by `game_id` and `ply`.
   - Returns ordered moves after the requested ply, plus `latest_ply` and `next_turn`.
 
 Matchmaking uses Postgres transactions and `FOR UPDATE SKIP LOCKED` so two queue tickets cannot pair with the same opponent concurrently.
+
+## Gemini Live hints
+
+- `GET /v1/gemini/status`
+  - Returns Gemini Live connection state:
+    - `DISCONNECTED`
+    - `CONNECTING`
+    - `CONNECTED`
+    - `ERROR`
+  - Response also includes `lastError` and `since`.
+- `POST /v1/gemini/hint`
+  - Request body:
+    - `fen`
+    - `recent_history` optional short PGN/SAN sequence (recommended: last 5-10 half-moves)
+    - `best_move` (UCI)
+    - `side_to_move` (`white` or `black`)
+    - `moving_piece` (`pawn`, `knight`, `bishop`, `rook`, `queen`, `king`) optional
+    - `is_capture`
+    - `gives_check`
+    - `themes` list
+  - Uses a shared stateful Gemini Live WebSocket session on the backend.
+  - Each turn is sent to Gemini as a structured packet with current FEN, recent move narrative, and the query text.
+  - Turns are serialized to avoid interleaving.
+
+## Verify locally
+
+1. Start the server: `python3 main.py`
+2. Check Gemini Live status:
+   - `curl http://localhost:8080/v1/gemini/status`
+3. Send a sample hint turn:
+   - `curl -X POST http://localhost:8080/v1/gemini/hint -H 'content-type: application/json' -d '{\"fen\":\"rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1\",\"recent_history\":\"13. Re1 b5 14. Bb3 Nf6 15. O-O\",\"best_move\":\"e2e4\",\"side_to_move\":\"white\",\"moving_piece\":\"pawn\",\"is_capture\":false,\"gives_check\":false,\"themes\":[\"fight for the center\"]}'`
