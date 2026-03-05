@@ -24,9 +24,9 @@ Monorepo for the AR Chess platform with the existing server and a native iOS app
 - Run the `ARChess` scheme on an iPhone for native AR.
 - The app now launches native SwiftUI screens for `Join`, `Create`, `Lobby / Loading`, and the native AR sandbox.
 - `mobile/` is no longer the active iOS runtime path.
-- For Gemini hints, copy `.env.example` to `.env`, set `GEMINI_API_KEY=...`, then rebuild the iOS app so the key is bundled into the app at build time.
+- For Gemini hints, configure `ARChessAPIBaseURL` for the iOS app and set `GEMINI_API_KEY` only on the backend (`server-app/.env`).
 
-The native iOS UI does not require the server to be running. If you wire networking later, use your Mac's LAN IP instead of `localhost`.
+The native iOS UI does not require the server for local board play, but Gemini hints now require the server. Use your Mac's LAN IP instead of `localhost` when running on iPhone.
 
 ## Stockfish integration
 
@@ -46,6 +46,7 @@ The native iOS UI does not require the server to be running. If you wire network
 - Tap `Hint` to reveal the cached beginner-friendly hint. If prefetch is still running, the UI shows a short loading state instead of the raw move.
 - The overlay shows:
   - Gemini hint status
+  - Gemini Live connection state (`DISCONNECTED`, `CONNECTING`, `CONNECTED`, `ERROR`) in Gemini debug
   - white eval
   - black eval
   - last analysis duration
