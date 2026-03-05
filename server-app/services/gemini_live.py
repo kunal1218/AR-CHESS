@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 import websockets
+from websockets.protocol import State
 
 _UNSET = object()
 
@@ -40,7 +41,7 @@ class GeminiLiveClient:
 
     DEFAULT_WS_URL = (
         "wss://generativelanguage.googleapis.com/ws/"
-        "google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent"
+        "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
     )
 
     def __init__(
@@ -143,17 +144,7 @@ class GeminiLiveClient:
                 self._setup_future = asyncio.get_running_loop().create_future()
                 self._reader_task = asyncio.create_task(self._read_loop())
 
-                await self._send_json(
-                    {
-                        "setup": {
-                            "model": self._model,
-                            "generation_config": self._generation_config,
-                            "system_instruction": {
-                                "parts": [{"text": self._system_prompt}],
-                            },
-                        }
-                    }
-                )
+                await self._send_json(self._build_setup_payload())
                 self._logger.info("Gemini Live setup sent")
 
                 try:
@@ -194,13 +185,7 @@ class GeminiLiveClient:
 
     async def send_turn_complete(self) -> None:
         await self.connect()
-        await self._send_json(
-            {
-                "client_content": {
-                    "turn_complete": True,
-                }
-            }
-        )
+        await self._send_json(self._build_client_content_payload("", turn_complete=True))
 
     async def request_response(self) -> None:
         await self.send_turn_complete()
@@ -249,25 +234,41 @@ class GeminiLiveClient:
         metadata: dict[str, Any] | None,
         turn_complete: bool,
     ) -> None:
-        await self._send_json(
-            {
-                "client_content": {
-                    "turns": [
-                        {
-                            "role": "user",
-                            "parts": [{"text": text}],
-                        }
-                    ],
-                    "turn_complete": turn_complete,
-                }
-            }
-        )
+        await self._send_json(self._build_client_content_payload(text, turn_complete=turn_complete))
         self._logger.info(
             "Gemini Live turn text sent chars=%s turn_complete=%s",
             len(text),
             turn_complete,
         )
         _ = metadata
+
+    def _build_setup_payload(self) -> dict[str, Any]:
+        return {
+            "setup": {
+                "model": self._model,
+                "generationConfig": self._generation_config,
+                "systemInstruction": {
+                    "parts": [{"text": self._system_prompt}],
+                },
+            }
+        }
+
+    def _build_client_content_payload(self, text: str, *, turn_complete: bool) -> dict[str, Any]:
+        turns: list[dict[str, Any]] = []
+        if text:
+            turns.append(
+                {
+                    "role": "user",
+                    "parts": [{"text": text}],
+                }
+            )
+
+        return {
+            "clientContent": {
+                "turns": turns,
+                "turnComplete": turn_complete,
+            }
+        }
 
     def _build_state_narrative_text(self, text: str, metadata: dict[str, Any] | None) -> str:
         metadata = metadata or {}
@@ -449,7 +450,13 @@ class GeminiLiveClient:
                 continue
 
     def _is_socket_open(self) -> bool:
-        return bool(self._ws is not None and not getattr(self._ws, "closed", True))
+        if self._ws is None:
+            return False
+
+        if hasattr(self._ws, "closed"):
+            return not bool(getattr(self._ws, "closed"))
+
+        return getattr(self._ws, "state", None) == State.OPEN
 
     def _set_status(self, state: str, last_error: str | None | object = _UNSET) -> None:
         changed = state != self._state

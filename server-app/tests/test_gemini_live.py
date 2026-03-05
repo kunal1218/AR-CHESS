@@ -1,5 +1,8 @@
+from types import SimpleNamespace
 import sys
 from pathlib import Path
+
+from websockets.protocol import State
 
 
 SERVER_APP_ROOT = Path(__file__).resolve().parents[1]
@@ -49,3 +52,66 @@ def test_build_state_narrative_text_omits_missing_history() -> None:
         "Current FEN: 8/8/8/8/8/8/8/8 w - - 0 1 | "
         "User Query: Find the main idea."
     )
+
+
+def test_default_ws_url_targets_v1beta() -> None:
+    assert GeminiLiveClient.DEFAULT_WS_URL.endswith(
+        "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
+    )
+
+
+def test_build_setup_payload_uses_live_camel_case_fields() -> None:
+    client = GeminiLiveClient(
+        api_key="test-key",
+        model="models/test",
+        system_prompt="System prompt",
+        generation_config={"temperature": 0.5},
+    )
+
+    payload = client._build_setup_payload()  # noqa: SLF001
+
+    assert payload == {
+        "setup": {
+            "model": "models/test",
+            "generationConfig": {"temperature": 0.5},
+            "systemInstruction": {
+                "parts": [{"text": "System prompt"}],
+            },
+        }
+    }
+
+
+def test_build_client_content_payload_uses_live_camel_case_fields() -> None:
+    client = GeminiLiveClient(
+        api_key="test-key",
+        model="models/test",
+        system_prompt="test",
+    )
+
+    payload = client._build_client_content_payload(  # noqa: SLF001
+        "Current FEN: test",
+        turn_complete=True,
+    )
+
+    assert payload == {
+        "clientContent": {
+            "turns": [
+                {
+                    "role": "user",
+                    "parts": [{"text": "Current FEN: test"}],
+                }
+            ],
+            "turnComplete": True,
+        }
+    }
+
+
+def test_is_socket_open_supports_websockets16_state() -> None:
+    client = GeminiLiveClient(
+        api_key="test-key",
+        model="models/test",
+        system_prompt="test",
+    )
+    client._ws = SimpleNamespace(state=State.OPEN)  # noqa: SLF001
+
+    assert client._is_socket_open() is True  # noqa: SLF001
