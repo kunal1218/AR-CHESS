@@ -2,6 +2,7 @@ import AVFoundation
 import ARKit
 import CryptoKit
 import Foundation
+import ImageIO
 import OSLog
 import RealityKit
 import SwiftUI
@@ -22,6 +23,56 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
     self.window = window
     window.makeKeyAndVisible()
     return true
+  }
+}
+
+private struct GIFAnimationSequence {
+  let frames: [UIImage]
+  let duration: TimeInterval
+
+  static func loadFromBundle(named name: String, withExtension ext: String) -> GIFAnimationSequence? {
+    guard let url = Bundle.main.url(forResource: name, withExtension: ext),
+          let source = CGImageSourceCreateWithURL(url as CFURL, nil) else {
+      return nil
+    }
+
+    let frameCount = CGImageSourceGetCount(source)
+    guard frameCount > 0 else {
+      return nil
+    }
+
+    var frames: [UIImage] = []
+    var totalDuration: TimeInterval = 0
+
+    for index in 0..<frameCount {
+      guard let cgImage = CGImageSourceCreateImageAtIndex(source, index, nil) else {
+        continue
+      }
+
+      let duration = frameDuration(for: source, index: index)
+      let repeats = max(1, Int(round(duration / 0.04)))
+      let image = UIImage(cgImage: cgImage)
+      frames.append(contentsOf: Array(repeating: image, count: repeats))
+      totalDuration += duration
+    }
+
+    guard !frames.isEmpty else {
+      return nil
+    }
+
+    return GIFAnimationSequence(frames: frames, duration: max(totalDuration, 0.4))
+  }
+
+  private static func frameDuration(for source: CGImageSource, index: Int) -> TimeInterval {
+    guard let properties = CGImageSourceCopyPropertiesAtIndex(source, index, nil) as? [CFString: Any],
+          let gifProperties = properties[kCGImagePropertyGIFDictionary] as? [CFString: Any] else {
+      return 0.08
+    }
+
+    let unclamped = gifProperties[kCGImagePropertyGIFUnclampedDelayTime] as? Double
+    let clamped = gifProperties[kCGImagePropertyGIFDelayTime] as? Double
+    let duration = unclamped ?? clamped ?? 0.08
+    return duration < 0.02 ? 0.08 : duration
   }
 }
 
@@ -3267,6 +3318,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     enum Kind {
       case enemyKingPrays(color: ChessColor)
       case currentKingCries(color: ChessColor)
+      case knightFork(targets: [BoardSquare])
     }
 
     let kind: Kind
@@ -3476,6 +3528,14 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     await prepare(with: state, force: true)
   }
 
+  func isTopFiveStockfishMove(_ move: ChessMove, before state: ChessGameState) async -> Bool {
+    guard let analysis = await analysisForCurrentTurn(state: state) else {
+      return false
+    }
+
+    return analysis.topUniqueMoves.contains { $0.move == move.uciString }
+  }
+
   func setStockfishDebugVisible(_ isVisible: Bool) {
     stockfishDebugVisible = isVisible
     guard isVisible else {
@@ -3633,6 +3693,11 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       }
     }
 
+    let knightForkTargets = knightForkTargets(after: move, in: afterState)
+    if knightForkTargets.count >= 2 {
+      reactionHandler?(ReactionCue(kind: .knightFork(targets: Array(knightForkTargets.prefix(2)))))
+    }
+
     guard completedPlyCount >= nextCommentaryPly else {
       return
     }
@@ -3777,6 +3842,41 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     var updated = state
     updated.turn = side
     return updated
+  }
+
+  private func knightForkTargets(after move: ChessMove, in state: ChessGameState) -> [BoardSquare] {
+    guard move.piece.kind == .knight,
+          let attacker = state.board[move.to],
+          attacker.color == move.piece.color,
+          attacker.kind == .knight else {
+      return []
+    }
+
+    let offsets = [
+      (1, 2), (2, 1), (2, -1), (1, -2),
+      (-1, -2), (-2, -1), (-2, 1), (-1, 2),
+    ]
+
+    // A knight can hit more than two pieces; for the visual cue we prioritize the two most
+    // important attacked enemy pieces so the fork reads clearly on the board.
+    return offsets
+      .compactMap { move.to.offset(file: $0.0, rank: $0.1) }
+      .compactMap { square -> (BoardSquare, ChessPieceState)? in
+        guard let target = state.board[square], target.color == attacker.color.opponent else {
+          return nil
+        }
+        return (square, target)
+      }
+      .sorted { left, right in
+        if left.1.kind.forkThreatPriority == right.1.kind.forkThreatPriority {
+          if left.0.rank == right.0.rank {
+            return left.0.file < right.0.file
+          }
+          return left.0.rank < right.0.rank
+        }
+        return left.1.kind.forkThreatPriority > right.1.kind.forkThreatPriority
+      }
+      .map(\.0)
   }
 
   private func classifyMove(
@@ -5754,6 +5854,23 @@ private enum ChessPieceKind {
       return "K"
     }
   }
+
+  var forkThreatPriority: Int {
+    switch self {
+    case .king:
+      return 6
+    case .queen:
+      return 5
+    case .rook:
+      return 4
+    case .bishop:
+      return 3
+    case .knight:
+      return 2
+    case .pawn:
+      return 1
+    }
+  }
 }
 
 private struct BoardSquare: Hashable {
@@ -6492,6 +6609,7 @@ private struct NativeARView: UIViewRepresentable {
     private let boardInset: Float = 0.08
     private let minimumBoardScale: Float = 1.0
     private let maximumBoardScale: Float = 2.4
+    private static let brilliantAnimation = GIFAnimationSequence.loadFromBundle(named: "brilliant", withExtension: "gif")
     private let matchLog: MatchLogStore
     private let queueMatch: QueueMatchStore
     private let mode: ExperienceMode
@@ -6519,6 +6637,10 @@ private struct NativeARView: UIViewRepresentable {
     private var moveAnimationTask: Task<Void, Never>?
     private var narrativeHistory: [NarrativeMove] = []
     private let captureSoundEffects = CaptureSoundEffectEngine()
+    private weak var brilliantMarkerView: UIImageView?
+    private var brilliantMarkerSquare: BoardSquare?
+    private var brilliantMarkerDisplayLink: CADisplayLink?
+    private var brilliantMarkerHideWorkItem: DispatchWorkItem?
 
     init(
       matchLog: MatchLogStore,
@@ -6535,6 +6657,8 @@ private struct NativeARView: UIViewRepresentable {
     deinit {
       initialAnalysisTask?.cancel()
       moveAnimationTask?.cancel()
+      brilliantMarkerDisplayLink?.invalidate()
+      brilliantMarkerHideWorkItem?.cancel()
       AmbientMusicController.shared.stop()
     }
 
@@ -6853,6 +6977,9 @@ private struct NativeARView: UIViewRepresentable {
 
             self.matchLog.recordMove(move.uciString, color: movingColor)
             self.recordNarrativeMove(move, before: beforeState)
+            if await self.commentary.isTopFiveStockfishMove(move, before: beforeState) {
+              self.showBrilliantMoveMarker(at: move.to)
+            }
             await self.commentary.handleMove(move: move, before: beforeState, after: afterState)
           }
         )
@@ -6912,14 +7039,17 @@ private struct NativeARView: UIViewRepresentable {
             move: item.move,
             beforeState: item.before,
             afterState: item.after,
-            postApply: { [weak self] in
-              guard let self else {
-                return
-              }
-
-              await self.commentary.handleMove(move: item.move, before: item.before, after: item.after)
+          postApply: { [weak self] in
+            guard let self else {
+              return
             }
-          )
+
+            if await self.commentary.isTopFiveStockfishMove(item.move, before: item.before) {
+              self.showBrilliantMoveMarker(at: item.move.to)
+            }
+            await self.commentary.handleMove(move: item.move, before: item.before, after: item.after)
+          }
+        )
         )
       }
     }
@@ -6990,12 +7120,119 @@ private struct NativeARView: UIViewRepresentable {
       await context.postApply?()
     }
 
+    @MainActor
+    private func showBrilliantMoveMarker(at square: BoardSquare) {
+      guard let animation = Self.brilliantAnimation,
+            let arView else {
+        return
+      }
+
+      brilliantMarkerHideWorkItem?.cancel()
+      brilliantMarkerDisplayLink?.invalidate()
+      brilliantMarkerView?.removeFromSuperview()
+
+      let marker = UIImageView()
+      marker.backgroundColor = .clear
+      marker.isUserInteractionEnabled = false
+      marker.contentMode = .scaleAspectFit
+      marker.alpha = 0.96
+      marker.animationImages = animation.frames
+      marker.animationDuration = animation.duration
+      marker.animationRepeatCount = 1
+      arView.addSubview(marker)
+      arView.bringSubviewToFront(marker)
+
+      brilliantMarkerView = marker
+      brilliantMarkerSquare = square
+      updateBrilliantMoveMarkerFrame()
+      marker.startAnimating()
+
+      let displayLink = CADisplayLink(target: self, selector: #selector(handleBrilliantMarkerDisplayLink))
+      displayLink.add(to: .main, forMode: .common)
+      brilliantMarkerDisplayLink = displayLink
+
+      let hideWorkItem = DispatchWorkItem { [weak self, weak marker] in
+        guard let self else {
+          return
+        }
+        self.brilliantMarkerDisplayLink?.invalidate()
+        self.brilliantMarkerDisplayLink = nil
+        self.brilliantMarkerSquare = nil
+        UIView.animate(withDuration: 0.14, animations: {
+          marker?.alpha = 0
+        }, completion: { _ in
+          marker?.removeFromSuperview()
+        })
+      }
+      brilliantMarkerHideWorkItem = hideWorkItem
+      DispatchQueue.main.asyncAfter(deadline: .now() + animation.duration + 0.05, execute: hideWorkItem)
+    }
+
+    @objc
+    private func handleBrilliantMarkerDisplayLink() {
+      updateBrilliantMoveMarkerFrame()
+    }
+
+    private func updateBrilliantMoveMarkerFrame() {
+      guard let marker = brilliantMarkerView,
+            let square = brilliantMarkerSquare,
+            let frame = brilliantMarkerFrame(for: square) else {
+        brilliantMarkerView?.removeFromSuperview()
+        brilliantMarkerView = nil
+        brilliantMarkerDisplayLink?.invalidate()
+        brilliantMarkerDisplayLink = nil
+        brilliantMarkerSquare = nil
+        return
+      }
+
+      marker.frame = frame
+    }
+
+    private func brilliantMarkerFrame(for square: BoardSquare) -> CGRect? {
+      guard let arView,
+            let center = projectedBoardPoint(for: square, localOffset: SIMD3<Float>(0, 0.006, 0)),
+            let east = projectedBoardPoint(for: square, localOffset: SIMD3<Float>((boardSize / 8.0) * 0.46, 0.006, 0)),
+            let north = projectedBoardPoint(for: square, localOffset: SIMD3<Float>(0, 0.006, -((boardSize / 8.0) * 0.46))) else {
+        return nil
+      }
+
+      let halfWidth = max(abs(east.x - center.x), abs(north.x - center.x))
+      let halfHeight = max(abs(east.y - center.y), abs(north.y - center.y))
+      let size = max(44, min(160, max(halfWidth, halfHeight) * 3.1))
+      let origin = CGPoint(x: center.x - (size * 0.5), y: center.y - (size * 0.5))
+      let frame = CGRect(origin: origin, size: CGSize(width: size, height: size))
+      return frame.intersects(arView.bounds) ? frame : nil
+    }
+
+    private func projectedBoardPoint(for square: BoardSquare, localOffset: SIMD3<Float>) -> CGPoint? {
+      guard let arView,
+            let worldPoint = worldBoardPoint(for: square, localOffset: localOffset) else {
+        return nil
+      }
+
+      return arView.project(worldPoint)
+    }
+
+    private func worldBoardPoint(for square: BoardSquare, localOffset: SIMD3<Float>) -> SIMD3<Float>? {
+      guard let boardWorldTransform else {
+        return nil
+      }
+
+      let squareSize = boardSize / 8.0
+      let local = boardPosition(square, squareSize: squareSize) + localOffset
+      let scaled = local * boardScale
+      let world = boardWorldTransform * SIMD4<Float>(scaled.x, scaled.y, scaled.z, 1)
+      return SIMD3<Float>(world.x, world.y, world.z)
+    }
+
     private func handleReactionCue(_ cue: PiecePersonalityDirector.ReactionCue) {
       switch cue.kind {
       case .enemyKingPrays(let color):
         animateKingPrayer(for: color)
       case .currentKingCries(let color):
         animateKingCrying(for: color)
+      case .knightFork(let targets):
+        animateKnightForkChains(on: targets)
       }
     }
 
@@ -7464,6 +7701,90 @@ private struct NativeARView: UIViewRepresentable {
         leftTear.move(to: originalLeftTearTransform, relativeTo: kingEntity, duration: 0.20, timingFunction: .easeInOut)
         rightTear.move(to: originalRightTearTransform, relativeTo: kingEntity, duration: 0.20, timingFunction: .easeInOut)
       }
+    }
+
+    private func animateKnightForkChains(on targetSquares: [BoardSquare]) {
+      for (index, square) in Array(targetSquares.prefix(2)).enumerated() {
+        guard let victim = piecesContainer.findEntity(named: pieceName(square)) else {
+          continue
+        }
+
+        let shackle = makeKnightForkChainEntity(seed: index)
+        shackle.position = SIMD3<Float>(0, 0.026, 0)
+        shackle.scale = SIMD3<Float>(repeating: 0.26)
+        shackle.orientation = simd_quatf(angle: Float(index) * .pi / 9, axis: SIMD3<Float>(0, 1, 0))
+        victim.addChild(shackle)
+
+        let settle = Transform(
+          scale: SIMD3<Float>(repeating: 1.0),
+          rotation: simd_quatf(angle: Float(index + 1) * .pi / 12, axis: SIMD3<Float>(0, 1, 0)),
+          translation: shackle.position
+        )
+        shackle.move(to: settle, relativeTo: victim, duration: 0.14, timingFunction: .easeOut)
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.42) { [weak shackle, weak victim] in
+          guard let shackle, let victim else {
+            return
+          }
+
+          let release = Transform(
+            scale: SIMD3<Float>(repeating: 0.08),
+            rotation: simd_quatf(angle: .pi / 2.6, axis: SIMD3<Float>(0, 1, 0)),
+            translation: shackle.position + SIMD3<Float>(0, 0.010, 0)
+          )
+          shackle.move(to: release, relativeTo: victim, duration: 0.18, timingFunction: .easeIn)
+
+          DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) { [weak shackle] in
+            shackle?.removeFromParent()
+          }
+        }
+      }
+    }
+
+    private func makeKnightForkChainEntity(seed: Int) -> Entity {
+      let group = Entity()
+      let linkMaterial = SimpleMaterial(
+        color: UIColor(red: 0.73, green: 0.72, blue: 0.66, alpha: 0.96),
+        roughness: 0.16,
+        isMetallic: true
+      )
+      let lockMaterial = SimpleMaterial(
+        color: UIColor(red: 0.44, green: 0.37, blue: 0.22, alpha: 0.96),
+        roughness: 0.22,
+        isMetallic: true
+      )
+
+      func addRing(y: Float, radiusX: Float, radiusZ: Float, yaw: Float) {
+        let ring = Entity()
+        ring.position = SIMD3<Float>(0, y, 0)
+        ring.orientation = simd_quatf(angle: yaw, axis: SIMD3<Float>(0, 1, 0))
+        let linkCount = 12
+
+        for index in 0..<linkCount {
+          let angle = (Float(index) / Float(linkCount)) * (.pi * 2)
+          let link = ModelEntity(
+            mesh: .generateBox(size: SIMD3<Float>(0.007, 0.003, 0.0023)),
+            materials: [linkMaterial]
+          )
+          link.position = SIMD3<Float>(cosf(angle) * radiusX, 0, sinf(angle) * radiusZ)
+          link.orientation = simd_quatf(angle: -angle, axis: SIMD3<Float>(0, 1, 0))
+          ring.addChild(link)
+        }
+
+        group.addChild(ring)
+      }
+
+      addRing(y: 0.008, radiusX: 0.028, radiusZ: 0.020, yaw: Float(seed) * .pi / 10)
+      addRing(y: 0.024, radiusX: 0.026, radiusZ: 0.018, yaw: (.pi / 7) + Float(seed) * .pi / 12)
+
+      let lock = ModelEntity(
+        mesh: .generateBox(size: SIMD3<Float>(0.010, 0.012, 0.006)),
+        materials: [lockMaterial]
+      )
+      lock.position = SIMD3<Float>(0, 0.016, 0.020)
+      group.addChild(lock)
+
+      return group
     }
 
     private func kingEntity(for color: ChessColor) -> Entity? {

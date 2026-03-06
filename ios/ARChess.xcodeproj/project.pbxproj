@@ -16,6 +16,7 @@
 		F0A100010000000000000006 /* pawnSword.mp3 in Resources */ = {isa = PBXBuildFile; fileRef = F0A100010000000000000007 /* pawnSword.mp3 */; };
 		F0A100010000000000000008 /* knightHorse.mp3 in Resources */ = {isa = PBXBuildFile; fileRef = F0A100010000000000000009 /* knightHorse.mp3 */; };
 		F0A10001000000000000000A /* bishopBell.mp3 in Resources */ = {isa = PBXBuildFile; fileRef = F0A10001000000000000000B /* bishopBell.mp3 */; };
+		F0A10001000000000000000C /* brilliant.gif in Resources */ = {isa = PBXBuildFile; fileRef = F0A10001000000000000000D /* brilliant.gif */; };
 		F11748422D0307B40044C1D9 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = F11748412D0307B40044C1D9 /* AppDelegate.swift */; };
 		F84ACDC8CD493E1B02A2E598 /* ExpoModulesProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2877FCB4D0AD12C0BEB325CC /* ExpoModulesProvider.swift */; };
 		F9C6574201C748B4B3B30901 /* stockfish-nnue-16-single.js in Resources */ = {isa = PBXBuildFile; fileRef = F9C6574001C748B4B3B30901 /* stockfish-nnue-16-single.js */; };
@@ -37,6 +38,7 @@
 		F0A100010000000000000007 /* pawnSword.mp3 */ = {isa = PBXFileReference; lastKnownFileType = audio.mp3; path = pawnSword.mp3; sourceTree = "<group>"; };
 		F0A100010000000000000009 /* knightHorse.mp3 */ = {isa = PBXFileReference; lastKnownFileType = audio.mp3; path = knightHorse.mp3; sourceTree = "<group>"; };
 		F0A10001000000000000000B /* bishopBell.mp3 */ = {isa = PBXFileReference; lastKnownFileType = audio.mp3; path = bishopBell.mp3; sourceTree = "<group>"; };
+		F0A10001000000000000000D /* brilliant.gif */ = {isa = PBXFileReference; lastKnownFileType = image.gif; path = brilliant.gif; sourceTree = "<group>"; };
 		F11748412D0307B40044C1D9 /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = AppDelegate.swift; path = ARChess/AppDelegate.swift; sourceTree = "<group>"; };
 		F11748442D0722820044C1D9 /* ARChess-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = "ARChess-Bridging-Header.h"; path = "ARChess/ARChess-Bridging-Header.h"; sourceTree = "<group>"; };
 		F9C6574001C748B4B3B30901 /* stockfish-nnue-16-single.js */ = {isa = PBXFileReference; lastKnownFileType = text.javascript; path = "stockfish-nnue-16-single.js"; sourceTree = "<group>"; };
@@ -63,6 +65,7 @@
 				F11748442D0722820044C1D9 /* ARChess-Bridging-Header.h */,
 				BB2F792B24A3F905000567C9 /* Supporting */,
 				F0A100010000000000000003 /* Audio */,
+				F0A10001000000000000000E /* Effects */,
 				F9C6573F01C748B4B3B30901 /* Stockfish */,
 				13B07FB51A68108700A75B9A /* Images.xcassets */,
 				13B07FB61A68108700A75B9A /* Info.plist */,
@@ -156,6 +159,14 @@
 			path = ARChess/Audio;
 			sourceTree = "<group>";
 		};
+		F0A10001000000000000000E /* Effects */ = {
+			isa = PBXGroup;
+			children = (
+				F0A10001000000000000000D /* brilliant.gif */,
+			);
+			path = ARChess/Effects;
+			sourceTree = "<group>";
+		};
 		F9C6573F01C748B4B3B30901 /* Stockfish */ = {
 			isa = PBXGroup;
 			children = (
@@ -236,6 +247,7 @@
 				F0A100010000000000000006 /* pawnSword.mp3 in Resources */,
 				F0A100010000000000000008 /* knightHorse.mp3 in Resources */,
 				F0A100010000000000000004 /* queenBlast.mp3 in Resources */,
+				F0A10001000000000000000C /* brilliant.gif in Resources */,
 				F9C6574201C748B4B3B30901 /* stockfish-nnue-16-single.js in Resources */,
 				F9C6574301C748B4B3B30901 /* stockfish-nnue-16-single.wasm in Resources */,
 			);
