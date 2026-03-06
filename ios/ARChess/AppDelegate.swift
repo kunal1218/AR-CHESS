@@ -7756,8 +7756,16 @@ private struct NativeARView: UIViewRepresentable {
 
       func makeChainLink(width: Float, height: Float, thickness: Float) -> Entity {
         let link = Entity()
-        let verticalMesh = MeshResource.generateCapsule(height: max(0.004, height - (thickness * 1.2)), radius: thickness)
-        let horizontalMesh = MeshResource.generateCapsule(height: max(0.004, width - (thickness * 1.2)), radius: thickness)
+        let railThickness = thickness * 1.8
+        let verticalHeight = Swift.max(Float(0.004), height - (thickness * 2.6))
+        let horizontalWidth = Swift.max(Float(0.004), width - (thickness * 2.6))
+        let verticalMesh = MeshResource.generateBox(
+          size: SIMD3<Float>(railThickness, verticalHeight, thickness * 1.15)
+        )
+        let horizontalMesh = MeshResource.generateBox(
+          size: SIMD3<Float>(horizontalWidth, railThickness, thickness * 1.15)
+        )
+        let cornerMesh = MeshResource.generateSphere(radius: thickness * 0.92)
 
         let leftRail = ModelEntity(mesh: verticalMesh, materials: [linkMaterial])
         leftRail.position = SIMD3<Float>(-(width * 0.5), 0, 0)
@@ -7775,6 +7783,19 @@ private struct NativeARView: UIViewRepresentable {
         link.addChild(rightRail)
         link.addChild(topBridge)
         link.addChild(bottomBridge)
+
+        let cornerOffsets: [SIMD3<Float>] = [
+          SIMD3<Float>(-(width * 0.5), height * 0.5, 0),
+          SIMD3<Float>(width * 0.5, height * 0.5, 0),
+          SIMD3<Float>(-(width * 0.5), -(height * 0.5), 0),
+          SIMD3<Float>(width * 0.5, -(height * 0.5), 0),
+        ]
+        for offset in cornerOffsets {
+          let corner = ModelEntity(mesh: cornerMesh, materials: [linkMaterial])
+          corner.position = offset
+          link.addChild(corner)
+        }
+
         return link
       }
 
