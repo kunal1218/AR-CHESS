@@ -1321,13 +1321,20 @@ private struct StockfishSearchOptions {
   var debugDepth: Int?
   var hardTimeoutMs: Int?
   var multiPV: Int?
+  var searchMoves: [String]?
 
-  static func realtime(movetimeMs: Int = 80, hardTimeoutMs: Int = 600, multiPV: Int = 1) -> Self {
+  static func realtime(
+    movetimeMs: Int = 80,
+    hardTimeoutMs: Int = 600,
+    multiPV: Int = 1,
+    searchMoves: [String]? = nil
+  ) -> Self {
     StockfishSearchOptions(
       movetimeMs: movetimeMs,
       debugDepth: nil,
       hardTimeoutMs: hardTimeoutMs,
-      multiPV: multiPV
+      multiPV: multiPV,
+      searchMoves: searchMoves
     )
   }
 }
@@ -2213,6 +2220,7 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
         "movetimeMs": payload.movetimeMs ?? config.defaultMovetimeMs,
         "debugDepth": payload.debugDepth as Any,
         "multiPV": payload.multiPV ?? 1,
+        "searchMoves": payload.searchMoves as Any,
       ]
 
       Self.logger.info("Stockfish request \(requestID, privacy: .public) queued state=\(self.engineState.rawValue, privacy: .public) fen_hash=\(fenHash, privacy: .public)")
@@ -2817,6 +2825,7 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
               movetimeMs: request.movetimeMs,
               debugDepth: request.debugDepth || null,
               multiPV: Math.max(1, request.multiPV || 1),
+              searchMoves: Array.isArray(request.searchMoves) ? request.searchMoves.filter(Boolean) : null,
               startedAtMs: Date.now(),
               scoreCp: null,
               mateIn: null,
@@ -2828,10 +2837,13 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
             bridgeStateChange('THINKING', searchLabel);
             sendEngineCommand('setoption name MultiPV value ' + bridgeState.currentRequest.multiPV);
             sendEngineCommand('position fen ' + request.fen);
+            const searchMovesSuffix = bridgeState.currentRequest.searchMoves && bridgeState.currentRequest.searchMoves.length > 0
+              ? (' searchmoves ' + bridgeState.currentRequest.searchMoves.join(' '))
+              : '';
             if (request.debugDepth) {
-              sendEngineCommand('go depth ' + request.debugDepth);
+              sendEngineCommand('go depth ' + request.debugDepth + searchMovesSuffix);
             } else {
-              sendEngineCommand('go movetime ' + request.movetimeMs);
+              sendEngineCommand('go movetime ' + request.movetimeMs + searchMovesSuffix);
             }
           }
 
@@ -3105,7 +3117,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   private let synthesizer = AVSpeechSynthesizer()
   private var utteranceCaptions: [ObjectIdentifier: Caption] = [:]
   private var cachedAnalysis: CachedAnalysis?
-  private var debugAnalysisCache: [String: StockfishAnalysis] = [:]
+  private var stockfishDebugLineCache: [String: [String]] = [:]
   private var completedPlyCount = 0
   private var nextCommentaryPly = Int.random(in: commentaryIntervalRange)
   private var reactionHandler: ((ReactionCue) -> Void)?
@@ -3180,7 +3192,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     utteranceCaptions.removeAll()
     caption = nil
     cachedAnalysis = nil
-    debugAnalysisCache.removeAll()
+    stockfishDebugLineCache.removeAll()
     hintTask?.cancel()
     hintTask = nil
     geminiStatusTask?.cancel()
@@ -3500,62 +3512,119 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     }
 
     stockfishDebugStatusText = "Refreshing Stockfish top lines..."
-    let whiteFEN = fenByReplacingSideToMove(in: state.fenString, with: .white)
-    let blackFEN = fenByReplacingSideToMove(in: state.fenString, with: .black)
+    let whiteState = stateByReplacingTurn(in: state, with: .white)
+    let blackState = stateByReplacingTurn(in: state, with: .black)
 
-    let whiteAnalysis = await debugAnalysis(
-      for: whiteFEN,
+    stockfishDebugWhiteLines = await debugCandidateLines(
+      for: whiteState,
       currentAnalysis: currentAnalysis,
       force: force
-    )
-    let blackAnalysis = await debugAnalysis(
-      for: blackFEN,
+    ) ?? []
+    stockfishDebugBlackLines = await debugCandidateLines(
+      for: blackState,
       currentAnalysis: currentAnalysis,
       force: force
-    )
-
-    stockfishDebugWhiteLines = whiteAnalysis.map { stockfishDebugLines(from: $0) } ?? []
-    stockfishDebugBlackLines = blackAnalysis.map { stockfishDebugLines(from: $0) } ?? []
+    ) ?? []
 
     if !stockfishDebugWhiteLines.isEmpty || !stockfishDebugBlackLines.isEmpty {
-      stockfishDebugStatusText = "Stockfish MultiPV 5 lines for the current board."
+      stockfishDebugStatusText = "Stockfish top 5 root moves for the current board."
     } else {
       stockfishDebugStatusText = "Stockfish top lines unavailable."
     }
   }
 
-  private func debugAnalysis(
-    for fen: String,
+  private func debugCandidateLines(
+    for state: ChessGameState,
     currentAnalysis: StockfishAnalysis? = nil,
     force: Bool
-  ) async -> StockfishAnalysis? {
-    if let currentAnalysis,
-       currentAnalysis.fen == fen,
-       currentAnalysis.candidates.count >= 5 {
-      debugAnalysisCache[fen] = currentAnalysis
-      return currentAnalysis
-    }
+  ) async -> [String]? {
+    let fen = state.fenString
 
-    if !force,
-       let cached = debugAnalysisCache[fen],
-       cached.candidates.count >= 5 {
+    if !force, let cached = stockfishDebugLineCache[fen] {
       return cached
     }
 
-    do {
-      let analysis = try await analyzer.analyze(
-        fen: fen,
-        options: .realtime(
-          movetimeMs: Self.preferredMovetimeMs,
-          hardTimeoutMs: Self.preferredHardTimeoutMs,
-          multiPV: 5
+    let rootMoves = legalRootMoves(in: state).map(\.uciString)
+    guard !rootMoves.isEmpty else {
+      stockfishDebugLineCache[fen] = []
+      return []
+    }
+
+    var remainingMoves = rootMoves
+    var candidates: [StockfishCandidate] = []
+    let maxLines = min(5, remainingMoves.count)
+
+    if let currentAnalysis,
+       currentAnalysis.fen == fen,
+       let bestMove = currentAnalysis.bestMove,
+       bestMove != "(none)" {
+      candidates.append(
+        StockfishCandidate(
+          rank: 1,
+          bestMove: bestMove,
+          scoreCp: currentAnalysis.scoreCp,
+          mateIn: currentAnalysis.mateIn,
+          pv: currentAnalysis.pv
         )
       )
-      debugAnalysisCache[fen] = analysis
-      return analysis
-    } catch {
-      return nil
+      remainingMoves.removeAll { $0 == bestMove }
     }
+
+    while candidates.count < maxLines && !remainingMoves.isEmpty {
+      let analysis: StockfishAnalysis
+      do {
+        analysis = try await analyzer.analyze(
+          fen: fen,
+          options: .realtime(
+            movetimeMs: Self.preferredMovetimeMs,
+            hardTimeoutMs: Self.preferredHardTimeoutMs,
+            multiPV: 1,
+            searchMoves: remainingMoves
+          )
+        )
+      } catch {
+        break
+      }
+
+      guard let bestMove = analysis.bestMove, bestMove != "(none)" else {
+        break
+      }
+
+      candidates.append(
+        StockfishCandidate(
+          rank: candidates.count + 1,
+          bestMove: bestMove,
+          scoreCp: analysis.scoreCp,
+          mateIn: analysis.mateIn,
+          pv: analysis.pv
+        )
+      )
+      remainingMoves.removeAll { $0 == bestMove }
+    }
+
+    let lines = stockfishDebugLines(from: candidates)
+    stockfishDebugLineCache[fen] = lines
+    return lines
+  }
+
+  private func legalRootMoves(in state: ChessGameState) -> [ChessMove] {
+    state.board
+      .filter { $0.value.color == state.turn }
+      .sorted { lhs, rhs in
+        if lhs.key.rank == rhs.key.rank {
+          return lhs.key.file < rhs.key.file
+        }
+        return lhs.key.rank < rhs.key.rank
+      }
+      .flatMap { square, _ in
+        state.legalMoves(from: square)
+      }
+  }
+
+  private func stateByReplacingTurn(in state: ChessGameState, with side: ChessColor) -> ChessGameState {
+    var updated = state
+    updated.turn = side
+    return updated
   }
 
   private func classifyMove(
@@ -3639,20 +3708,8 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     analysisTimingText = "Last analysis: \(analysis.durationMs)ms"
   }
 
-  private func stockfishDebugLines(from analysis: StockfishAnalysis) -> [String] {
-    let candidates = analysis.candidates.isEmpty
-      ? [
-          StockfishCandidate(
-            rank: 1,
-            bestMove: analysis.bestMove,
-            scoreCp: analysis.scoreCp,
-            mateIn: analysis.mateIn,
-            pv: analysis.pv
-          )
-        ]
-      : analysis.candidates
-
-    return Array(candidates.prefix(5)).map { candidate in
+  private func stockfishDebugLines(from candidates: [StockfishCandidate]) -> [String] {
+    Array(candidates.prefix(5)).map { candidate in
       let move = humanReadableMove(candidate.bestMove ?? candidate.pv.first ?? "(none)")
       let continuation = candidate.pv.dropFirst().prefix(2).map(humanReadableMove).joined(separator: " -> ")
       if continuation.isEmpty {
@@ -4039,15 +4096,6 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     return Array(Set(themes)).sorted()
   }
 
-  private func fenByReplacingSideToMove(in fen: String, with side: ChessColor) -> String {
-    var fields = fen.split(separator: " ", omittingEmptySubsequences: false).map(String.init)
-    guard fields.count == 6 else {
-      return fen
-    }
-
-    fields[1] = side.fenSymbol
-    return fields.joined(separator: " ")
-  }
 
   private func bestMoveDescription(from analysis: StockfishAnalysis) -> String {
     guard let bestMove = analysis.bestMove, bestMove != "(none)" else {
