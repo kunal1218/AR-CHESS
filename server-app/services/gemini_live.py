@@ -31,6 +31,10 @@ class _TurnBuffer:
     done: asyncio.Future[str]
     metadata: dict[str, Any] | None = None
     chunks: list[str] = field(default_factory=list)
+    transcript_text: str = ""
+    last_output_transcription: str = ""
+    turn_complete_received: bool = False
+    finish_task: asyncio.Task[None] | None = None
 
 
 class GeminiLiveClient:
@@ -70,7 +74,6 @@ class GeminiLiveClient:
             "top_p": 0.9,
             "top_k": 32,
             "max_output_tokens": 64,
-            "responseModalities": ["TEXT"],
         }
         self._ws_url = ws_url or self.DEFAULT_WS_URL
         self._logger = logger or logging.getLogger("archess.gemini.live")
@@ -254,17 +257,21 @@ class GeminiLiveClient:
 
     def _build_setup_payload(self) -> dict[str, Any]:
         generation_config = dict(self._generation_config)
-        generation_config.setdefault("responseModalities", ["TEXT"])
-
-        return {
-            "setup": {
-                "model": self._model,
-                "generationConfig": generation_config,
-                "systemInstruction": {
-                    "parts": [{"text": self._system_prompt}],
-                },
-            }
+        setup: dict[str, Any] = {
+            "model": self._model,
+            "generationConfig": generation_config,
+            "systemInstruction": {
+                "parts": [{"text": self._system_prompt}],
+            },
         }
+
+        if self._requires_audio_output():
+            generation_config["responseModalities"] = ["AUDIO"]
+            setup["outputAudioTranscription"] = {}
+        else:
+            generation_config.setdefault("responseModalities", ["TEXT"])
+
+        return {"setup": setup}
 
     def _build_client_content_payload(self, text: str, *, turn_complete: bool) -> dict[str, Any]:
         turns: list[dict[str, Any]] = []
@@ -367,6 +374,16 @@ class GeminiLiveClient:
                 self._setup_future.set_result(True)
             self._set_status(self.CONNECTED)
 
+        output_transcription = message.get("outputTranscription") or message.get("output_transcription")
+        if isinstance(output_transcription, dict):
+            text = output_transcription.get("text")
+            if isinstance(text, str) and text:
+                if self._setup_future and not self._setup_future.done():
+                    self._setup_future.set_result(True)
+                    self._logger.info("Gemini Live first output transcription received")
+                self._set_status(self.CONNECTED)
+                await self._handle_output_transcription(text)
+
         server_content = message.get("serverContent") or message.get("server_content")
         if not isinstance(server_content, dict):
             return
@@ -401,13 +418,51 @@ class GeminiLiveClient:
         if turn_complete is None:
             turn_complete = server_content.get("turn_complete")
         if bool(turn_complete):
-            self._finish_active_turn()
+            if self._current_turn is not None:
+                self._current_turn.turn_complete_received = True
+
+            if self._requires_audio_output():
+                self._schedule_finish_active_turn(delay_seconds=0.35)
+            else:
+                self._finish_active_turn()
+
+    async def _handle_output_transcription(self, text: str) -> None:
+        if self._current_turn is None:
+            return
+
+        normalized = text.strip()
+        if not normalized:
+            return
+
+        previous = self._current_turn.last_output_transcription
+        self._current_turn.last_output_transcription = normalized
+        self._current_turn.transcript_text = normalized
+
+        if self._partial_callback is not None:
+            delta = normalized
+            if previous and normalized.startswith(previous):
+                delta = normalized[len(previous) :]
+            if delta:
+                callback_result = self._partial_callback(
+                    delta,
+                    self._current_turn.metadata,
+                )
+                if inspect.isawaitable(callback_result):
+                    await callback_result
+
+        if self._current_turn.turn_complete_received:
+            self._schedule_finish_active_turn(delay_seconds=0.35)
 
     def _finish_active_turn(self) -> None:
         if self._current_turn is None:
             return
 
-        combined = "".join(self._current_turn.chunks).strip()
+        self._cancel_finish_task(self._current_turn)
+
+        combined = self._current_turn.transcript_text.strip()
+        if not combined:
+            combined = "".join(self._current_turn.chunks).strip()
+
         if not self._current_turn.done.done():
             self._current_turn.done.set_result(combined)
         self._current_turn = None
@@ -415,9 +470,32 @@ class GeminiLiveClient:
     def _fail_active_turn(self, error: Exception) -> None:
         if self._current_turn is None:
             return
+        self._cancel_finish_task(self._current_turn)
         if not self._current_turn.done.done():
             self._current_turn.done.set_exception(error)
         self._current_turn = None
+
+    def _schedule_finish_active_turn(self, *, delay_seconds: float) -> None:
+        if self._current_turn is None:
+            return
+
+        self._cancel_finish_task(self._current_turn)
+        self._current_turn.finish_task = asyncio.create_task(
+            self._finish_active_turn_after_delay(delay_seconds)
+        )
+
+    async def _finish_active_turn_after_delay(self, delay_seconds: float) -> None:
+        try:
+            await asyncio.sleep(delay_seconds)
+            self._finish_active_turn()
+        except asyncio.CancelledError:
+            raise
+
+    @staticmethod
+    def _cancel_finish_task(turn: _TurnBuffer) -> None:
+        if turn.finish_task is not None and not turn.finish_task.done():
+            turn.finish_task.cancel()
+        turn.finish_task = None
 
     async def _close_socket(self, *, best_effort: bool) -> None:
         ws = self._ws
@@ -561,3 +639,6 @@ class GeminiLiveClient:
         if normalized.startswith("models/"):
             normalized = normalized.removeprefix("models/")
         return normalized
+
+    def _requires_audio_output(self) -> bool:
+        return "native-audio" in self._normalized_model_name(self._model)

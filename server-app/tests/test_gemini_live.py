@@ -95,6 +95,20 @@ def test_build_setup_payload_defaults_to_text_response_modality() -> None:
     assert payload["setup"]["generationConfig"]["responseModalities"] == ["TEXT"]
 
 
+def test_build_setup_payload_uses_audio_transcription_for_native_audio_models() -> None:
+    client = GeminiLiveClient(
+        api_key="test-key",
+        model=GeminiLiveClient.DEFAULT_MODEL,
+        system_prompt="System prompt",
+        generation_config={"temperature": 0.5},
+    )
+
+    payload = client._build_setup_payload()  # noqa: SLF001
+
+    assert payload["setup"]["generationConfig"]["responseModalities"] == ["AUDIO"]
+    assert payload["setup"]["outputAudioTranscription"] == {}
+
+
 def test_build_client_content_payload_uses_live_camel_case_fields() -> None:
     client = GeminiLiveClient(
         api_key="test-key",
@@ -153,6 +167,16 @@ def test_is_terminal_error_treats_voice_extraction_close_reason_as_terminal() ->
     assert client._is_terminal_error(  # noqa: SLF001
         "received 1007 (invalid frame payload data) Cannot extract voices from a non-audio request."
     )
+
+
+def test_requires_audio_output_for_native_audio_models() -> None:
+    client = GeminiLiveClient(
+        api_key="test-key",
+        model=GeminiLiveClient.DEFAULT_MODEL,
+        system_prompt="test",
+    )
+
+    assert client._requires_audio_output() is True  # noqa: SLF001
 
 
 def test_validate_live_model_rejects_shut_down_model() -> None:
