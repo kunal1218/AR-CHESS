@@ -1207,6 +1207,12 @@ private extension URL {
   }
 }
 
+private enum StockfishAnalysisDefaults {
+  static let multiPV = 5
+  static let pvPreviewCount = 5
+  static let confidenceGapWindowCp = 240
+}
+
 private struct StockfishAnalysis {
   let fen: String
   let sideToMove: ChessColor
@@ -1216,7 +1222,12 @@ private struct StockfishAnalysis {
   let mateIn: Int?
   let pv: [String]
   let bestMove: String?
-  let candidates: [StockfishCandidate]
+  let rawCandidates: [StockfishCandidate]
+  let topUniqueMoves: [StockfishCandidate]
+
+  var candidates: [StockfishCandidate] {
+    rawCandidates
+  }
 
   var normalizedScore: Int {
     if let mateIn {
@@ -1249,10 +1260,41 @@ private struct StockfishAnalysis {
 
 private struct StockfishCandidate {
   let rank: Int
-  let bestMove: String?
+  let move: String?
   let scoreCp: Int?
   let mateIn: Int?
+  let depth: Int
   let pv: [String]
+  let pvPreview: [String]
+  let rootFrom: String?
+  let rootTo: String?
+  let confidence: Double
+
+  init(
+    rank: Int,
+    move: String?,
+    scoreCp: Int?,
+    mateIn: Int?,
+    depth: Int,
+    pv: [String],
+    confidence: Double = 1.0
+  ) {
+    let resolvedMove = move ?? pv.first
+    self.rank = rank
+    self.move = resolvedMove
+    self.scoreCp = scoreCp
+    self.mateIn = mateIn
+    self.depth = depth
+    self.pv = pv
+    self.pvPreview = Array(pv.prefix(StockfishAnalysisDefaults.pvPreviewCount))
+    self.rootFrom = resolvedMove.map { String($0.prefix(2)) }
+    self.rootTo = resolvedMove.map { String($0.dropFirst(2).prefix(2)) }
+    self.confidence = max(0.0, min(1.0, confidence))
+  }
+
+  var bestMove: String? {
+    move
+  }
 
   var formattedScore: String {
     if let mateIn {
@@ -1260,6 +1302,15 @@ private struct StockfishCandidate {
     }
 
     return String(format: "%+.2f", Double(scoreCp ?? 0) / 100.0)
+  }
+
+  var normalizedScore: Int {
+    if let mateIn {
+      let magnitude = max(1, 100_000 - (abs(mateIn) * 1_000))
+      return mateIn >= 0 ? magnitude : -magnitude
+    }
+
+    return scoreCp ?? 0
   }
 }
 
@@ -1326,7 +1377,8 @@ private struct StockfishSearchOptions {
   static func realtime(
     movetimeMs: Int = 80,
     hardTimeoutMs: Int = 600,
-    multiPV: Int = 1,
+    // Human-facing analysis wants multiple candidate choices, not only the best line.
+    multiPV: Int = StockfishAnalysisDefaults.multiPV,
     searchMoves: [String]? = nil
   ) -> Self {
     StockfishSearchOptions(
@@ -2195,7 +2247,9 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
     let payload = StockfishSearchOptions(
       movetimeMs: options.movetimeMs ?? config.defaultMovetimeMs,
       debugDepth: options.debugDepth,
-      hardTimeoutMs: options.hardTimeoutMs ?? max(config.hardTimeoutMs, (options.movetimeMs ?? config.defaultMovetimeMs) * 4)
+      hardTimeoutMs: options.hardTimeoutMs ?? max(config.hardTimeoutMs, (options.movetimeMs ?? config.defaultMovetimeMs) * 4),
+      multiPV: max(1, options.multiPV ?? 1),
+      searchMoves: options.searchMoves
     )
     let fenHash = Self.hashFEN(validatedFEN.fen)
     lastStatus = payload.debugDepth != nil
@@ -2550,6 +2604,13 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
 
     let durationMs = payload["durationMs"] as? Int
       ?? max(0, Int(Date().timeIntervalSince(pending.startedAt) * 1_000))
+    let rawCandidates = Self.decodeCandidates(
+      from: payload["candidates"],
+      fallbackMove: bestMove,
+      fallbackScoreCp: payload["scoreCp"] as? Int,
+      fallbackMateIn: payload["mateIn"] as? Int,
+      fallbackPV: payload["pv"] as? [String] ?? []
+    )
     let analysis = StockfishAnalysis(
       fen: pending.fen,
       sideToMove: pending.sideToMove,
@@ -2559,7 +2620,8 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
       mateIn: payload["mateIn"] as? Int,
       pv: payload["pv"] as? [String] ?? [],
       bestMove: bestMove,
-      candidates: Self.decodeCandidates(from: payload["candidates"])
+      rawCandidates: rawCandidates,
+      topUniqueMoves: Self.buildTopUniqueMoves(from: rawCandidates)
     )
 
     lastError = nil
@@ -2608,22 +2670,149 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
     return "stockfish-\(requestCounter)"
   }
 
-  private static func decodeCandidates(from rawValue: Any?) -> [StockfishCandidate] {
+  private static func decodeCandidates(
+    from rawValue: Any?,
+    fallbackMove: String?,
+    fallbackScoreCp: Int?,
+    fallbackMateIn: Int?,
+    fallbackPV: [String]
+  ) -> [StockfishCandidate] {
     guard let rawCandidates = rawValue as? [[String: Any]] else {
-      return []
+      return fallbackCandidates(
+        bestMove: fallbackMove,
+        scoreCp: fallbackScoreCp,
+        mateIn: fallbackMateIn,
+        pv: fallbackPV
+      )
     }
 
-    return rawCandidates.compactMap { payload in
-      let rank = payload["rank"] as? Int ?? 1
+    let decoded = rawCandidates.compactMap { payload in
+      let pv = payload["pv"] as? [String] ?? []
       return StockfishCandidate(
-        rank: rank,
-        bestMove: payload["bestMove"] as? String,
+        rank: payload["rank"] as? Int ?? 1,
+        move: payload["move"] as? String ?? payload["bestMove"] as? String,
         scoreCp: payload["scoreCp"] as? Int,
         mateIn: payload["mateIn"] as? Int,
-        pv: payload["pv"] as? [String] ?? []
+        depth: payload["depth"] as? Int ?? 0,
+        pv: pv
       )
     }
     .sorted { $0.rank < $1.rank }
+
+    if decoded.isEmpty {
+      return fallbackCandidates(
+        bestMove: fallbackMove,
+        scoreCp: fallbackScoreCp,
+        mateIn: fallbackMateIn,
+        pv: fallbackPV
+      )
+    }
+
+    if let fallbackMove, !fallbackMove.isEmpty, !decoded.contains(where: { $0.move == fallbackMove }) {
+      let fallback = StockfishCandidate(
+        rank: 1,
+        move: fallbackMove,
+        scoreCp: fallbackScoreCp,
+        mateIn: fallbackMateIn,
+        depth: decoded.first?.depth ?? 0,
+        pv: fallbackPV
+      )
+      return ([fallback] + decoded).sorted { $0.rank < $1.rank }
+    }
+
+    return decoded
+  }
+
+  private static func fallbackCandidates(
+    bestMove: String?,
+    scoreCp: Int?,
+    mateIn: Int?,
+    pv: [String]
+  ) -> [StockfishCandidate] {
+    guard let bestMove, !bestMove.isEmpty else {
+      return []
+    }
+
+    return [
+      StockfishCandidate(
+        rank: 1,
+        move: bestMove,
+        scoreCp: scoreCp,
+        mateIn: mateIn,
+        depth: 0,
+        pv: pv.isEmpty ? [bestMove] : pv
+      )
+    ]
+  }
+
+  private static func buildTopUniqueMoves(from rawCandidates: [StockfishCandidate]) -> [StockfishCandidate] {
+    // Stockfish streams repeated info lines during search. By the time we receive bestmove,
+    // each multipv rank holds its latest final snapshot. We then dedupe by root move so the
+    // UI shows distinct human choices rather than repeated near-identical PVs.
+    var bestByMove: [String: StockfishCandidate] = [:]
+
+    for candidate in rawCandidates {
+      guard let move = candidate.move, !move.isEmpty else {
+        continue
+      }
+
+      if let existing = bestByMove[move] {
+        if shouldPrefer(candidate, over: existing) {
+          bestByMove[move] = candidate
+        }
+      } else {
+        bestByMove[move] = candidate
+      }
+    }
+
+    let ordered = bestByMove.values
+      .sorted(by: compareCandidates)
+      .prefix(StockfishAnalysisDefaults.multiPV)
+
+    guard let bestCandidate = ordered.first else {
+      return []
+    }
+
+    return Array(ordered.enumerated()).map { index, candidate in
+      StockfishCandidate(
+        rank: index + 1,
+        move: candidate.move,
+        scoreCp: candidate.scoreCp,
+        mateIn: candidate.mateIn,
+        depth: candidate.depth,
+        pv: candidate.pv,
+        confidence: confidence(for: candidate, relativeTo: bestCandidate)
+      )
+    }
+  }
+
+  private static func shouldPrefer(_ candidate: StockfishCandidate, over existing: StockfishCandidate) -> Bool {
+    if candidate.rank != existing.rank {
+      return candidate.rank < existing.rank
+    }
+    if candidate.normalizedScore != existing.normalizedScore {
+      return candidate.normalizedScore > existing.normalizedScore
+    }
+    return candidate.depth > existing.depth
+  }
+
+  private static func compareCandidates(_ left: StockfishCandidate, _ right: StockfishCandidate) -> Bool {
+    if left.normalizedScore != right.normalizedScore {
+      return left.normalizedScore > right.normalizedScore
+    }
+    if left.rank != right.rank {
+      return left.rank < right.rank
+    }
+    if left.depth != right.depth {
+      return left.depth > right.depth
+    }
+    return (left.move ?? "") < (right.move ?? "")
+  }
+
+  private static func confidence(for candidate: StockfishCandidate, relativeTo bestCandidate: StockfishCandidate) -> Double {
+    let gap = max(0, bestCandidate.normalizedScore - candidate.normalizedScore)
+    let clampedGap = min(gap, StockfishAnalysisDefaults.confidenceGapWindowCp)
+    return 1.0 - (Double(clampedGap) / Double(StockfishAnalysisDefaults.confidenceGapWindowCp))
   }
 
   private func evaluate(
@@ -2870,12 +3059,21 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
 
             const multipvMatch = line.match(/\\smultipv\\s(\\d+)/);
             const rank = multipvMatch ? parseInt(multipvMatch[1], 10) : 1;
+            // Stockfish emits many incremental info updates per rank while searching. We keep
+            // only the latest snapshot for each multipv rank and publish the set once bestmove
+            // arrives, which prevents intermediate search spam from masquerading as final lines.
             const candidate = current.candidates[rank] || {
               rank,
               scoreCp: null,
               mateIn: null,
+              depth: 0,
               pv: [],
             };
+
+            const depthMatch = line.match(/\\sdepth\\s(\\d+)/);
+            if (depthMatch) {
+              candidate.depth = parseInt(depthMatch[1], 10);
+            }
 
             const cpMatch = line.match(/score cp (-?\\d+)/);
             if (cpMatch) {
@@ -2981,8 +3179,9 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
                   rank: candidate.rank || 1,
                   scoreCp: candidate.scoreCp ?? null,
                   mateIn: candidate.mateIn ?? null,
+                  depth: candidate.depth || 0,
                   pv: candidate.pv || [],
-                  bestMove: candidate.pv && candidate.pv.length > 0 ? candidate.pv[0] : null,
+                  move: candidate.pv && candidate.pv.length > 0 ? candidate.pv[0] : null,
                 }));
 
               bridgePost({
@@ -3105,9 +3304,9 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   @Published private(set) var visibleHintText: String?
   @Published private(set) var isHintLoading = false
   @Published private(set) var geminiDebugLines: [String] = []
-  @Published private(set) var stockfishDebugStatusText = "Open Gemini debug to inspect Stockfish lines."
-  @Published private(set) var stockfishDebugWhiteLines: [String] = []
-  @Published private(set) var stockfishDebugBlackLines: [String] = []
+  @Published private(set) var stockfishDebugStatusText = "Open Stockfish debug to inspect engine candidates."
+  @Published private(set) var stockfishDebugWhiteMoves: [StockfishCandidate] = []
+  @Published private(set) var stockfishDebugBlackMoves: [StockfishCandidate] = []
   @Published private(set) var geminiConnectionState: GeminiLiveStatusPayload.ConnectionState = .disconnected
   @Published private(set) var geminiConnectionLastError: String?
   @Published private(set) var geminiConnectionSince: String?
@@ -3117,7 +3316,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   private let synthesizer = AVSpeechSynthesizer()
   private var utteranceCaptions: [ObjectIdentifier: Caption] = [:]
   private var cachedAnalysis: CachedAnalysis?
-  private var stockfishDebugLineCache: [String: [String]] = [:]
+  private var stockfishDebugAnalysisCache: [String: StockfishAnalysis] = [:]
   private var completedPlyCount = 0
   private var nextCommentaryPly = Int.random(in: commentaryIntervalRange)
   private var reactionHandler: ((ReactionCue) -> Void)?
@@ -3157,7 +3356,8 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
         fen: fen,
         options: .realtime(
           movetimeMs: Self.preferredMovetimeMs,
-          hardTimeoutMs: Self.preferredHardTimeoutMs
+          hardTimeoutMs: Self.preferredHardTimeoutMs,
+          multiPV: StockfishAnalysisDefaults.multiPV
         )
       )
       cachedAnalysis = CachedAnalysis(fen: fen, analysis: analysis)
@@ -3181,8 +3381,8 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
         : defaultHintStatus()
       if stockfishDebugVisible {
         stockfishDebugStatusText = "Stockfish debug unavailable: \(message)"
-        stockfishDebugWhiteLines = []
-        stockfishDebugBlackLines = []
+        stockfishDebugWhiteMoves = []
+        stockfishDebugBlackMoves = []
       }
     }
   }
@@ -3192,7 +3392,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     utteranceCaptions.removeAll()
     caption = nil
     cachedAnalysis = nil
-    stockfishDebugLineCache.removeAll()
+    stockfishDebugAnalysisCache.removeAll()
     hintTask?.cancel()
     hintTask = nil
     geminiStatusTask?.cancel()
@@ -3205,9 +3405,9 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     narratedHintKeys.removeAll()
     lastGeminiStatusSnapshot = nil
     geminiDebugLines = []
-    stockfishDebugStatusText = "Open Gemini debug to inspect Stockfish lines."
-    stockfishDebugWhiteLines = []
-    stockfishDebugBlackLines = []
+    stockfishDebugStatusText = "Open Stockfish debug to inspect engine candidates."
+    stockfishDebugWhiteMoves = []
+    stockfishDebugBlackMoves = []
     visibleHintText = nil
     isHintLoading = false
     completedPlyCount = 0
@@ -3276,7 +3476,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     await prepare(with: state, force: true)
   }
 
-  func setGeminiDebugVisible(_ isVisible: Bool) {
+  func setStockfishDebugVisible(_ isVisible: Bool) {
     stockfishDebugVisible = isVisible
     guard isVisible else {
       return
@@ -3285,6 +3485,10 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     Task { @MainActor [weak self] in
       await self?.refreshStockfishDebugMoves(force: false)
     }
+  }
+
+  func setGeminiDebugVisible(_ isVisible: Bool) {
+    setStockfishDebugVisible(isVisible)
   }
 
   func revealHint() {
@@ -3485,7 +3689,8 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
         fen: fen,
         options: .realtime(
           movetimeMs: Self.preferredMovetimeMs,
-          hardTimeoutMs: Self.preferredHardTimeoutMs
+          hardTimeoutMs: Self.preferredHardTimeoutMs,
+          multiPV: StockfishAnalysisDefaults.multiPV
         )
       )
       cachedAnalysis = CachedAnalysis(fen: fen, analysis: analysis)
@@ -3506,119 +3711,66 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
 
     guard let state = state ?? stateProvider?() else {
       stockfishDebugStatusText = "Stockfish debug requires a board state."
-      stockfishDebugWhiteLines = []
-      stockfishDebugBlackLines = []
+      stockfishDebugWhiteMoves = []
+      stockfishDebugBlackMoves = []
       return
     }
 
-    stockfishDebugStatusText = "Refreshing Stockfish top lines..."
+    stockfishDebugStatusText = "Refreshing Stockfish MultiPV root moves..."
     let whiteState = stateByReplacingTurn(in: state, with: .white)
     let blackState = stateByReplacingTurn(in: state, with: .black)
 
-    stockfishDebugWhiteLines = await debugCandidateLines(
+    let whiteAnalysis = await debugAnalysis(
       for: whiteState,
       currentAnalysis: currentAnalysis,
       force: force
-    ) ?? []
-    stockfishDebugBlackLines = await debugCandidateLines(
+    )
+    let blackAnalysis = await debugAnalysis(
       for: blackState,
       currentAnalysis: currentAnalysis,
       force: force
-    ) ?? []
+    )
 
-    if !stockfishDebugWhiteLines.isEmpty || !stockfishDebugBlackLines.isEmpty {
-      stockfishDebugStatusText = "Stockfish top 5 root moves for the current board."
+    stockfishDebugWhiteMoves = whiteAnalysis?.topUniqueMoves ?? []
+    stockfishDebugBlackMoves = blackAnalysis?.topUniqueMoves ?? []
+
+    if !stockfishDebugWhiteMoves.isEmpty || !stockfishDebugBlackMoves.isEmpty {
+      stockfishDebugStatusText = "Stockfish ready. Showing final MultiPV root moves."
     } else {
       stockfishDebugStatusText = "Stockfish top lines unavailable."
     }
   }
 
-  private func debugCandidateLines(
+  private func debugAnalysis(
     for state: ChessGameState,
     currentAnalysis: StockfishAnalysis? = nil,
     force: Bool
-  ) async -> [String]? {
+  ) async -> StockfishAnalysis? {
     let fen = state.fenString
 
-    if !force, let cached = stockfishDebugLineCache[fen] {
+    if !force, let cached = stockfishDebugAnalysisCache[fen] {
       return cached
     }
 
-    let rootMoves = legalRootMoves(in: state).map(\.uciString)
-    guard !rootMoves.isEmpty else {
-      stockfishDebugLineCache[fen] = []
-      return []
+    if let currentAnalysis, currentAnalysis.fen == fen {
+      stockfishDebugAnalysisCache[fen] = currentAnalysis
+      return currentAnalysis
     }
 
-    var remainingMoves = rootMoves
-    var candidates: [StockfishCandidate] = []
-    let maxLines = min(5, remainingMoves.count)
-
-    if let currentAnalysis,
-       currentAnalysis.fen == fen,
-       let bestMove = currentAnalysis.bestMove,
-       bestMove != "(none)" {
-      candidates.append(
-        StockfishCandidate(
-          rank: 1,
-          bestMove: bestMove,
-          scoreCp: currentAnalysis.scoreCp,
-          mateIn: currentAnalysis.mateIn,
-          pv: currentAnalysis.pv
+    do {
+      let analysis = try await analyzer.analyze(
+        fen: fen,
+        options: .realtime(
+          movetimeMs: Self.preferredMovetimeMs,
+          hardTimeoutMs: Self.preferredHardTimeoutMs,
+          multiPV: StockfishAnalysisDefaults.multiPV
         )
       )
-      remainingMoves.removeAll { $0 == bestMove }
+      stockfishDebugAnalysisCache[fen] = analysis
+      return analysis
+    } catch {
+      return nil
     }
-
-    while candidates.count < maxLines && !remainingMoves.isEmpty {
-      let analysis: StockfishAnalysis
-      do {
-        analysis = try await analyzer.analyze(
-          fen: fen,
-          options: .realtime(
-            movetimeMs: Self.preferredMovetimeMs,
-            hardTimeoutMs: Self.preferredHardTimeoutMs,
-            multiPV: 1,
-            searchMoves: remainingMoves
-          )
-        )
-      } catch {
-        break
-      }
-
-      guard let bestMove = analysis.bestMove, bestMove != "(none)" else {
-        break
-      }
-
-      candidates.append(
-        StockfishCandidate(
-          rank: candidates.count + 1,
-          bestMove: bestMove,
-          scoreCp: analysis.scoreCp,
-          mateIn: analysis.mateIn,
-          pv: analysis.pv
-        )
-      )
-      remainingMoves.removeAll { $0 == bestMove }
-    }
-
-    let lines = stockfishDebugLines(from: candidates)
-    stockfishDebugLineCache[fen] = lines
-    return lines
-  }
-
-  private func legalRootMoves(in state: ChessGameState) -> [ChessMove] {
-    state.board
-      .filter { $0.value.color == state.turn }
-      .sorted { lhs, rhs in
-        if lhs.key.rank == rhs.key.rank {
-          return lhs.key.file < rhs.key.file
-        }
-        return lhs.key.rank < rhs.key.rank
-      }
-      .flatMap { square, _ in
-        state.legalMoves(from: square)
-      }
   }
 
   private func stateByReplacingTurn(in state: ChessGameState, with side: ChessColor) -> ChessGameState {
@@ -3706,17 +3858,6 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     whiteEvalText = "White eval: \(analysis.formattedEval(for: .white))"
     blackEvalText = "Black eval: \(analysis.formattedEval(for: .black))"
     analysisTimingText = "Last analysis: \(analysis.durationMs)ms"
-  }
-
-  private func stockfishDebugLines(from candidates: [StockfishCandidate]) -> [String] {
-    Array(candidates.prefix(5)).map { candidate in
-      let move = humanReadableMove(candidate.bestMove ?? candidate.pv.first ?? "(none)")
-      let continuation = candidate.pv.dropFirst().prefix(2).map(humanReadableMove).joined(separator: " -> ")
-      if continuation.isEmpty {
-        return "\(candidate.rank). \(move) (\(candidate.formattedScore))"
-      }
-      return "\(candidate.rank). \(move) (\(candidate.formattedScore)) | pv: \(continuation)"
-    }
   }
 
   private func prefetchHint(
@@ -5228,43 +5369,92 @@ private struct NativeARExperienceView: View {
         }
         .buttonStyle(.plain)
 
-        if commentary.stockfishDebugWhiteLines.isEmpty && commentary.stockfishDebugBlackLines.isEmpty {
+        if commentary.stockfishDebugWhiteMoves.isEmpty && commentary.stockfishDebugBlackMoves.isEmpty {
           Text("No Stockfish move lines yet.")
             .font(.system(size: 13, weight: .medium, design: .rounded))
             .foregroundStyle(Color.white.opacity(0.68))
         } else {
-          if !commentary.stockfishDebugWhiteLines.isEmpty {
+          if !commentary.stockfishDebugWhiteMoves.isEmpty {
             VStack(alignment: .leading, spacing: 4) {
               Text("Stockfish top 5: White")
                 .font(.system(size: 12, weight: .bold, design: .rounded))
                 .foregroundStyle(Color.white.opacity(0.86))
 
-              ForEach(Array(commentary.stockfishDebugWhiteLines.enumerated()), id: \.offset) { _, line in
-                Text(line)
-                  .font(.system(size: 11, weight: .medium, design: .monospaced))
-                  .foregroundStyle(Color.white.opacity(0.80))
-                  .textSelection(.enabled)
-              }
+              stockfishMoveList(commentary.stockfishDebugWhiteMoves)
             }
           }
 
-          if !commentary.stockfishDebugBlackLines.isEmpty {
+          if !commentary.stockfishDebugBlackMoves.isEmpty {
             VStack(alignment: .leading, spacing: 4) {
               Text("Stockfish top 5: Black")
                 .font(.system(size: 12, weight: .bold, design: .rounded))
                 .foregroundStyle(Color.white.opacity(0.86))
 
-              ForEach(Array(commentary.stockfishDebugBlackLines.enumerated()), id: \.offset) { _, line in
-                Text(line)
-                  .font(.system(size: 11, weight: .medium, design: .monospaced))
-                  .foregroundStyle(Color.white.opacity(0.80))
-                  .textSelection(.enabled)
-              }
+              stockfishMoveList(commentary.stockfishDebugBlackMoves)
             }
           }
         }
       }
     }
+  }
+
+  @ViewBuilder
+  private func stockfishMoveList(_ moves: [StockfishCandidate]) -> some View {
+    ForEach(Array(moves.prefix(StockfishAnalysisDefaults.multiPV).enumerated()), id: \.offset) { _, candidate in
+      VStack(alignment: .leading, spacing: 2) {
+        Text(stockfishCandidateHeadline(candidate))
+          .font(.system(size: 11, weight: .semibold, design: .monospaced))
+          .foregroundStyle(Color.white.opacity(0.84))
+          .textSelection(.enabled)
+
+        Text(stockfishCandidatePV(candidate))
+          .font(.system(size: 10, weight: .medium, design: .monospaced))
+          .foregroundStyle(Color.white.opacity(0.68))
+          .textSelection(.enabled)
+      }
+    }
+  }
+
+  private func stockfishCandidateHeadline(_ candidate: StockfishCandidate) -> String {
+    let move = commentaryHumanMove(candidate.move ?? "(none)")
+    let rootRange = [candidate.rootFrom, candidate.rootTo].compactMap { $0 }.joined(separator: "→")
+    let rootSuffix = rootRange.isEmpty ? "" : " | \(rootRange)"
+    let confidence = Int((candidate.confidence * 100.0).rounded())
+    return "\(candidate.rank). \(move) (\(candidate.formattedScore)) | d\(candidate.depth) | conf \(confidence)%\(rootSuffix)"
+  }
+
+  private func stockfishCandidatePV(_ candidate: StockfishCandidate) -> String {
+    let preview = candidate.pvPreview.map(commentaryHumanMove).joined(separator: " -> ")
+    return preview.isEmpty ? "pv: —" : "pv: \(preview)"
+  }
+
+  private func commentaryHumanMove(_ uci: String) -> String {
+    guard uci.count >= 4 else {
+      return uci
+    }
+
+    let from = String(uci.prefix(2))
+    let to = String(uci.dropFirst(2).prefix(2))
+    guard uci.count > 4 else {
+      return "\(from) to \(to)"
+    }
+
+    let promotion = String(uci.suffix(1)).lowercased()
+    let promotionName: String
+    switch promotion {
+    case "q":
+      promotionName = "queen"
+    case "r":
+      promotionName = "rook"
+    case "b":
+      promotionName = "bishop"
+    case "n":
+      promotionName = "knight"
+    default:
+      promotionName = promotion
+    }
+
+    return "\(from) to \(to) = \(promotionName)"
   }
 
   private var debugPanelBackground: some View {
@@ -5298,7 +5488,7 @@ private struct NativeARExperienceView: View {
   }
 
   private func syncStockfishDebugVisibility() {
-    commentary.setGeminiDebugVisible(isStockfishDebugVisible)
+    commentary.setStockfishDebugVisible(isStockfishDebugVisible)
   }
 
   private var modeTitle: String {
@@ -7527,8 +7717,8 @@ private struct NativeARView: UIViewRepresentable {
         for file in 0..<8 {
           let squareMesh = MeshResource.generateBox(size: SIMD3<Float>(squareSize, 0.004, squareSize))
           let squareColor: UIColor = (rank + file).isMultiple(of: 2)
-            ? UIColor(red: 0.93, green: 0.88, blue: 0.79, alpha: 1)
-            : UIColor(red: 0.22, green: 0.18, blue: 0.15, alpha: 1)
+            ? UIColor(red: 0.22, green: 0.18, blue: 0.15, alpha: 1)
+            : UIColor(red: 0.93, green: 0.88, blue: 0.79, alpha: 1)
 
           let squareMaterial = SimpleMaterial(color: squareColor, roughness: 0.35, isMetallic: false)
           let squareEntity = ModelEntity(mesh: squareMesh, materials: [squareMaterial])
