@@ -317,8 +317,12 @@ class GeminiLiveClient:
                 self._logger.warning("Gemini Live reader stopped: %s", message)
                 if self._setup_future and not self._setup_future.done():
                     self._setup_future.set_exception(GeminiLiveConnectionError(message))
-                self._set_status(self.DISCONNECTED, message)
-                self._schedule_reconnect_if_needed()
+                if self._is_terminal_error(message):
+                    self._terminal_error = True
+                    self._set_status(self.ERROR, message)
+                else:
+                    self._set_status(self.DISCONNECTED, message)
+                    self._schedule_reconnect_if_needed()
                 self._fail_active_turn(GeminiLiveConnectionError(message))
         finally:
             self._reader_task = None
@@ -485,10 +489,21 @@ class GeminiLiveClient:
             return True
 
         lowered = message.lower()
+        if "api key" in lowered and any(
+            marker in lowered for marker in ("expired", "expir", "invalid", "revoked", "disabled")
+        ):
+            return True
+
+        if "invalid frame payload data" in lowered and any(
+            marker in lowered for marker in ("api key", "credential", "auth", "unauth")
+        ):
+            return True
+
         return any(
             marker in lowered
             for marker in (
                 "api key not valid",
+                "api key expired",
                 "permission_denied",
                 "unauthenticated",
                 "forbidden",

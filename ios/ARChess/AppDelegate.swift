@@ -3042,12 +3042,12 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   private var narratedHintKeys: Set<String> = []
   private var nextKingCookedAllowedPly: [ChessColor: Int] = [:]
   private var lastGeminiStatusSnapshot: GeminiLiveStatusPayload?
+  private var nextGeminiBackgroundRetryAt: Date?
 
   override init() {
     super.init()
     synthesizer.delegate = self
     hintStatusText = defaultHintStatus()
-    startGeminiStatusMonitoring()
   }
 
   func attachEngineHost(to view: UIView) {
@@ -3143,6 +3143,8 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
 
   func unbindStateProvider() {
     stateProvider = nil
+    geminiStatusTask?.cancel()
+    geminiStatusTask = nil
   }
 
   func bindHintAvailabilityProvider(_ provider: @escaping () -> Bool) {
@@ -3521,6 +3523,33 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       return
     }
 
+    if geminiConnectionState == .error, geminiLooksTerminal(geminiConnectionLastError) {
+      isHintLoading = false
+      hintStatusText = "Hint unavailable right now."
+      appendGeminiDebug("Skipped hint request because Gemini Live reported a terminal auth/config error.")
+      return
+    }
+
+    if !revealWhenReady {
+      if let retryAt = nextGeminiBackgroundRetryAt, retryAt > Date() {
+        isHintLoading = false
+        hintStatusText = geminiConnectionState == .connected
+          ? "Fun hints warm up in the background when it is your turn."
+          : "Hint warming up in the background."
+        appendGeminiDebug("Skipped Gemini prefetch because the retry cooldown is still active.")
+        return
+      }
+
+      guard geminiConnectionState == .connected else {
+        isHintLoading = false
+        hintStatusText = geminiConnectionState == .error
+          ? "Hint unavailable right now."
+          : "Hint warming up in the background."
+        appendGeminiDebug("Deferred Gemini prefetch until Live finishes connecting.")
+        return
+      }
+    }
+
     isHintLoading = true
     hintStatusText = pendingHintReveal ? "Loading hint..." : "Preparing a playful hint..."
     appendGeminiDebug("Prefetching Gemini hint in background for move \(context.bestMove).")
@@ -3532,7 +3561,6 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       }
 
       do {
-        await self.refreshGeminiStatus()
         let hint = try await self.hintService.fetchHint(for: context)
         await MainActor.run {
           guard self.currentHintKey == key else {
@@ -3541,6 +3569,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
 
           self.hintTask = nil
           self.hintCache[key] = hint
+          self.nextGeminiBackgroundRetryAt = nil
           self.isHintLoading = false
           self.hintStatusText = "Hint ready. Tap Hint."
           self.appendGeminiDebug("Gemini hint ready and cached for the current turn.")
@@ -3554,20 +3583,19 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
             self.narrateGeminiHintIfNeeded(text: hint, key: key, allowRepeat: allowRepeatNarration)
           }
         }
-        await self.refreshGeminiStatus()
       } catch is CancellationError {
         await MainActor.run {
           self.appendGeminiDebug("Gemini hint request was cancelled because a newer turn replaced it.")
         }
         return
       } catch {
-        await self.refreshGeminiStatus()
         await MainActor.run {
           guard self.currentHintKey == key else {
             return
           }
 
           self.hintTask = nil
+          self.recordGeminiHintFailure(error)
           self.isHintLoading = false
           self.visibleHintText = nil
           self.pendingHintReveal = false
@@ -3614,7 +3642,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
 
       while !Task.isCancelled {
         await self.refreshGeminiStatus()
-        try? await Task.sleep(nanoseconds: 1_000_000_000)
+        try? await Task.sleep(nanoseconds: self.geminiStatusPollInterval())
       }
     }
   }
@@ -3653,6 +3681,11 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     } else {
       appendGeminiDebug("Gemini Live status -> \(status.state.rawValue)")
     }
+
+    if status.state == .connected {
+      nextGeminiBackgroundRetryAt = nil
+      maybeResumeGeminiPrefetch(after: previous, status: status)
+    }
   }
 
   private func defaultHintStatus() -> String {
@@ -3669,6 +3702,71 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     if geminiDebugLines.count > 18 {
       geminiDebugLines.removeFirst(geminiDebugLines.count - 18)
     }
+  }
+
+  private func geminiStatusPollInterval() -> UInt64 {
+    let seconds: UInt64
+    switch geminiConnectionState {
+    case .connected:
+      seconds = 15
+    case .connecting:
+      seconds = 3
+    case .disconnected:
+      seconds = 5
+    case .error:
+      seconds = geminiLooksTerminal(geminiConnectionLastError) ? 30 : 10
+    }
+
+    return seconds * 1_000_000_000
+  }
+
+  private func recordGeminiHintFailure(_ error: Error) {
+    let description = error.localizedDescription
+    let cooldownSeconds: TimeInterval = geminiLooksTerminal(description) ? 60 : 12
+    nextGeminiBackgroundRetryAt = Date().addingTimeInterval(cooldownSeconds)
+  }
+
+  private func geminiLooksTerminal(_ message: String?) -> Bool {
+    let lowered = message?.lowercased() ?? ""
+    guard !lowered.isEmpty else {
+      return false
+    }
+
+    if lowered.contains("api key") && (lowered.contains("expir") || lowered.contains("invalid")) {
+      return true
+    }
+
+    return lowered.contains("permission_denied")
+      || lowered.contains("unauthenticated")
+      || lowered.contains("forbidden")
+      || lowered.contains("invalid frame payload data")
+  }
+
+  private func maybeResumeGeminiPrefetch(
+    after previous: GeminiLiveStatusPayload?,
+    status: GeminiLiveStatusPayload
+  ) {
+    guard previous?.state != status.state else {
+      return
+    }
+
+    guard status.state == .connected else {
+      return
+    }
+
+    guard hintTask == nil else {
+      return
+    }
+
+    guard let state = stateProvider?(),
+          let cached = cachedAnalysis,
+          cached.fen == state.fenString,
+          shouldPrefetchHint(for: state) else {
+      return
+    }
+
+    appendGeminiDebug("Gemini Live connected; resuming background hint prefetch for the current turn.")
+    prefetchHint(for: state, analysis: cached.analysis)
   }
 
   private func shouldPrefetchHint(for _: ChessGameState) -> Bool {

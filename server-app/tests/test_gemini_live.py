@@ -115,3 +115,15 @@ def test_is_socket_open_supports_websockets16_state() -> None:
     client._ws = SimpleNamespace(state=State.OPEN)  # noqa: SLF001
 
     assert client._is_socket_open() is True  # noqa: SLF001
+
+
+def test_is_terminal_error_treats_expired_api_key_close_reason_as_terminal() -> None:
+    client = GeminiLiveClient(
+        api_key="test-key",
+        model="models/test",
+        system_prompt="test",
+    )
+
+    assert client._is_terminal_error(  # noqa: SLF001
+        "received 1007 (invalid frame payload data) API key expired"
+    )
