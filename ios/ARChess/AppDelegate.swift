@@ -7209,10 +7209,10 @@ private struct NativeARView: UIViewRepresentable {
       // smaller than the piece and offset above-right of the crown while still
       // tracking the piece's world position through projection.
       let projectedHeadHeight = abs(neck.y - head.y)
-      let size = max(28, min(74, projectedHeadHeight * 1.85))
+      let size = max(18, min(42, projectedHeadHeight * 1.1))
       let exponentCenter = CGPoint(
-        x: head.x + max(size * 0.18, projectedHeadHeight * 0.55),
-        y: head.y - max(size * 0.22, projectedHeadHeight * 0.35)
+        x: head.x + max(size * 0.28, projectedHeadHeight * 0.22),
+        y: head.y - max(size * 0.16, projectedHeadHeight * 0.14)
       )
       let origin = CGPoint(x: exponentCenter.x - (size * 0.5), y: exponentCenter.y - (size * 0.5))
       let frame = CGRect(origin: origin, size: CGSize(width: size, height: size))
