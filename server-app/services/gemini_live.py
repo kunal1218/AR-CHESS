@@ -70,6 +70,7 @@ class GeminiLiveClient:
             "top_p": 0.9,
             "top_k": 32,
             "max_output_tokens": 64,
+            "responseModalities": ["TEXT"],
         }
         self._ws_url = ws_url or self.DEFAULT_WS_URL
         self._logger = logger or logging.getLogger("archess.gemini.live")
@@ -252,10 +253,13 @@ class GeminiLiveClient:
         _ = metadata
 
     def _build_setup_payload(self) -> dict[str, Any]:
+        generation_config = dict(self._generation_config)
+        generation_config.setdefault("responseModalities", ["TEXT"])
+
         return {
             "setup": {
                 "model": self._model,
-                "generationConfig": self._generation_config,
+                "generationConfig": generation_config,
                 "systemInstruction": {
                     "parts": [{"text": self._system_prompt}],
                 },
@@ -508,6 +512,9 @@ class GeminiLiveClient:
         ):
             return True
 
+        if "cannot extract voices from a non-audio request" in lowered:
+            return True
+
         return any(
             marker in lowered
             for marker in (
@@ -520,6 +527,7 @@ class GeminiLiveClient:
                 "http 403",
                 "invalid argument",
                 "invalid setup",
+                "cannot extract voices",
                 "malformed",
             )
         )

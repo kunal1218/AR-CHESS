@@ -66,7 +66,7 @@ def test_build_setup_payload_uses_live_camel_case_fields() -> None:
         api_key="test-key",
         model="models/test",
         system_prompt="System prompt",
-        generation_config={"temperature": 0.5},
+        generation_config={"temperature": 0.5, "responseModalities": ["TEXT"]},
     )
 
     payload = client._build_setup_payload()  # noqa: SLF001
@@ -74,12 +74,25 @@ def test_build_setup_payload_uses_live_camel_case_fields() -> None:
     assert payload == {
         "setup": {
             "model": "models/test",
-            "generationConfig": {"temperature": 0.5},
+            "generationConfig": {"temperature": 0.5, "responseModalities": ["TEXT"]},
             "systemInstruction": {
                 "parts": [{"text": "System prompt"}],
             },
         }
     }
+
+
+def test_build_setup_payload_defaults_to_text_response_modality() -> None:
+    client = GeminiLiveClient(
+        api_key="test-key",
+        model="models/test",
+        system_prompt="System prompt",
+        generation_config={"temperature": 0.5},
+    )
+
+    payload = client._build_setup_payload()  # noqa: SLF001
+
+    assert payload["setup"]["generationConfig"]["responseModalities"] == ["TEXT"]
 
 
 def test_build_client_content_payload_uses_live_camel_case_fields() -> None:
@@ -127,6 +140,18 @@ def test_is_terminal_error_treats_expired_api_key_close_reason_as_terminal() -> 
 
     assert client._is_terminal_error(  # noqa: SLF001
         "received 1007 (invalid frame payload data) API key expired"
+    )
+
+
+def test_is_terminal_error_treats_voice_extraction_close_reason_as_terminal() -> None:
+    client = GeminiLiveClient(
+        api_key="test-key",
+        model="models/test",
+        system_prompt="test",
+    )
+
+    assert client._is_terminal_error(  # noqa: SLF001
+        "received 1007 (invalid frame payload data) Cannot extract voices from a non-audio request."
     )
 
 
