@@ -1216,6 +1216,7 @@ private struct StockfishAnalysis {
   let mateIn: Int?
   let pv: [String]
   let bestMove: String?
+  let candidates: [StockfishCandidate]
 
   var normalizedScore: Int {
     if let mateIn {
@@ -1243,6 +1244,22 @@ private struct StockfishAnalysis {
 
     let centipawns = color == .white ? whitePerspectiveScore : blackPerspectiveScore
     return String(format: "%+.2f", Double(centipawns) / 100.0)
+  }
+}
+
+private struct StockfishCandidate {
+  let rank: Int
+  let bestMove: String?
+  let scoreCp: Int?
+  let mateIn: Int?
+  let pv: [String]
+
+  var formattedScore: String {
+    if let mateIn {
+      return mateIn >= 0 ? "#\(mateIn)" : "-#\(abs(mateIn))"
+    }
+
+    return String(format: "%+.2f", Double(scoreCp ?? 0) / 100.0)
   }
 }
 
@@ -1303,12 +1320,14 @@ private struct StockfishSearchOptions {
   var movetimeMs: Int?
   var debugDepth: Int?
   var hardTimeoutMs: Int?
+  var multiPV: Int?
 
-  static func realtime(movetimeMs: Int = 80, hardTimeoutMs: Int = 600) -> Self {
+  static func realtime(movetimeMs: Int = 80, hardTimeoutMs: Int = 600, multiPV: Int = 1) -> Self {
     StockfishSearchOptions(
       movetimeMs: movetimeMs,
       debugDepth: nil,
-      hardTimeoutMs: hardTimeoutMs
+      hardTimeoutMs: hardTimeoutMs,
+      multiPV: multiPV
     )
   }
 }
@@ -2193,6 +2212,7 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
         "fen": validatedFEN.fen,
         "movetimeMs": payload.movetimeMs ?? config.defaultMovetimeMs,
         "debugDepth": payload.debugDepth as Any,
+        "multiPV": payload.multiPV ?? 1,
       ]
 
       Self.logger.info("Stockfish request \(requestID, privacy: .public) queued state=\(self.engineState.rawValue, privacy: .public) fen_hash=\(fenHash, privacy: .public)")
@@ -2530,7 +2550,8 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
       scoreCp: payload["scoreCp"] as? Int,
       mateIn: payload["mateIn"] as? Int,
       pv: payload["pv"] as? [String] ?? [],
-      bestMove: bestMove
+      bestMove: bestMove,
+      candidates: Self.decodeCandidates(from: payload["candidates"])
     )
 
     lastError = nil
@@ -2577,6 +2598,24 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
   private func nextRequestID() -> String {
     requestCounter += 1
     return "stockfish-\(requestCounter)"
+  }
+
+  private static func decodeCandidates(from rawValue: Any?) -> [StockfishCandidate] {
+    guard let rawCandidates = rawValue as? [[String: Any]] else {
+      return []
+    }
+
+    return rawCandidates.compactMap { payload in
+      let rank = payload["rank"] as? Int ?? 1
+      return StockfishCandidate(
+        rank: rank,
+        bestMove: payload["bestMove"] as? String,
+        scoreCp: payload["scoreCp"] as? Int,
+        mateIn: payload["mateIn"] as? Int,
+        pv: payload["pv"] as? [String] ?? []
+      )
+    }
+    .sorted { $0.rank < $1.rank }
   }
 
   private func evaluate(
@@ -2777,14 +2816,17 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
               fen: request.fen,
               movetimeMs: request.movetimeMs,
               debugDepth: request.debugDepth || null,
+              multiPV: Math.max(1, request.multiPV || 1),
               startedAtMs: Date.now(),
               scoreCp: null,
               mateIn: null,
               pv: [],
+              candidates: {},
             };
             bridgeState.queuedRequest = null;
             const searchLabel = request.debugDepth ? ('Analyzing depth ' + request.debugDepth + '...') : ('Analyzing movetime ' + request.movetimeMs + 'ms...');
             bridgeStateChange('THINKING', searchLabel);
+            sendEngineCommand('setoption name MultiPV value ' + bridgeState.currentRequest.multiPV);
             sendEngineCommand('position fen ' + request.fen);
             if (request.debugDepth) {
               sendEngineCommand('go depth ' + request.debugDepth);
@@ -2814,22 +2856,44 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
               return;
             }
 
+            const multipvMatch = line.match(/\\smultipv\\s(\\d+)/);
+            const rank = multipvMatch ? parseInt(multipvMatch[1], 10) : 1;
+            const candidate = current.candidates[rank] || {
+              rank,
+              scoreCp: null,
+              mateIn: null,
+              pv: [],
+            };
+
             const cpMatch = line.match(/score cp (-?\\d+)/);
             if (cpMatch) {
-              current.scoreCp = parseInt(cpMatch[1], 10);
-              current.mateIn = null;
+              candidate.scoreCp = parseInt(cpMatch[1], 10);
+              candidate.mateIn = null;
+              if (rank === 1) {
+                current.scoreCp = candidate.scoreCp;
+                current.mateIn = null;
+              }
             }
 
             const mateMatch = line.match(/score mate (-?\\d+)/);
             if (mateMatch) {
-              current.mateIn = parseInt(mateMatch[1], 10);
-              current.scoreCp = null;
+              candidate.mateIn = parseInt(mateMatch[1], 10);
+              candidate.scoreCp = null;
+              if (rank === 1) {
+                current.mateIn = candidate.mateIn;
+                current.scoreCp = null;
+              }
             }
 
             const pvMatch = line.match(/\\spv\\s(.+)/);
             if (pvMatch) {
-              current.pv = pvMatch[1].trim().split(/\\s+/).filter(Boolean);
+              candidate.pv = pvMatch[1].trim().split(/\\s+/).filter(Boolean);
+              if (rank === 1) {
+                current.pv = candidate.pv;
+              }
             }
+
+            current.candidates[rank] = candidate;
           }
 
           function handleEngineLine(message) {
@@ -2899,6 +2963,16 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
                 return;
               }
 
+              const candidates = Object.values(finished.candidates || {})
+                .sort((left, right) => (left.rank || 1) - (right.rank || 1))
+                .map((candidate) => ({
+                  rank: candidate.rank || 1,
+                  scoreCp: candidate.scoreCp ?? null,
+                  mateIn: candidate.mateIn ?? null,
+                  pv: candidate.pv || [],
+                  bestMove: candidate.pv && candidate.pv.length > 0 ? candidate.pv[0] : null,
+                }));
+
               bridgePost({
                 type: 'result',
                 id: finished.id,
@@ -2906,6 +2980,7 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
                 mateIn: finished.mateIn,
                 pv: finished.pv || [],
                 bestMove: parts[1] || null,
+                candidates,
                 durationMs: Date.now() - finished.startedAtMs,
                 status: parts[1] ? 'bestmove ' + parts[1] : 'bestmove unavailable',
               });
@@ -3018,6 +3093,9 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   @Published private(set) var visibleHintText: String?
   @Published private(set) var isHintLoading = false
   @Published private(set) var geminiDebugLines: [String] = []
+  @Published private(set) var stockfishDebugStatusText = "Open Gemini debug to inspect Stockfish lines."
+  @Published private(set) var stockfishDebugWhiteLines: [String] = []
+  @Published private(set) var stockfishDebugBlackLines: [String] = []
   @Published private(set) var geminiConnectionState: GeminiLiveStatusPayload.ConnectionState = .disconnected
   @Published private(set) var geminiConnectionLastError: String?
   @Published private(set) var geminiConnectionSince: String?
@@ -3027,6 +3105,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   private let synthesizer = AVSpeechSynthesizer()
   private var utteranceCaptions: [ObjectIdentifier: Caption] = [:]
   private var cachedAnalysis: CachedAnalysis?
+  private var debugAnalysisCache: [String: StockfishAnalysis] = [:]
   private var completedPlyCount = 0
   private var nextCommentaryPly = Int.random(in: commentaryIntervalRange)
   private var reactionHandler: ((ReactionCue) -> Void)?
@@ -3043,6 +3122,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   private var nextKingCookedAllowedPly: [ChessColor: Int] = [:]
   private var lastGeminiStatusSnapshot: GeminiLiveStatusPayload?
   private var nextGeminiBackgroundRetryAt: Date?
+  private var stockfishDebugVisible = false
 
   override init() {
     super.init()
@@ -3072,6 +3152,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       updateAnalysisPresentation(analysis)
       analysisStatus = "Stockfish movetime \(Self.preferredMovetimeMs)ms ready."
       latestAssessment = "Prep eval: \(describe(analysis: analysis, moverColor: state.turn))."
+      await refreshStockfishDebugMoves(for: state, currentAnalysis: analysis, force: force)
       prefetchHint(for: state, analysis: analysis)
     } catch {
       let message = analyzer.lastError ?? error.localizedDescription
@@ -3086,6 +3167,11 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       hintStatusText = hintService.isConfigured
         ? "Hint unavailable until Stockfish finishes."
         : defaultHintStatus()
+      if stockfishDebugVisible {
+        stockfishDebugStatusText = "Stockfish debug unavailable: \(message)"
+        stockfishDebugWhiteLines = []
+        stockfishDebugBlackLines = []
+      }
     }
   }
 
@@ -3094,6 +3180,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     utteranceCaptions.removeAll()
     caption = nil
     cachedAnalysis = nil
+    debugAnalysisCache.removeAll()
     hintTask?.cancel()
     hintTask = nil
     geminiStatusTask?.cancel()
@@ -3106,6 +3193,9 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     narratedHintKeys.removeAll()
     lastGeminiStatusSnapshot = nil
     geminiDebugLines = []
+    stockfishDebugStatusText = "Open Gemini debug to inspect Stockfish lines."
+    stockfishDebugWhiteLines = []
+    stockfishDebugBlackLines = []
     visibleHintText = nil
     isHintLoading = false
     completedPlyCount = 0
@@ -3122,6 +3212,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     geminiConnectionState = hintService.isConfigured ? .disconnected : .error
     geminiConnectionLastError = hintService.isConfigured ? nil : "ARChessAPIBaseURL is not configured."
     geminiConnectionSince = nil
+    stockfishDebugVisible = false
   }
 
   func noteExternalStatus(_ message: String) {
@@ -3171,6 +3262,17 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
 
     analysisStatus = "Manual analysis requested..."
     await prepare(with: state, force: true)
+  }
+
+  func setGeminiDebugVisible(_ isVisible: Bool) {
+    stockfishDebugVisible = isVisible
+    guard isVisible else {
+      return
+    }
+
+    Task { @MainActor [weak self] in
+      await self?.refreshStockfishDebugMoves(force: false)
+    }
   }
 
   func revealHint() {
@@ -3243,6 +3345,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       cachedAnalysis = CachedAnalysis(fen: afterState.fenString, analysis: afterAnalysis)
       updateAnalysisPresentation(afterAnalysis)
       analysisStatus = "Stockfish movetime \(Self.preferredMovetimeMs)ms live."
+      await refreshStockfishDebugMoves(for: afterState, currentAnalysis: afterAnalysis)
       let shouldNarrateHintOnDrop: Bool
       if let swing = evalSwing(before: beforeAnalysis, after: afterAnalysis, moverColor: beforeState.turn) {
         shouldNarrateHintOnDrop = swing >= Self.substantialGainThreshold
@@ -3380,6 +3483,81 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     }
   }
 
+  private func refreshStockfishDebugMoves(
+    for state: ChessGameState? = nil,
+    currentAnalysis: StockfishAnalysis? = nil,
+    force: Bool = false
+  ) async {
+    guard stockfishDebugVisible else {
+      return
+    }
+
+    guard let state = state ?? stateProvider?() else {
+      stockfishDebugStatusText = "Stockfish debug requires a board state."
+      stockfishDebugWhiteLines = []
+      stockfishDebugBlackLines = []
+      return
+    }
+
+    stockfishDebugStatusText = "Refreshing Stockfish top lines..."
+    let whiteFEN = fenByReplacingSideToMove(in: state.fenString, with: .white)
+    let blackFEN = fenByReplacingSideToMove(in: state.fenString, with: .black)
+
+    let whiteAnalysis = await debugAnalysis(
+      for: whiteFEN,
+      currentAnalysis: currentAnalysis,
+      force: force
+    )
+    let blackAnalysis = await debugAnalysis(
+      for: blackFEN,
+      currentAnalysis: currentAnalysis,
+      force: force
+    )
+
+    stockfishDebugWhiteLines = whiteAnalysis.map { stockfishDebugLines(from: $0) } ?? []
+    stockfishDebugBlackLines = blackAnalysis.map { stockfishDebugLines(from: $0) } ?? []
+
+    if !stockfishDebugWhiteLines.isEmpty || !stockfishDebugBlackLines.isEmpty {
+      stockfishDebugStatusText = "Stockfish MultiPV 5 lines for the current board."
+    } else {
+      stockfishDebugStatusText = "Stockfish top lines unavailable."
+    }
+  }
+
+  private func debugAnalysis(
+    for fen: String,
+    currentAnalysis: StockfishAnalysis? = nil,
+    force: Bool
+  ) async -> StockfishAnalysis? {
+    if let currentAnalysis,
+       currentAnalysis.fen == fen,
+       currentAnalysis.candidates.count >= 5 {
+      debugAnalysisCache[fen] = currentAnalysis
+      return currentAnalysis
+    }
+
+    if !force,
+       let cached = debugAnalysisCache[fen],
+       cached.candidates.count >= 5 {
+      return cached
+    }
+
+    do {
+      let analysis = try await analyzer.analyze(
+        fen: fen,
+        options: .realtime(
+          movetimeMs: Self.preferredMovetimeMs,
+          hardTimeoutMs: Self.preferredHardTimeoutMs,
+          multiPV: 5
+        )
+      )
+      debugAnalysisCache[fen] = analysis
+      return analysis
+    } catch {
+      return nil
+    }
+  }
+
   private func classifyMove(
     before: StockfishAnalysis?,
     after: StockfishAnalysis?,
@@ -3459,6 +3637,29 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     whiteEvalText = "White eval: \(analysis.formattedEval(for: .white))"
     blackEvalText = "Black eval: \(analysis.formattedEval(for: .black))"
     analysisTimingText = "Last analysis: \(analysis.durationMs)ms"
+  }
+
+  private func stockfishDebugLines(from analysis: StockfishAnalysis) -> [String] {
+    let candidates = analysis.candidates.isEmpty
+      ? [
+          StockfishCandidate(
+            rank: 1,
+            bestMove: analysis.bestMove,
+            scoreCp: analysis.scoreCp,
+            mateIn: analysis.mateIn,
+            pv: analysis.pv
+          )
+        ]
+      : analysis.candidates
+
+    return Array(candidates.prefix(5)).map { candidate in
+      let move = humanReadableMove(candidate.bestMove ?? candidate.pv.first ?? "(none)")
+      let continuation = candidate.pv.dropFirst().prefix(2).map(humanReadableMove).joined(separator: " -> ")
+      if continuation.isEmpty {
+        return "\(candidate.rank). \(move) (\(candidate.formattedScore))"
+      }
+      return "\(candidate.rank). \(move) (\(candidate.formattedScore)) | pv: \(continuation)"
+    }
   }
 
   private func prefetchHint(
@@ -3836,6 +4037,16 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     }
 
     return Array(Set(themes)).sorted()
+  }
+
+  private func fenByReplacingSideToMove(in fen: String, with side: ChessColor) -> String {
+    var fields = fen.split(separator: " ", omittingEmptySubsequences: false).map(String.init)
+    guard fields.count == 6 else {
+      return fen
+    }
+
+    fields[1] = side.fenSymbol
+    return fields.joined(separator: " ")
   }
 
   private func bestMoveDescription(from analysis: StockfishAnalysis) -> String {
@@ -4732,6 +4943,40 @@ private struct NativeARExperienceView: View {
                 .lineLimit(2)
             }
 
+            Text(commentary.stockfishDebugStatusText)
+              .font(.system(size: 12, weight: .semibold, design: .rounded))
+              .foregroundStyle(Color.white.opacity(0.70))
+
+            if !commentary.stockfishDebugWhiteLines.isEmpty {
+              VStack(alignment: .leading, spacing: 4) {
+                Text("Stockfish top 5: White")
+                  .font(.system(size: 12, weight: .bold, design: .rounded))
+                  .foregroundStyle(Color.white.opacity(0.86))
+
+                ForEach(Array(commentary.stockfishDebugWhiteLines.enumerated()), id: \.offset) { _, line in
+                  Text(line)
+                    .font(.system(size: 11, weight: .medium, design: .monospaced))
+                    .foregroundStyle(Color.white.opacity(0.80))
+                    .textSelection(.enabled)
+                }
+              }
+            }
+
+            if !commentary.stockfishDebugBlackLines.isEmpty {
+              VStack(alignment: .leading, spacing: 4) {
+                Text("Stockfish top 5: Black")
+                  .font(.system(size: 12, weight: .bold, design: .rounded))
+                  .foregroundStyle(Color.white.opacity(0.86))
+
+                ForEach(Array(commentary.stockfishDebugBlackLines.enumerated()), id: \.offset) { _, line in
+                  Text(line)
+                    .font(.system(size: 11, weight: .medium, design: .monospaced))
+                    .foregroundStyle(Color.white.opacity(0.80))
+                    .textSelection(.enabled)
+                }
+              }
+            }
+
             if commentary.geminiDebugLines.isEmpty {
               Text("No Gemini activity yet.")
                 .font(.system(size: 13, weight: .medium, design: .rounded))
@@ -4849,6 +5094,7 @@ private struct NativeARExperienceView: View {
               withAnimation(.spring(response: 0.30, dampingFraction: 0.86)) {
                 isGeminiDebugVisible.toggle()
               }
+              commentary.setGeminiDebugVisible(isGeminiDebugVisible)
             }
           }
 
