@@ -4847,6 +4847,11 @@ private struct QueueMatchView: View {
 }
 
 private struct NativeARExperienceView: View {
+  private enum DebugOverlayPanel {
+    case gemini
+    case stockfish
+  }
+
   let mode: ExperienceMode
   @ObservedObject var queueMatch: QueueMatchStore
   let closeExperience: () -> Void
@@ -4854,8 +4859,7 @@ private struct NativeARExperienceView: View {
   @StateObject private var commentary = PiecePersonalityDirector()
   @State private var isModePanelVisible = false
   @State private var isMatchLogVisible = false
-  @State private var isGeminiDebugVisible = false
-  @State private var isStockfishDebugPanelVisible = false
+  @State private var activeDebugPanel: DebugOverlayPanel?
 
   var body: some View {
     ZStack {
@@ -4876,79 +4880,82 @@ private struct NativeARExperienceView: View {
 
       VStack(spacing: 16) {
         if isModePanelVisible {
-          VStack(alignment: .leading, spacing: 10) {
-            Text(modeTitle)
-              .font(.system(size: 12, weight: .bold, design: .rounded))
-              .tracking(2.0)
-              .foregroundStyle(Color(red: 0.87, green: 0.79, blue: 0.64))
+          ScrollView(showsIndicators: true) {
+            VStack(alignment: .leading, spacing: 10) {
+              Text(modeTitle)
+                .font(.system(size: 12, weight: .bold, design: .rounded))
+                .tracking(2.0)
+                .foregroundStyle(Color(red: 0.87, green: 0.79, blue: 0.64))
 
-            Text("Native AR Sandbox")
-              .font(.system(size: 30, weight: .heavy, design: .rounded))
-              .foregroundStyle(.white)
+              Text("Native AR Sandbox")
+                .font(.system(size: 30, weight: .heavy, design: .rounded))
+                .foregroundStyle(.white)
 
-            Text("RealityKit and ARKit are running inside the iOS app. Tap a piece, then tap a highlighted square to move it. Legal moves log in UCI and sync to Railway when ARChessAPIBaseURL is configured.")
-              .font(.system(size: 15, weight: .medium, design: .rounded))
-              .foregroundStyle(Color.white.opacity(0.86))
-              .lineSpacing(3)
-
-            Text(commentary.analysisStatus)
-              .font(.system(size: 12, weight: .semibold, design: .rounded))
-              .foregroundStyle(Color(red: 0.88, green: 0.82, blue: 0.70))
-
-            Text(commentary.hintStatusText)
-              .font(.system(size: 13, weight: .bold, design: .rounded))
-              .foregroundStyle(Color.white.opacity(0.92))
-
-            if commentary.isHintLoading {
-              HStack(spacing: 10) {
-                ProgressView()
-                  .tint(Color.white.opacity(0.92))
-
-                Text("Loading hint...")
-                  .font(.system(size: 12, weight: .semibold, design: .rounded))
-                  .foregroundStyle(Color.white.opacity(0.78))
-              }
-            }
-
-            if let visibleHintText = commentary.visibleHintText {
-              Text(visibleHintText)
-                .font(.system(size: 15, weight: .semibold, design: .rounded))
-                .foregroundStyle(Color(red: 0.96, green: 0.92, blue: 0.82))
+              Text("RealityKit and ARKit are running inside the iOS app. Tap a piece, then tap a highlighted square to move it. Legal moves log in UCI and sync to Railway when ARChessAPIBaseURL is configured.")
+                .font(.system(size: 15, weight: .medium, design: .rounded))
+                .foregroundStyle(Color.white.opacity(0.86))
                 .lineSpacing(3)
-            }
 
-            HStack(spacing: 10) {
-              VStack(alignment: .leading, spacing: 4) {
-                Text(commentary.whiteEvalText)
-                  .font(.system(size: 12, weight: .bold, design: .rounded))
-                  .foregroundStyle(Color.white.opacity(0.94))
+              Text(commentary.analysisStatus)
+                .font(.system(size: 12, weight: .semibold, design: .rounded))
+                .foregroundStyle(Color(red: 0.88, green: 0.82, blue: 0.70))
 
-                Text(commentary.blackEvalText)
-                  .font(.system(size: 12, weight: .bold, design: .rounded))
-                  .foregroundStyle(Color.white.opacity(0.88))
+              Text(commentary.hintStatusText)
+                .font(.system(size: 13, weight: .bold, design: .rounded))
+                .foregroundStyle(Color.white.opacity(0.92))
 
-                Text(commentary.analysisTimingText)
-                  .font(.system(size: 11, weight: .semibold, design: .rounded))
-                  .foregroundStyle(Color.white.opacity(0.66))
+              if commentary.isHintLoading {
+                HStack(spacing: 10) {
+                  ProgressView()
+                    .tint(Color.white.opacity(0.92))
+
+                  Text("Loading hint...")
+                    .font(.system(size: 12, weight: .semibold, design: .rounded))
+                    .foregroundStyle(Color.white.opacity(0.78))
+                }
               }
 
-              Spacer(minLength: 12)
+              if let visibleHintText = commentary.visibleHintText {
+                Text(visibleHintText)
+                  .font(.system(size: 15, weight: .semibold, design: .rounded))
+                  .foregroundStyle(Color(red: 0.96, green: 0.92, blue: 0.82))
+                  .lineSpacing(3)
+              }
 
-              VStack(spacing: 8) {
-                NativeActionButton(title: "Hint", style: .outline) {
-                  commentary.revealHint()
+              HStack(spacing: 10) {
+                VStack(alignment: .leading, spacing: 4) {
+                  Text(commentary.whiteEvalText)
+                    .font(.system(size: 12, weight: .bold, design: .rounded))
+                    .foregroundStyle(Color.white.opacity(0.94))
+
+                  Text(commentary.blackEvalText)
+                    .font(.system(size: 12, weight: .bold, design: .rounded))
+                    .foregroundStyle(Color.white.opacity(0.88))
+
+                  Text(commentary.analysisTimingText)
+                    .font(.system(size: 11, weight: .semibold, design: .rounded))
+                    .foregroundStyle(Color.white.opacity(0.66))
                 }
 
-                NativeActionButton(title: "Analyze current position", style: .outline) {
-                  Task {
-                    await commentary.analyzeCurrentPosition()
+                Spacer(minLength: 12)
+
+                VStack(spacing: 8) {
+                  NativeActionButton(title: "Hint", style: .outline) {
+                    commentary.revealHint()
+                  }
+
+                  NativeActionButton(title: "Analyze current position", style: .outline) {
+                    Task {
+                      await commentary.analyzeCurrentPosition()
+                    }
                   }
                 }
               }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(18)
           }
-          .frame(maxWidth: .infinity, alignment: .leading)
-          .padding(18)
+          .frame(maxWidth: .infinity, maxHeight: overlayPanelMaxHeight(ratio: 0.36), alignment: .top)
           .background(
             RoundedRectangle(cornerRadius: 26, style: .continuous)
               .fill(.ultraThinMaterial)
@@ -4964,9 +4971,9 @@ private struct NativeARExperienceView: View {
           .transition(.move(edge: .bottom).combined(with: .opacity))
         }
 
-        if isGeminiDebugVisible {
+        if let activeDebugPanel {
           Group {
-            if isStockfishDebugPanelVisible {
+            if activeDebugPanel == .stockfish {
               stockfishDebugPanel
             } else {
               geminiDebugPanel
@@ -4976,54 +4983,57 @@ private struct NativeARExperienceView: View {
         }
 
         if isMatchLogVisible {
-          VStack(alignment: .leading, spacing: 10) {
-            Text("Match log")
-              .font(.system(size: 12, weight: .bold, design: .rounded))
-              .tracking(1.8)
-              .foregroundStyle(Color(red: 0.88, green: 0.82, blue: 0.70))
+          ScrollView(showsIndicators: true) {
+            VStack(alignment: .leading, spacing: 10) {
+              Text("Match log")
+                .font(.system(size: 12, weight: .bold, design: .rounded))
+                .tracking(1.8)
+                .foregroundStyle(Color(red: 0.88, green: 0.82, blue: 0.70))
 
-            Text(activeSyncStatus)
-              .font(.system(size: 15, weight: .medium, design: .rounded))
-              .foregroundStyle(Color.white.opacity(0.86))
+              Text(activeSyncStatus)
+                .font(.system(size: 15, weight: .medium, design: .rounded))
+                .foregroundStyle(Color.white.opacity(0.86))
 
-            Text(commentary.latestAssessment)
-              .font(.system(size: 13, weight: .semibold, design: .rounded))
-              .foregroundStyle(Color.white.opacity(0.70))
+              Text(commentary.latestAssessment)
+                .font(.system(size: 13, weight: .semibold, design: .rounded))
+                .foregroundStyle(Color.white.opacity(0.70))
 
-            if let remoteGameID = activeRemoteGameID {
-              Text("Game ID: \(remoteGameID)")
-                .font(.system(size: 12, weight: .semibold, design: .rounded))
-                .foregroundStyle(Color.white.opacity(0.62))
-                .textSelection(.enabled)
-            }
+              if let remoteGameID = activeRemoteGameID {
+                Text("Game ID: \(remoteGameID)")
+                  .font(.system(size: 12, weight: .semibold, design: .rounded))
+                  .foregroundStyle(Color.white.opacity(0.62))
+                  .textSelection(.enabled)
+              }
 
-            if activeEntries.isEmpty {
-              Text("Make a legal move to start the UCI move log.")
-                .font(.system(size: 14, weight: .medium, design: .rounded))
-                .foregroundStyle(Color.white.opacity(0.72))
-            } else {
-              ForEach(Array(activeEntries.suffix(6))) { entry in
-                HStack(alignment: .firstTextBaseline, spacing: 12) {
-                  Text(entry.label)
-                    .font(.system(size: 14, weight: .bold, design: .monospaced))
-                    .foregroundStyle(.white)
+              if activeEntries.isEmpty {
+                Text("Make a legal move to start the UCI move log.")
+                  .font(.system(size: 14, weight: .medium, design: .rounded))
+                  .foregroundStyle(Color.white.opacity(0.72))
+              } else {
+                ForEach(Array(activeEntries.suffix(6))) { entry in
+                  HStack(alignment: .firstTextBaseline, spacing: 12) {
+                    Text(entry.label)
+                      .font(.system(size: 14, weight: .bold, design: .monospaced))
+                      .foregroundStyle(.white)
 
-                  Spacer(minLength: 0)
+                    Spacer(minLength: 0)
 
-                  Text(entry.statusLabel)
-                    .font(.system(size: 11, weight: .bold, design: .rounded))
-                    .tracking(1.1)
-                    .foregroundStyle(
-                      entry.isSynced
-                        ? Color(red: 0.57, green: 0.90, blue: 0.68)
-                        : Color(red: 0.93, green: 0.78, blue: 0.54)
-                    )
+                    Text(entry.statusLabel)
+                      .font(.system(size: 11, weight: .bold, design: .rounded))
+                      .tracking(1.1)
+                      .foregroundStyle(
+                        entry.isSynced
+                          ? Color(red: 0.57, green: 0.90, blue: 0.68)
+                          : Color(red: 0.93, green: 0.78, blue: 0.54)
+                      )
+                  }
                 }
               }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(18)
           }
-          .frame(maxWidth: .infinity, alignment: .leading)
-          .padding(18)
+          .frame(maxWidth: .infinity, maxHeight: overlayPanelMaxHeight(ratio: 0.42), alignment: .top)
           .background(
             RoundedRectangle(cornerRadius: 24, style: .continuous)
               .fill(Color(red: 0.05, green: 0.07, blue: 0.10).opacity(0.82))
@@ -5060,17 +5070,14 @@ private struct NativeARExperienceView: View {
             }
 
             overlayToggleButton(
-              title: isGeminiDebugVisible ? "Hide Gemini Debug" : "Show Gemini Debug",
+              title: activeDebugPanel == nil ? "Show Gemini Debug" : "Hide Gemini Debug",
               systemImage: "sparkles.rectangle.stack"
             ) {
-              let nextVisible = !isGeminiDebugVisible
+              let nextPanel: DebugOverlayPanel? = activeDebugPanel == nil ? .gemini : nil
               withAnimation(.spring(response: 0.30, dampingFraction: 0.86)) {
-                isGeminiDebugVisible = nextVisible
-                if !nextVisible {
-                  isStockfishDebugPanelVisible = false
-                }
+                activeDebugPanel = nextPanel
               }
-              commentary.setGeminiDebugVisible(nextVisible)
+              commentary.setGeminiDebugVisible(nextPanel != nil)
             }
           }
 
@@ -5136,130 +5143,136 @@ private struct NativeARExperienceView: View {
   }
 
   private var geminiDebugPanel: some View {
-    VStack(alignment: .leading, spacing: 10) {
-      Text("Gemini debug")
-        .font(.system(size: 12, weight: .bold, design: .rounded))
-        .tracking(1.8)
-        .foregroundStyle(Color(red: 0.88, green: 0.82, blue: 0.70))
+    ScrollView(showsIndicators: true) {
+      VStack(alignment: .leading, spacing: 10) {
+        Text("Gemini debug")
+          .font(.system(size: 12, weight: .bold, design: .rounded))
+          .tracking(1.8)
+          .foregroundStyle(Color(red: 0.88, green: 0.82, blue: 0.70))
 
-      Text(commentary.hintStatusText)
-        .font(.system(size: 14, weight: .semibold, design: .rounded))
-        .foregroundStyle(Color.white.opacity(0.86))
+        Text(commentary.hintStatusText)
+          .font(.system(size: 14, weight: .semibold, design: .rounded))
+          .foregroundStyle(Color.white.opacity(0.86))
 
-      HStack(spacing: 8) {
-        Text("Live:")
-          .font(.system(size: 13, weight: .bold, design: .monospaced))
-          .foregroundStyle(Color.white.opacity(0.76))
+        HStack(spacing: 8) {
+          Text("Live:")
+            .font(.system(size: 13, weight: .bold, design: .monospaced))
+            .foregroundStyle(Color.white.opacity(0.76))
 
-        Text(commentary.geminiConnectionState.rawValue)
-          .font(.system(size: 13, weight: .bold, design: .monospaced))
-          .foregroundStyle(connectionStateColor)
-      }
+          Text(commentary.geminiConnectionState.rawValue)
+            .font(.system(size: 13, weight: .bold, design: .monospaced))
+            .foregroundStyle(connectionStateColor)
+        }
 
-      if let connectionError = commentary.geminiConnectionLastError {
-        Text(connectionError)
-          .font(.system(size: 12, weight: .medium, design: .rounded))
-          .foregroundStyle(Color(red: 0.95, green: 0.70, blue: 0.62))
-          .lineLimit(2)
-      }
+        if let connectionError = commentary.geminiConnectionLastError {
+          Text(connectionError)
+            .font(.system(size: 12, weight: .medium, design: .rounded))
+            .foregroundStyle(Color(red: 0.95, green: 0.70, blue: 0.62))
+            .lineLimit(2)
+        }
 
-      Text("Swipe right for Stockfish-only debug.")
-        .font(.system(size: 12, weight: .semibold, design: .rounded))
-        .foregroundStyle(Color.white.opacity(0.70))
+        Text("Swipe right for Stockfish-only debug.")
+          .font(.system(size: 12, weight: .semibold, design: .rounded))
+          .foregroundStyle(Color.white.opacity(0.70))
 
-      if commentary.geminiDebugLines.isEmpty {
-        Text("No Gemini activity yet.")
-          .font(.system(size: 13, weight: .medium, design: .rounded))
-          .foregroundStyle(Color.white.opacity(0.68))
-      } else {
-        ForEach(Array(commentary.geminiDebugLines.reversed()), id: \.self) { line in
-          Text(line)
-            .font(.system(size: 12, weight: .medium, design: .monospaced))
-            .foregroundStyle(Color.white.opacity(0.80))
-            .textSelection(.enabled)
+        if commentary.geminiDebugLines.isEmpty {
+          Text("No Gemini activity yet.")
+            .font(.system(size: 13, weight: .medium, design: .rounded))
+            .foregroundStyle(Color.white.opacity(0.68))
+        } else {
+          ForEach(Array(commentary.geminiDebugLines.reversed()), id: \.self) { line in
+            Text(line)
+              .font(.system(size: 12, weight: .medium, design: .monospaced))
+              .foregroundStyle(Color.white.opacity(0.80))
+              .textSelection(.enabled)
+          }
         }
       }
+      .frame(maxWidth: .infinity, alignment: .leading)
+      .padding(18)
     }
-    .frame(maxWidth: .infinity, alignment: .leading)
-    .padding(18)
+    .frame(maxWidth: .infinity, maxHeight: overlayPanelMaxHeight(ratio: 0.42), alignment: .top)
     .background(debugPanelBackground)
     .contentShape(Rectangle())
-    .gesture(
+    .simultaneousGesture(
       DragGesture(minimumDistance: 24)
         .onEnded { value in
           guard value.translation.width > 70, abs(value.translation.height) < 60 else {
             return
           }
           withAnimation(.spring(response: 0.30, dampingFraction: 0.86)) {
-            isStockfishDebugPanelVisible = true
+            activeDebugPanel = .stockfish
           }
         }
     )
   }
 
   private var stockfishDebugPanel: some View {
-    VStack(alignment: .leading, spacing: 10) {
-      Text("Stockfish debug")
-        .font(.system(size: 12, weight: .bold, design: .rounded))
-        .tracking(1.8)
-        .foregroundStyle(Color(red: 0.88, green: 0.82, blue: 0.70))
+    ScrollView(showsIndicators: true) {
+      VStack(alignment: .leading, spacing: 10) {
+        Text("Stockfish debug")
+          .font(.system(size: 12, weight: .bold, design: .rounded))
+          .tracking(1.8)
+          .foregroundStyle(Color(red: 0.88, green: 0.82, blue: 0.70))
 
-      Text(commentary.stockfishDebugStatusText)
-        .font(.system(size: 13, weight: .semibold, design: .rounded))
-        .foregroundStyle(Color.white.opacity(0.82))
+        Text(commentary.stockfishDebugStatusText)
+          .font(.system(size: 13, weight: .semibold, design: .rounded))
+          .foregroundStyle(Color.white.opacity(0.82))
 
-      Text("Swipe left to return to Gemini debug.")
-        .font(.system(size: 12, weight: .semibold, design: .rounded))
-        .foregroundStyle(Color.white.opacity(0.70))
+        Text("Swipe left to return to Gemini debug.")
+          .font(.system(size: 12, weight: .semibold, design: .rounded))
+          .foregroundStyle(Color.white.opacity(0.70))
 
-      if commentary.stockfishDebugWhiteLines.isEmpty && commentary.stockfishDebugBlackLines.isEmpty {
-        Text("No Stockfish move lines yet.")
-          .font(.system(size: 13, weight: .medium, design: .rounded))
-          .foregroundStyle(Color.white.opacity(0.68))
-      } else {
-        if !commentary.stockfishDebugWhiteLines.isEmpty {
-          VStack(alignment: .leading, spacing: 4) {
-            Text("Stockfish top 5: White")
-              .font(.system(size: 12, weight: .bold, design: .rounded))
-              .foregroundStyle(Color.white.opacity(0.86))
+        if commentary.stockfishDebugWhiteLines.isEmpty && commentary.stockfishDebugBlackLines.isEmpty {
+          Text("No Stockfish move lines yet.")
+            .font(.system(size: 13, weight: .medium, design: .rounded))
+            .foregroundStyle(Color.white.opacity(0.68))
+        } else {
+          if !commentary.stockfishDebugWhiteLines.isEmpty {
+            VStack(alignment: .leading, spacing: 4) {
+              Text("Stockfish top 5: White")
+                .font(.system(size: 12, weight: .bold, design: .rounded))
+                .foregroundStyle(Color.white.opacity(0.86))
 
-            ForEach(Array(commentary.stockfishDebugWhiteLines.enumerated()), id: \.offset) { _, line in
-              Text(line)
-                .font(.system(size: 11, weight: .medium, design: .monospaced))
-                .foregroundStyle(Color.white.opacity(0.80))
-                .textSelection(.enabled)
+              ForEach(Array(commentary.stockfishDebugWhiteLines.enumerated()), id: \.offset) { _, line in
+                Text(line)
+                  .font(.system(size: 11, weight: .medium, design: .monospaced))
+                  .foregroundStyle(Color.white.opacity(0.80))
+                  .textSelection(.enabled)
+              }
             }
           }
-        }
 
-        if !commentary.stockfishDebugBlackLines.isEmpty {
-          VStack(alignment: .leading, spacing: 4) {
-            Text("Stockfish top 5: Black")
-              .font(.system(size: 12, weight: .bold, design: .rounded))
-              .foregroundStyle(Color.white.opacity(0.86))
+          if !commentary.stockfishDebugBlackLines.isEmpty {
+            VStack(alignment: .leading, spacing: 4) {
+              Text("Stockfish top 5: Black")
+                .font(.system(size: 12, weight: .bold, design: .rounded))
+                .foregroundStyle(Color.white.opacity(0.86))
 
-            ForEach(Array(commentary.stockfishDebugBlackLines.enumerated()), id: \.offset) { _, line in
-              Text(line)
-                .font(.system(size: 11, weight: .medium, design: .monospaced))
-                .foregroundStyle(Color.white.opacity(0.80))
-                .textSelection(.enabled)
+              ForEach(Array(commentary.stockfishDebugBlackLines.enumerated()), id: \.offset) { _, line in
+                Text(line)
+                  .font(.system(size: 11, weight: .medium, design: .monospaced))
+                  .foregroundStyle(Color.white.opacity(0.80))
+                  .textSelection(.enabled)
+              }
             }
           }
         }
       }
+      .frame(maxWidth: .infinity, alignment: .leading)
+      .padding(18)
     }
-    .frame(maxWidth: .infinity, alignment: .leading)
-    .padding(18)
+    .frame(maxWidth: .infinity, maxHeight: overlayPanelMaxHeight(ratio: 0.42), alignment: .top)
     .background(debugPanelBackground)
     .contentShape(Rectangle())
-    .gesture(
+    .simultaneousGesture(
       DragGesture(minimumDistance: 24)
         .onEnded { value in
           guard value.translation.width < -70, abs(value.translation.height) < 60 else {
             return
           }
           withAnimation(.spring(response: 0.30, dampingFraction: 0.86)) {
-            isStockfishDebugPanelVisible = false
+            activeDebugPanel = .gemini
           }
         }
     )
@@ -5272,6 +5285,10 @@ private struct NativeARExperienceView: View {
         RoundedRectangle(cornerRadius: 24, style: .continuous)
           .stroke(Color.white.opacity(0.14), lineWidth: 1)
       )
+  }
+
+  private func overlayPanelMaxHeight(ratio: CGFloat) -> CGFloat {
+    UIScreen.main.bounds.height * ratio
   }
 
   private var modeTitle: String {
