@@ -175,6 +175,30 @@ private struct GeminiHintResponsePayload: Decodable {
   let hint: String
 }
 
+private struct GeminiCoachCommentaryRequestPayload: Encodable {
+  let fen: String
+}
+
+private struct GeminiPieceRole: Decodable, Equatable, Hashable {
+  let piece: String
+  let square: String
+  let reason: String
+}
+
+private struct GeminiCoachCommentary: Decodable, Equatable {
+  let sideToMove: String
+  let topWorkers: [GeminiPieceRole]
+  let topTraitors: [GeminiPieceRole]
+  let coachLines: [String]
+
+  enum CodingKeys: String, CodingKey {
+    case sideToMove = "side_to_move"
+    case topWorkers = "top_3_workers"
+    case topTraitors = "top_3_traitors"
+    case coachLines = "coach_lines"
+  }
+}
+
 private struct GeminiLiveStatusPayload: Decodable, Equatable {
   enum ConnectionState: String, Decodable {
     case disconnected = "DISCONNECTED"
@@ -197,6 +221,10 @@ private struct GeminiHintContext {
   let isCapture: Bool
   let givesCheck: Bool
   let themes: [String]
+}
+
+private struct GeminiCoachCommentaryContext: Equatable {
+  let fen: String
 }
 
 private final class GeminiHintService {
@@ -323,6 +351,56 @@ private final class GeminiHintService {
     }
 
     return try JSONDecoder().decode(GeminiLiveStatusPayload.self, from: data)
+  }
+
+  func fetchCoachCommentary(for context: GeminiCoachCommentaryContext) async throws -> GeminiCoachCommentary {
+    guard let baseURL = apiBaseURL else {
+      throw NSError(
+        domain: "ARChess.GeminiHint",
+        code: -1007,
+        userInfo: [NSLocalizedDescriptionKey: "Gemini commentary is disabled until ARChessAPIBaseURL is configured."]
+      )
+    }
+
+    var request = URLRequest(
+      url: baseURL
+        .appendingPathComponent("v1")
+        .appendingPathComponent("gemini")
+        .appendingPathComponent("commentary")
+    )
+    request.httpMethod = "POST"
+    request.timeoutInterval = 8.0
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.setValue("application/json", forHTTPHeaderField: "Accept")
+    request.httpBody = try JSONEncoder().encode(
+      GeminiCoachCommentaryRequestPayload(fen: context.fen)
+    )
+
+    let startedAt = Date()
+    let (data, response) = try await session.data(for: request)
+    let durationMs = Int(Date().timeIntervalSince(startedAt) * 1_000)
+    guard let httpResponse = response as? HTTPURLResponse else {
+      throw NSError(
+        domain: "ARChess.GeminiHint",
+        code: -1008,
+        userInfo: [NSLocalizedDescriptionKey: "Gemini commentary endpoint did not return HTTP."]
+      )
+    }
+
+    guard (200..<300).contains(httpResponse.statusCode) else {
+      let message = String(data: data, encoding: .utf8) ?? "Unexpected Gemini commentary response."
+      Self.logger.error("Gemini backend commentary request failed status=\(httpResponse.statusCode, privacy: .public) duration_ms=\(durationMs, privacy: .public)")
+      throw NSError(
+        domain: "ARChess.GeminiHint",
+        code: httpResponse.statusCode,
+        userInfo: [NSLocalizedDescriptionKey: message]
+      )
+    }
+
+    let decoder = JSONDecoder()
+    let payload = try decoder.decode(GeminiCoachCommentary.self, from: data)
+    Self.logger.info("Gemini coach commentary ready via backend duration_ms=\(durationMs, privacy: .public)")
+    return payload
   }
 
   private func sanitize(_ raw: String, fallback: String) -> String {
@@ -3356,6 +3434,9 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   @Published private(set) var visibleHintText: String?
   @Published private(set) var isHintLoading = false
   @Published private(set) var geminiDebugLines: [String] = []
+  @Published private(set) var coachLines: [String] = []
+  @Published private(set) var topWorkers: [GeminiPieceRole] = []
+  @Published private(set) var topTraitors: [GeminiPieceRole] = []
   @Published private(set) var stockfishDebugStatusText = "Open Stockfish debug to inspect engine candidates."
   @Published private(set) var stockfishDebugWhiteMoves: [StockfishCandidate] = []
   @Published private(set) var stockfishDebugBlackMoves: [StockfishCandidate] = []
@@ -3385,6 +3466,11 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   private var nextKingCookedAllowedPly: [ChessColor: Int] = [:]
   private var lastGeminiStatusSnapshot: GeminiLiveStatusPayload?
   private var nextGeminiBackgroundRetryAt: Date?
+  private var nextGeminiCoachRetryAt: Date?
+  private var latestAnalyzedFEN: String?
+  private var pendingCommentaryFEN: String?
+  private var latestCommentaryRequestID = 0
+  private var commentaryRequestTask: Task<Void, Never>?
   private var stockfishDebugVisible = false
 
   override init() {
@@ -3418,6 +3504,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       latestAssessment = "Prep eval: \(describe(analysis: analysis, moverColor: state.turn))."
       await refreshStockfishDebugMoves(for: state, currentAnalysis: analysis, force: force)
       prefetchHint(for: state, analysis: analysis)
+      scheduleCoachCommentary(for: state)
     } catch {
       let message = analyzer.lastError ?? error.localizedDescription
       analysisStatus = "Stockfish unavailable. Last stage: \(analyzer.lastStatus)"
@@ -3447,6 +3534,8 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     stockfishDebugAnalysisCache.removeAll()
     hintTask?.cancel()
     hintTask = nil
+    commentaryRequestTask?.cancel()
+    commentaryRequestTask = nil
     geminiStatusTask?.cancel()
     geminiStatusTask = nil
     recentHistoryProvider = nil
@@ -3457,6 +3546,9 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     narratedHintKeys.removeAll()
     lastGeminiStatusSnapshot = nil
     geminiDebugLines = []
+    coachLines = []
+    topWorkers = []
+    topTraitors = []
     stockfishDebugStatusText = "Open Stockfish debug to inspect engine candidates."
     stockfishDebugWhiteMoves = []
     stockfishDebugBlackMoves = []
@@ -3465,6 +3557,10 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     completedPlyCount = 0
     nextCommentaryPly = Int.random(in: Self.commentaryIntervalRange)
     nextKingCookedAllowedPly = [:]
+    nextGeminiCoachRetryAt = nil
+    latestAnalyzedFEN = nil
+    pendingCommentaryFEN = nil
+    latestCommentaryRequestID = 0
     analyzer.reset()
     analysisStatus = "Waiting for AR tracking to settle before warming Stockfish..."
     latestAssessment = "Waiting for initial analysis."
@@ -3629,6 +3725,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
         shouldNarrateHintOnDrop = false
       }
       prefetchHint(for: afterState, analysis: afterAnalysis, narrateWhenReady: shouldNarrateHintOnDrop)
+      scheduleCoachCommentary(for: afterState)
     } else if analyzer.lastError != nil {
       analysisStatus = "Stockfish unavailable. Last stage: \(analyzer.lastStatus)"
       latestAssessment = "Stockfish error: \(analyzer.lastError ?? analyzer.lastStatus)"
@@ -4105,6 +4202,83 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     }
   }
 
+  private func scheduleCoachCommentary(for state: ChessGameState) {
+    guard hintService.isConfigured else {
+      return
+    }
+
+    guard geminiConnectionState == .connected else {
+      return
+    }
+
+    if geminiConnectionState == .error, geminiLooksTerminal(geminiConnectionLastError) {
+      return
+    }
+
+    if let retryAt = nextGeminiCoachRetryAt, retryAt > Date() {
+      return
+    }
+
+    let context = GeminiCoachCommentaryContext(fen: state.fenString)
+    if latestAnalyzedFEN == context.fen || pendingCommentaryFEN == context.fen {
+      return
+    }
+
+    latestCommentaryRequestID += 1
+    let requestID = latestCommentaryRequestID
+    pendingCommentaryFEN = context.fen
+
+    commentaryRequestTask?.cancel()
+    commentaryRequestTask = Task { [weak self] in
+      guard let self else {
+        return
+      }
+
+      do {
+        try await Task.sleep(nanoseconds: 350_000_000)
+        let commentary = try await self.hintService.fetchCoachCommentary(for: context)
+        await MainActor.run {
+          guard self.latestCommentaryRequestID == requestID else {
+            return
+          }
+
+          self.commentaryRequestTask = nil
+          self.pendingCommentaryFEN = nil
+          self.nextGeminiCoachRetryAt = nil
+          self.latestAnalyzedFEN = context.fen
+          self.applyCoachCommentary(commentary)
+          self.appendGeminiDebug("Gemini coach commentary updated for the current position.")
+        }
+      } catch is CancellationError {
+        return
+      } catch {
+        await MainActor.run {
+          guard self.latestCommentaryRequestID == requestID else {
+            return
+          }
+
+          self.commentaryRequestTask = nil
+          self.pendingCommentaryFEN = nil
+          self.nextGeminiCoachRetryAt = Date().addingTimeInterval(
+            self.geminiLooksTerminal(error.localizedDescription) ? 60 : 15
+          )
+          self.appendGeminiDebug("Gemini coach commentary request failed: \(error.localizedDescription)")
+        }
+      }
+    }
+  }
+
+  private func applyCoachCommentary(_ commentary: GeminiCoachCommentary) {
+    let normalizedLines = uniquePreservingOrder(
+      commentary.coachLines.map {
+        $0.trimmingCharacters(in: .whitespacesAndNewlines)
+      }.filter { !$0.isEmpty }
+    )
+    coachLines = normalizedLines
+    topWorkers = Array(commentary.topWorkers.prefix(3))
+    topTraitors = Array(commentary.topTraitors.prefix(3))
+  }
+
   private func narrateGeminiHintIfNeeded(text: String, key: String, allowRepeat: Bool = false) {
     guard allowRepeat || !narratedHintKeys.contains(key) else {
       appendGeminiDebug("Skipped Gemini narration because this hint was already narrated for the current turn.")
@@ -4184,6 +4358,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     if status.state == .connected {
       nextGeminiBackgroundRetryAt = nil
       maybeResumeGeminiPrefetch(after: previous, status: status)
+      maybeResumeGeminiCoachCommentary(after: previous, status: status)
     }
   }
 
@@ -4266,6 +4441,40 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
 
     appendGeminiDebug("Gemini Live connected; resuming background hint prefetch for the current turn.")
     prefetchHint(for: state, analysis: cached.analysis)
+  }
+
+  private func maybeResumeGeminiCoachCommentary(
+    after previous: GeminiLiveStatusPayload?,
+    status: GeminiLiveStatusPayload
+  ) {
+    guard previous?.state != status.state else {
+      return
+    }
+
+    guard status.state == .connected else {
+      return
+    }
+
+    guard commentaryRequestTask == nil else {
+      return
+    }
+
+    guard let state = stateProvider?() else {
+      return
+    }
+
+    scheduleCoachCommentary(for: state)
+  }
+
+  private func uniquePreservingOrder(_ values: [String]) -> [String] {
+    var seen: Set<String> = []
+    var ordered: [String] = []
+    for value in values {
+      if seen.insert(value).inserted {
+        ordered.append(value)
+      }
+    }
+    return ordered
   }
 
   private func shouldPrefetchHint(for _: ChessGameState) -> Bool {
@@ -5424,6 +5633,39 @@ private struct NativeARExperienceView: View {
             .lineLimit(2)
         }
 
+        VStack(alignment: .leading, spacing: 6) {
+          Text("Gemini Coach Lines")
+            .font(.system(size: 12, weight: .bold, design: .rounded))
+            .foregroundStyle(Color.white.opacity(0.88))
+
+          if commentary.coachLines.isEmpty {
+            Text("No coach lines yet.")
+              .font(.system(size: 13, weight: .medium, design: .rounded))
+              .foregroundStyle(Color.white.opacity(0.68))
+          } else {
+            ForEach(Array(commentary.coachLines.enumerated()), id: \.offset) { _, line in
+              Text("Coach: \(line)")
+                .font(.system(size: 12, weight: .semibold, design: .rounded))
+                .foregroundStyle(Color(red: 0.95, green: 0.90, blue: 0.80))
+                .lineSpacing(2)
+            }
+          }
+
+          if !commentary.topWorkers.isEmpty {
+            Text("Workers: \(geminiRoleSummary(commentary.topWorkers))")
+              .font(.system(size: 11, weight: .medium, design: .rounded))
+              .foregroundStyle(Color.white.opacity(0.70))
+              .lineSpacing(2)
+          }
+
+          if !commentary.topTraitors.isEmpty {
+            Text("Traitors: \(geminiRoleSummary(commentary.topTraitors))")
+              .font(.system(size: 11, weight: .medium, design: .rounded))
+              .foregroundStyle(Color.white.opacity(0.70))
+              .lineSpacing(2)
+          }
+        }
+
         if commentary.geminiDebugLines.isEmpty {
           Text("No Gemini activity yet.")
             .font(.system(size: 13, weight: .medium, design: .rounded))
@@ -5555,6 +5797,10 @@ private struct NativeARExperienceView: View {
     }
 
     return "\(from) to \(to) = \(promotionName)"
+  }
+
+  private func geminiRoleSummary(_ roles: [GeminiPieceRole]) -> String {
+    roles.map { "\($0.piece) \($0.square)" }.joined(separator: " | ")
   }
 
   private var debugPanelBackground: some View {

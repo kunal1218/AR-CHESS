@@ -11,7 +11,13 @@ SERVER_APP_ROOT = Path(__file__).resolve().parents[1]
 if str(SERVER_APP_ROOT) not in sys.path:
     sys.path.insert(0, str(SERVER_APP_ROOT))
 
-from main import app, get_postgres_dsn, is_placeholder_value, normalize_postgres_dsn  # noqa: E402
+from main import (  # noqa: E402
+    app,
+    get_postgres_dsn,
+    is_placeholder_value,
+    normalize_postgres_dsn,
+    parse_gemini_coach_response,
+)
 
 
 def test_fastapi_app_bootstraps() -> None:
@@ -387,6 +393,90 @@ def test_create_gemini_hint_returns_sanitized_hint(monkeypatch) -> None:
     assert response.status_code == 200
     # Coordinates are stripped via fallback to keep hints beginner-friendly.
     assert response.json()["hint"] == "A brave pawn wants to claim more space."
+
+
+def test_parse_gemini_coach_response_extracts_json_object() -> None:
+    response = parse_gemini_coach_response(
+        """
+        {
+          "side_to_move": "white",
+          "top_3_workers": [
+            {"piece": "White Knight", "square": "d5", "reason": "Controls the center."}
+          ],
+          "top_3_traitors": [
+            {"piece": "White Rook", "square": "a1", "reason": "Still sleeping."}
+          ],
+          "coach_lines": [
+            "Your knight on d5 is your hardest worker right now."
+          ]
+        }
+        """
+    )
+
+    assert response.side_to_move == "white"
+    assert response.top_3_workers[0].square == "d5"
+    assert response.coach_lines == ["Your knight on d5 is your hardest worker right now."]
+
+
+def test_create_gemini_commentary_returns_structured_json(monkeypatch) -> None:
+    async def fake_run_turn(prompt: str, *, metadata=None, timeout_seconds: float = 0.0) -> str:
+        assert "Analyze this FEN and return the top 3 workers" in prompt
+        assert metadata["current_fen"].startswith("rnbqkbnr")
+        _ = timeout_seconds
+        return """
+        {
+          "side_to_move": "white",
+          "top_3_workers": [
+            {
+              "piece": "White Knight",
+              "square": "f3",
+              "reason": "Controls e5 and g5."
+            }
+          ],
+          "top_3_traitors": [
+            {
+              "piece": "White Rook",
+              "square": "h1",
+              "reason": "Still boxed in."
+            }
+          ],
+          "coach_lines": [
+            "Your knight on f3 is your hardest worker right now."
+          ]
+        }
+        """
+
+    monkeypatch.setattr("main.GEMINI_COACH_LIVE_CLIENT.run_turn", fake_run_turn)
+
+    client = TestClient(app)
+    response = client.post(
+        "/v1/gemini/commentary",
+        json={
+            "fen": "rnbqkbnr/pppppppp/8/8/8/5N2/PPPPPPPP/RNBQKB1R w KQkq - 0 1",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "side_to_move": "white",
+        "top_3_workers": [
+            {
+                "piece": "White Knight",
+                "square": "f3",
+                "reason": "Controls e5 and g5.",
+            }
+        ],
+        "top_3_traitors": [
+            {
+                "piece": "White Rook",
+                "square": "h1",
+                "reason": "Still boxed in.",
+            }
+        ],
+        "coach_lines": [
+            "Your knight on f3 is your hardest worker right now."
+        ],
+    }
 
 
 def test_get_postgres_dsn_prefers_railway_private_url(monkeypatch) -> None:

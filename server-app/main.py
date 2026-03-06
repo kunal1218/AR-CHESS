@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import re
@@ -161,6 +162,68 @@ class GeminiLiveStatusResponse(BaseModel):
     since: datetime
 
 
+class GeminiCoachRequest(BaseModel):
+    fen: str = Field(..., min_length=1, max_length=256)
+
+    @field_validator("fen")
+    @classmethod
+    def validate_fen(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("fen must not be empty.")
+        return normalized
+
+
+class GeminiCoachPieceRole(BaseModel):
+    piece: str = Field(..., min_length=1, max_length=64)
+    square: str = Field(..., min_length=2, max_length=2)
+    reason: str = Field(..., min_length=1, max_length=280)
+
+    @field_validator("piece", "reason")
+    @classmethod
+    def validate_text_field(cls, value: str) -> str:
+        normalized = re.sub(r"\s+", " ", value).strip()
+        if not normalized:
+            raise ValueError("text fields must not be empty.")
+        return normalized
+
+    @field_validator("square")
+    @classmethod
+    def validate_square(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if not re.fullmatch(r"[a-h][1-8]", normalized):
+            raise ValueError("square must use algebraic notation such as d5.")
+        return normalized
+
+
+class GeminiCoachResponse(BaseModel):
+    side_to_move: str
+    top_3_workers: list[GeminiCoachPieceRole] = Field(default_factory=list)
+    top_3_traitors: list[GeminiCoachPieceRole] = Field(default_factory=list)
+    coach_lines: list[str] = Field(default_factory=list)
+
+    @field_validator("side_to_move")
+    @classmethod
+    def validate_side_to_move(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"white", "black"}:
+            raise ValueError("side_to_move must be 'white' or 'black'.")
+        return normalized
+
+    @field_validator("coach_lines")
+    @classmethod
+    def validate_coach_lines(cls, value: list[str]) -> list[str]:
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for line in value:
+            normalized = re.sub(r"\s+", " ", line).strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            cleaned.append(normalized)
+        return cleaned[:3]
+
+
 GEMINI_HINT_SYSTEM_PROMPT = """
 You are a Grandmaster Chess Consultant. You will receive a FEN and a short PGN sequence.
 Use the FEN to identify tactical geometry (x-rays, pins, hanging pieces) and the PGN to identify strategic momentum and player intent.
@@ -176,6 +239,75 @@ Make it playful and helpful, like a coach whispering a vibe.
 Return plain text only.
 """.strip()
 GEMINI_HINT_MOVE_PATTERN = re.compile(r"\b[a-h][1-8][a-h][1-8][qrbn]?\b|\b[a-h][1-8]\b", re.IGNORECASE)
+GEMINI_COACH_SYSTEM_PROMPT = """
+You are a concise real-time chess coach.
+
+You will receive a FEN for the current chess position. Analyze the SIDE TO MOVE.
+
+Your task:
+1. Identify the side to move’s top 3 WORKERS.
+2. Identify the side to move’s top 3 TRAITORS.
+3. Generate 1 to 3 short coaching lines.
+
+Definitions:
+- WORKER: a piece or pawn actively helping its side through activity, pressure, defense, coordination, control of key squares, king safety, pawn-break support, or tactical threats.
+- TRAITOR: a piece or pawn currently harming its side more than helping because it is passive, misplaced, blocked, overloaded, tactically vulnerable, poorly coordinated, trapped, or tied to an unhealthy defensive role.
+
+Rules:
+- Focus only on the side to move.
+- Be concrete about piece names and squares.
+- Give reasons grounded in the actual position.
+- Keep coaching lines short, natural, vivid, and human-sounding.
+- Avoid generic filler.
+- Do not invent facts not supported by the FEN.
+- Output STRICT JSON only. No markdown. No prose outside JSON.
+
+Required JSON format:
+{
+  "side_to_move": "white",
+  "top_3_workers": [
+    {
+      "piece": "White Knight",
+      "square": "d5",
+      "reason": "Controls key central squares and pressures c7 and e7."
+    },
+    {
+      "piece": "White Bishop",
+      "square": "g2",
+      "reason": "Dominates the long diagonal and supports king safety."
+    },
+    {
+      "piece": "White Pawn",
+      "square": "e5",
+      "reason": "Claims space and restricts enemy minor pieces."
+    }
+  ],
+  "top_3_traitors": [
+    {
+      "piece": "White Rook",
+      "square": "a1",
+      "reason": "Inactive and blocked from the main theater of play."
+    },
+    {
+      "piece": "White Knight",
+      "square": "h2",
+      "reason": "Offside and not contributing to central control."
+    },
+    {
+      "piece": "White Pawn",
+      "square": "c2",
+      "reason": "Backward and vulnerable, forcing passive defense."
+    }
+  ],
+  "coach_lines": [
+    "Your knight on d5 is your hardest worker right now.",
+    "That rook on a1 is acting like a traitor until it enters the game.",
+    "Improve the worst piece first and your position will breathe."
+  ]
+}
+
+If the position is unclear or multiple interpretations are possible, still choose the most positionally relevant top 3 workers and top 3 traitors for the side to move and return valid JSON.
+""".strip()
 
 
 def env_float(name: str, default: float) -> float:
@@ -248,6 +380,39 @@ def build_gemini_user_query(payload: GeminiHintRequest) -> str:
     )
 
 
+def build_gemini_coach_query() -> str:
+    return (
+        "Analyze this FEN and return the top 3 workers, top 3 traitors, "
+        "and 1 to 3 coach lines for the side to move."
+    )
+
+
+def _extract_json_object(raw_text: str) -> str:
+    trimmed = raw_text.strip()
+    if trimmed.startswith("```"):
+        trimmed = re.sub(r"^```(?:json)?\s*", "", trimmed, flags=re.IGNORECASE)
+        trimmed = re.sub(r"\s*```$", "", trimmed)
+
+    if trimmed.startswith("{") and trimmed.endswith("}"):
+        return trimmed
+
+    start = trimmed.find("{")
+    end = trimmed.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        raise ValueError("Gemini coach response did not contain a JSON object.")
+    return trimmed[start : end + 1]
+
+
+def parse_gemini_coach_response(raw_text: str) -> GeminiCoachResponse:
+    json_text = _extract_json_object(raw_text)
+    payload = json.loads(json_text)
+    response = GeminiCoachResponse.model_validate(payload)
+    response.top_3_workers = response.top_3_workers[:3]
+    response.top_3_traitors = response.top_3_traitors[:3]
+    response.coach_lines = response.coach_lines[:3]
+    return response
+
+
 GEMINI_LIVE_CLIENT = GeminiLiveClient(
     api_key=os.getenv("GEMINI_API_KEY"),
     model=os.getenv("GEMINI_LIVE_MODEL", GeminiLiveClient.DEFAULT_MODEL),
@@ -262,6 +427,19 @@ GEMINI_LIVE_CLIENT = GeminiLiveClient(
     logger=logging.getLogger("archess.server.gemini_live"),
 )
 GEMINI_LIVE_TURN_TIMEOUT_SECONDS = env_float("GEMINI_LIVE_TURN_TIMEOUT_SECONDS", 12.0)
+GEMINI_COACH_LIVE_CLIENT = GeminiLiveClient(
+    api_key=os.getenv("GEMINI_API_KEY"),
+    model=os.getenv("GEMINI_LIVE_MODEL", GeminiLiveClient.DEFAULT_MODEL),
+    system_prompt=GEMINI_COACH_SYSTEM_PROMPT,
+    generation_config={
+        "temperature": env_float("GEMINI_COACH_TEMPERATURE", 0.6),
+        "top_p": env_float("GEMINI_COACH_TOP_P", 0.9),
+        "top_k": env_int("GEMINI_COACH_TOP_K", 32),
+        "max_output_tokens": env_int("GEMINI_COACH_MAX_OUTPUT_TOKENS", 320),
+    },
+    ws_url=os.getenv("GEMINI_LIVE_WS_URL") or None,
+    logger=logging.getLogger("archess.server.gemini_coach_live"),
+)
 
 
 def utcnow() -> datetime:
@@ -925,11 +1103,13 @@ def get_queue_match_moves(
 @app.on_event("startup")
 async def startup_gemini_live() -> None:
     GEMINI_LIVE_CLIENT.ensure_connection_background()
+    GEMINI_COACH_LIVE_CLIENT.ensure_connection_background()
 
 
 @app.on_event("shutdown")
 async def shutdown_gemini_live() -> None:
     await GEMINI_LIVE_CLIENT.disconnect()
+    await GEMINI_COACH_LIVE_CLIENT.disconnect()
 
 
 @app.get("/health/ping")
@@ -949,6 +1129,7 @@ def health_ping() -> dict[str, Any]:
 @app.get("/v1/gemini/status", response_model=GeminiLiveStatusResponse)
 async def get_gemini_live_status() -> dict[str, Any]:
     GEMINI_LIVE_CLIENT.ensure_connection_background()
+    GEMINI_COACH_LIVE_CLIENT.ensure_connection_background()
     return GEMINI_LIVE_CLIENT.get_status()
 
 
@@ -983,6 +1164,34 @@ async def create_gemini_hint(payload: GeminiHintRequest) -> dict[str, Any]:
     return {
         "hint": sanitize_hint_text(raw_hint, fallback),
     }
+
+
+@app.post("/v1/gemini/commentary", response_model=GeminiCoachResponse)
+async def create_gemini_commentary(payload: GeminiCoachRequest) -> dict[str, Any]:
+    metadata = {
+        "current_fen": payload.fen,
+    }
+
+    try:
+        raw_commentary = await GEMINI_COACH_LIVE_CLIENT.run_turn(
+            build_gemini_coach_query(),
+            metadata=metadata,
+            timeout_seconds=GEMINI_LIVE_TURN_TIMEOUT_SECONDS,
+        )
+        commentary = parse_gemini_coach_response(raw_commentary)
+    except ValueError as exc:
+        raise HTTPException(status_code=503, detail=f"Gemini coach returned invalid JSON: {exc}") from exc
+    except GeminiLiveConfigurationError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except GeminiLiveBusyError as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
+    except GeminiLiveConnectionError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:  # pragma: no cover - integration guarded
+        logger.exception("Gemini Live coach request failed unexpectedly")
+        raise HTTPException(status_code=503, detail=f"Gemini coach failed: {exc}") from exc
+
+    return commentary.model_dump()
 
 
 @app.post("/v1/games")
