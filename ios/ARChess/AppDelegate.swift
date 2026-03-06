@@ -1974,6 +1974,7 @@ private final class AmbientMusicController {
 
   private let queue = DispatchQueue(label: "ARChess.AmbientMusic")
   private var player: AVAudioPlayer?
+  private var ambientTrackMissing = false
   private let idleVolume: Float = 0.09
   private let speechDuckedVolume: Float = 0.045
   private var isSpeechActive = false
@@ -2024,21 +2025,19 @@ private final class AmbientMusicController {
   }
 
   private func preparePlayerIfNeeded() throws {
-    let session = AVAudioSession.sharedInstance()
-    try session.setCategory(.ambient, mode: .default, options: [.mixWithOthers])
-    try session.setActive(true, options: [])
-
-    if player != nil {
+    if player != nil || ambientTrackMissing {
       return
     }
 
     guard let url = Bundle.main.url(forResource: "doom_at_dooms_gate", withExtension: "mp3") else {
-      throw NSError(
-        domain: "ARChess.AmbientMusic",
-        code: -2001,
-        userInfo: [NSLocalizedDescriptionKey: "Bundled ambient track was not found in the app resources."]
-      )
+      ambientTrackMissing = true
+      Self.logger.notice("Ambient track missing from app resources. Background music is disabled for this build.")
+      return
     }
+
+    let session = AVAudioSession.sharedInstance()
+    try session.setCategory(.ambient, mode: .default, options: [.mixWithOthers])
+    try session.setActive(true, options: [])
 
     let nextPlayer = try AVAudioPlayer(contentsOf: url)
     nextPlayer.numberOfLoops = -1
