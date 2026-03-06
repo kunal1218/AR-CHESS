@@ -38,6 +38,13 @@ class GeminiLiveClient:
     CONNECTING = "CONNECTING"
     CONNECTED = "CONNECTED"
     ERROR = "ERROR"
+    DEFAULT_MODEL = "models/gemini-2.5-flash-native-audio-preview-12-2025"
+    SHUT_DOWN_MODELS = frozenset(
+        {
+            "gemini-2.0-flash-live-001",
+            "gemini-live-2.5-flash-preview",
+        }
+    )
 
     DEFAULT_WS_URL = (
         "wss://generativelanguage.googleapis.com/ws/"
@@ -56,7 +63,7 @@ class GeminiLiveClient:
         max_queued_turns: int = 2,
     ) -> None:
         self._api_key = (api_key or "").strip()
-        self._model = model
+        self._model = model.strip()
         self._system_prompt = system_prompt
         self._generation_config = generation_config or {
             "temperature": 0.95,
@@ -113,6 +120,8 @@ class GeminiLiveClient:
         if not self.is_configured:
             self._set_status(self.ERROR, "GEMINI_API_KEY is not configured on the backend.")
             raise GeminiLiveConfigurationError("GEMINI_API_KEY is not configured on the backend.")
+
+        self._validate_live_model()
 
         if self._is_socket_open():
             return
@@ -518,3 +527,29 @@ class GeminiLiveClient:
     def _error_message(self, exc: Exception) -> str:
         text = str(exc).strip()
         return text or exc.__class__.__name__
+
+    def _validate_live_model(self) -> None:
+        normalized = self._normalized_model_name(self._model)
+
+        if not normalized:
+            raise GeminiLiveConfigurationError("GEMINI_LIVE_MODEL is empty.")
+
+        if normalized in self.SHUT_DOWN_MODELS:
+            raise GeminiLiveConfigurationError(
+                f"GEMINI_LIVE_MODEL '{self._model}' is shut down. "
+                f"Use {self.DEFAULT_MODEL} for Gemini Live."
+            )
+
+        if normalized.startswith("gemini-3-"):
+            raise GeminiLiveConfigurationError(
+                f"GEMINI_LIVE_MODEL '{self._model}' is a Gemini 3 model, but Gemini 3 currently "
+                "does not support the Live API. Keep Gemini Live on "
+                f"{self.DEFAULT_MODEL} and use Gemini 3 only with generateContent-style endpoints."
+            )
+
+    @staticmethod
+    def _normalized_model_name(model: str) -> str:
+        normalized = model.strip()
+        if normalized.startswith("models/"):
+            normalized = normalized.removeprefix("models/")
+        return normalized

@@ -23,9 +23,10 @@ Backend owned by Person 1.
 - The app also supports Railway `PG*` variables and finally falls back to `POSTGRES_*` variables.
 - Gemini Live uses backend-only secrets:
   - `GEMINI_API_KEY` (required)
-  - `GEMINI_LIVE_MODEL` (optional, default `models/gemini-2.0-flash-live-001`)
+  - `GEMINI_LIVE_MODEL` (optional, default `models/gemini-2.5-flash-native-audio-preview-12-2025`)
   - `GEMINI_LIVE_TEMPERATURE`, `GEMINI_LIVE_TOP_P`, `GEMINI_LIVE_TOP_K`, `GEMINI_LIVE_MAX_OUTPUT_TOKENS` (optional tuning)
   - `GEMINI_LIVE_TURN_TIMEOUT_SECONDS` (optional)
+- Gemini 3 models are not currently supported on the Live API. If you add a non-Live Gemini path later, keep it on a separate model config instead of pointing `GEMINI_LIVE_MODEL` at Gemini 3.
 
 ## Health ping
 
@@ -102,6 +103,7 @@ Matchmaking uses Postgres transactions and `FOR UPDATE SKIP LOCKED` so two queue
     - `gives_check`
     - `themes` list
   - Uses a shared stateful Gemini Live WebSocket session on the backend.
+  - Defaults to `models/gemini-2.5-flash-native-audio-preview-12-2025`, because the older `gemini-2.0-flash-live-001` model is shut down and Gemini 3 does not currently support the Live API.
   - Each turn is sent to Gemini as a structured packet with current FEN, recent move narrative, and the query text.
   - Turns are serialized to avoid interleaving.
 

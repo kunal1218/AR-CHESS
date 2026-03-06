@@ -2,6 +2,7 @@ from types import SimpleNamespace
 import sys
 from pathlib import Path
 
+import pytest
 from websockets.protocol import State
 
 
@@ -127,3 +128,25 @@ def test_is_terminal_error_treats_expired_api_key_close_reason_as_terminal() -> 
     assert client._is_terminal_error(  # noqa: SLF001
         "received 1007 (invalid frame payload data) API key expired"
     )
+
+
+def test_validate_live_model_rejects_shut_down_model() -> None:
+    client = GeminiLiveClient(
+        api_key="test-key",
+        model="models/gemini-2.0-flash-live-001",
+        system_prompt="test",
+    )
+
+    with pytest.raises(RuntimeError, match="shut down"):
+        client._validate_live_model()  # noqa: SLF001
+
+
+def test_validate_live_model_rejects_gemini3_models_for_live() -> None:
+    client = GeminiLiveClient(
+        api_key="test-key",
+        model="models/gemini-3-flash-preview",
+        system_prompt="test",
+    )
+
+    with pytest.raises(RuntimeError, match="does not support the Live API"):
+        client._validate_live_model()  # noqa: SLF001

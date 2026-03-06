@@ -250,7 +250,7 @@ def build_gemini_user_query(payload: GeminiHintRequest) -> str:
 
 GEMINI_LIVE_CLIENT = GeminiLiveClient(
     api_key=os.getenv("GEMINI_API_KEY"),
-    model=os.getenv("GEMINI_LIVE_MODEL", "models/gemini-2.0-flash-live-001"),
+    model=os.getenv("GEMINI_LIVE_MODEL", GeminiLiveClient.DEFAULT_MODEL),
     system_prompt=os.getenv("GEMINI_LIVE_SYSTEM_PROMPT", GEMINI_HINT_SYSTEM_PROMPT).strip(),
     generation_config={
         "temperature": env_float("GEMINI_LIVE_TEMPERATURE", 0.95),
