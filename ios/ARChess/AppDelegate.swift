@@ -7710,17 +7710,17 @@ private struct NativeARView: UIViewRepresentable {
         }
 
         let shackle = makeKnightForkChainEntity(seed: index)
-        shackle.position = SIMD3<Float>(0, 0.026, 0)
-        shackle.scale = SIMD3<Float>(repeating: 0.26)
+        shackle.position = SIMD3<Float>(0, 0.020, 0)
+        shackle.scale = SIMD3<Float>(repeating: 1.16)
         shackle.orientation = simd_quatf(angle: Float(index) * .pi / 9, axis: SIMD3<Float>(0, 1, 0))
         victim.addChild(shackle)
 
         let settle = Transform(
-          scale: SIMD3<Float>(repeating: 1.0),
+          scale: SIMD3<Float>(repeating: 0.90),
           rotation: simd_quatf(angle: Float(index + 1) * .pi / 12, axis: SIMD3<Float>(0, 1, 0)),
-          translation: shackle.position
+          translation: shackle.position + SIMD3<Float>(0, -0.0015, 0)
         )
-        shackle.move(to: settle, relativeTo: victim, duration: 0.14, timingFunction: .easeOut)
+        shackle.move(to: settle, relativeTo: victim, duration: 0.16, timingFunction: .easeOut)
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.42) { [weak shackle, weak victim] in
           guard let shackle, let victim else {
@@ -7728,7 +7728,7 @@ private struct NativeARView: UIViewRepresentable {
           }
 
           let release = Transform(
-            scale: SIMD3<Float>(repeating: 0.08),
+            scale: SIMD3<Float>(repeating: 0.42),
             rotation: simd_quatf(angle: .pi / 2.6, axis: SIMD3<Float>(0, 1, 0)),
             translation: shackle.position + SIMD3<Float>(0, 0.010, 0)
           )
@@ -7742,49 +7742,109 @@ private struct NativeARView: UIViewRepresentable {
     }
 
     private func makeKnightForkChainEntity(seed: Int) -> Entity {
-      let group = Entity()
+      let shackle = Entity()
       let linkMaterial = SimpleMaterial(
-        color: UIColor(red: 0.73, green: 0.72, blue: 0.66, alpha: 0.96),
-        roughness: 0.16,
+        color: UIColor(red: 0.73, green: 0.72, blue: 0.66, alpha: 0.98),
+        roughness: 0.12,
         isMetallic: true
       )
       let lockMaterial = SimpleMaterial(
-        color: UIColor(red: 0.44, green: 0.37, blue: 0.22, alpha: 0.96),
-        roughness: 0.22,
+        color: UIColor(red: 0.44, green: 0.37, blue: 0.22, alpha: 0.98),
+        roughness: 0.18,
         isMetallic: true
       )
 
-      func addRing(y: Float, radiusX: Float, radiusZ: Float, yaw: Float) {
-        let ring = Entity()
-        ring.position = SIMD3<Float>(0, y, 0)
-        ring.orientation = simd_quatf(angle: yaw, axis: SIMD3<Float>(0, 1, 0))
-        let linkCount = 12
+      func makeChainLink(width: Float, height: Float, thickness: Float) -> Entity {
+        let link = Entity()
+        let verticalMesh = MeshResource.generateCapsule(height: max(0.004, height - (thickness * 1.2)), radius: thickness)
+        let horizontalMesh = MeshResource.generateCapsule(height: max(0.004, width - (thickness * 1.2)), radius: thickness)
+
+        let leftRail = ModelEntity(mesh: verticalMesh, materials: [linkMaterial])
+        leftRail.position = SIMD3<Float>(-(width * 0.5), 0, 0)
+        let rightRail = ModelEntity(mesh: verticalMesh, materials: [linkMaterial])
+        rightRail.position = SIMD3<Float>(width * 0.5, 0, 0)
+
+        let topBridge = ModelEntity(mesh: horizontalMesh, materials: [linkMaterial])
+        topBridge.position = SIMD3<Float>(0, height * 0.5, 0)
+        topBridge.orientation = simd_quatf(angle: .pi / 2, axis: SIMD3<Float>(0, 0, 1))
+        let bottomBridge = ModelEntity(mesh: horizontalMesh, materials: [linkMaterial])
+        bottomBridge.position = SIMD3<Float>(0, -(height * 0.5), 0)
+        bottomBridge.orientation = simd_quatf(angle: .pi / 2, axis: SIMD3<Float>(0, 0, 1))
+
+        link.addChild(leftRail)
+        link.addChild(rightRail)
+        link.addChild(topBridge)
+        link.addChild(bottomBridge)
+        return link
+      }
+
+      func makeChainBand(
+        y: Float,
+        ringRadiusX: Float,
+        ringRadiusZ: Float,
+        linkWidth: Float,
+        linkHeight: Float,
+        thickness: Float,
+        linkCount: Int,
+        yaw: Float
+      ) -> Entity {
+        let band = Entity()
+        band.position = SIMD3<Float>(0, y, 0)
+        band.orientation = simd_quatf(angle: yaw, axis: SIMD3<Float>(0, 1, 0))
 
         for index in 0..<linkCount {
           let angle = (Float(index) / Float(linkCount)) * (.pi * 2)
-          let link = ModelEntity(
-            mesh: .generateBox(size: SIMD3<Float>(0.007, 0.003, 0.0023)),
-            materials: [linkMaterial]
+          let link = makeChainLink(width: linkWidth, height: linkHeight, thickness: thickness)
+          link.position = SIMD3<Float>(
+            cosf(angle) * ringRadiusX,
+            index.isMultiple(of: 2) ? 0.0016 : -0.0016,
+            sinf(angle) * ringRadiusZ
           )
-          link.position = SIMD3<Float>(cosf(angle) * radiusX, 0, sinf(angle) * radiusZ)
-          link.orientation = simd_quatf(angle: -angle, axis: SIMD3<Float>(0, 1, 0))
-          ring.addChild(link)
+
+          let tangentYaw = -angle + (.pi / 2)
+          let interlockRoll: Float = index.isMultiple(of: 2) ? (.pi / 2.7) : (-.pi / 2.7)
+          link.orientation = simd_normalize(
+            simd_quatf(angle: tangentYaw, axis: SIMD3<Float>(0, 1, 0)) *
+              simd_quatf(angle: interlockRoll, axis: SIMD3<Float>(0, 0, 1))
+          )
+          band.addChild(link)
         }
 
-        group.addChild(ring)
+        return band
       }
 
-      addRing(y: 0.008, radiusX: 0.028, radiusZ: 0.020, yaw: Float(seed) * .pi / 10)
-      addRing(y: 0.024, radiusX: 0.026, radiusZ: 0.018, yaw: (.pi / 7) + Float(seed) * .pi / 12)
+      let lowerBand = makeChainBand(
+        y: 0.012,
+        ringRadiusX: 0.020,
+        ringRadiusZ: 0.015,
+        linkWidth: 0.007,
+        linkHeight: 0.011,
+        thickness: 0.00125,
+        linkCount: 6,
+        yaw: Float(seed) * .pi / 10
+      )
+      let upperBand = makeChainBand(
+        y: 0.024,
+        ringRadiusX: 0.018,
+        ringRadiusZ: 0.0135,
+        linkWidth: 0.0065,
+        linkHeight: 0.010,
+        thickness: 0.00115,
+        linkCount: 5,
+        yaw: (.pi / 9) + Float(seed) * .pi / 12
+      )
+      shackle.addChild(lowerBand)
+      shackle.addChild(upperBand)
 
       let lock = ModelEntity(
-        mesh: .generateBox(size: SIMD3<Float>(0.010, 0.012, 0.006)),
+        mesh: .generateBox(size: SIMD3<Float>(0.0075, 0.0095, 0.0055)),
         materials: [lockMaterial]
       )
-      lock.position = SIMD3<Float>(0, 0.016, 0.020)
-      group.addChild(lock)
+      lock.position = SIMD3<Float>(0.014, 0.018, 0.012)
+      lock.orientation = simd_quatf(angle: .pi / 6, axis: SIMD3<Float>(0, 1, 0))
+      shackle.addChild(lock)
 
-      return group
+      return shackle
     }
 
     private func kingEntity(for color: ChessColor) -> Entity? {
