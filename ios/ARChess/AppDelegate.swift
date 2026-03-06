@@ -6605,6 +6605,11 @@ private struct NativeARView: UIViewRepresentable {
       let postApply: (@MainActor () async -> Void)?
     }
 
+    private struct ActiveKnightForkBinding {
+      let targetSquares: [BoardSquare]
+      let clearsOnMoveBy: ChessColor
+    }
+
     private let boardSize: Float = 0.40
     private let boardInset: Float = 0.08
     private let minimumBoardScale: Float = 1.0
@@ -6637,8 +6642,9 @@ private struct NativeARView: UIViewRepresentable {
     private var moveAnimationTask: Task<Void, Never>?
     private var narrativeHistory: [NarrativeMove] = []
     private let captureSoundEffects = CaptureSoundEffectEngine()
+    private var activeKnightForkBinding: ActiveKnightForkBinding?
     private weak var brilliantMarkerView: UIImageView?
-    private var brilliantMarkerSquare: BoardSquare?
+    private var brilliantMarkerPieceName: String?
     private var brilliantMarkerDisplayLink: CADisplayLink?
     private var brilliantMarkerHideWorkItem: DispatchWorkItem?
 
@@ -7105,6 +7111,10 @@ private struct NativeARView: UIViewRepresentable {
 
     @MainActor
     private func animateAndApply(_ context: AnimatedMoveContext) async {
+      if activeKnightForkBinding?.clearsOnMoveBy == context.move.piece.color {
+        activeKnightForkBinding = nil
+      }
+
       selectedSquare = nil
       selectedMoves = []
       refreshBoardPresentation()
@@ -7143,7 +7153,7 @@ private struct NativeARView: UIViewRepresentable {
       arView.bringSubviewToFront(marker)
 
       brilliantMarkerView = marker
-      brilliantMarkerSquare = square
+      brilliantMarkerPieceName = pieceName(square)
       updateBrilliantMoveMarkerFrame()
       marker.startAnimating()
 
@@ -7157,7 +7167,7 @@ private struct NativeARView: UIViewRepresentable {
         }
         self.brilliantMarkerDisplayLink?.invalidate()
         self.brilliantMarkerDisplayLink = nil
-        self.brilliantMarkerSquare = nil
+        self.brilliantMarkerPieceName = nil
         UIView.animate(withDuration: 0.14, animations: {
           marker?.alpha = 0
         }, completion: { _ in
@@ -7175,54 +7185,41 @@ private struct NativeARView: UIViewRepresentable {
 
     private func updateBrilliantMoveMarkerFrame() {
       guard let marker = brilliantMarkerView,
-            let square = brilliantMarkerSquare,
-            let frame = brilliantMarkerFrame(for: square) else {
+            let pieceName = brilliantMarkerPieceName,
+            let frame = brilliantMarkerFrame(forPieceNamed: pieceName) else {
         brilliantMarkerView?.removeFromSuperview()
         brilliantMarkerView = nil
         brilliantMarkerDisplayLink?.invalidate()
         brilliantMarkerDisplayLink = nil
-        brilliantMarkerSquare = nil
+        brilliantMarkerPieceName = nil
         return
       }
 
       marker.frame = frame
     }
 
-    private func brilliantMarkerFrame(for square: BoardSquare) -> CGRect? {
+    private func brilliantMarkerFrame(forPieceNamed pieceName: String) -> CGRect? {
       guard let arView,
-            let center = projectedBoardPoint(for: square, localOffset: SIMD3<Float>(0, 0.006, 0)),
-            let east = projectedBoardPoint(for: square, localOffset: SIMD3<Float>((boardSize / 8.0) * 0.46, 0.006, 0)),
-            let north = projectedBoardPoint(for: square, localOffset: SIMD3<Float>(0, 0.006, -((boardSize / 8.0) * 0.46))) else {
+            let center = projectedPiecePoint(named: pieceName, verticalOffset: 0.082),
+            let shoulder = projectedPiecePoint(named: pieceName, verticalOffset: 0.046) else {
         return nil
       }
 
-      let halfWidth = max(abs(east.x - center.x), abs(north.x - center.x))
-      let halfHeight = max(abs(east.y - center.y), abs(north.y - center.y))
-      let size = max(44, min(160, max(halfWidth, halfHeight) * 3.1))
+      let projectedHeight = abs(shoulder.y - center.y)
+      let size = max(56, min(160, projectedHeight * 3.6))
       let origin = CGPoint(x: center.x - (size * 0.5), y: center.y - (size * 0.5))
       let frame = CGRect(origin: origin, size: CGSize(width: size, height: size))
       return frame.intersects(arView.bounds) ? frame : nil
     }
 
-    private func projectedBoardPoint(for square: BoardSquare, localOffset: SIMD3<Float>) -> CGPoint? {
+    private func projectedPiecePoint(named pieceName: String, verticalOffset: Float) -> CGPoint? {
       guard let arView,
-            let worldPoint = worldBoardPoint(for: square, localOffset: localOffset) else {
+            let piece = piecesContainer.findEntity(named: pieceName) else {
         return nil
       }
 
+      let worldPoint = piece.position(relativeTo: nil) + SIMD3<Float>(0, verticalOffset, 0)
       return arView.project(worldPoint)
-    }
-
-    private func worldBoardPoint(for square: BoardSquare, localOffset: SIMD3<Float>) -> SIMD3<Float>? {
-      guard let boardWorldTransform else {
-        return nil
-      }
-
-      let squareSize = boardSize / 8.0
-      let local = boardPosition(square, squareSize: squareSize) + localOffset
-      let scaled = local * boardScale
-      let world = boardWorldTransform * SIMD4<Float>(scaled.x, scaled.y, scaled.z, 1)
-      return SIMD3<Float>(world.x, world.y, world.z)
     }
 
     private func handleReactionCue(_ cue: PiecePersonalityDirector.ReactionCue) {
@@ -7232,7 +7229,7 @@ private struct NativeARView: UIViewRepresentable {
       case .currentKingCries(let color):
         animateKingCrying(for: color)
       case .knightFork(let targets):
-        animateKnightForkChains(on: targets)
+        activateKnightForkChains(on: targets)
       }
     }
 
@@ -7703,41 +7700,78 @@ private struct NativeARView: UIViewRepresentable {
       }
     }
 
-    private func animateKnightForkChains(on targetSquares: [BoardSquare]) {
-      for (index, square) in Array(targetSquares.prefix(2)).enumerated() {
-        guard let victim = piecesContainer.findEntity(named: pieceName(square)) else {
+    private func activateKnightForkChains(on targetSquares: [BoardSquare]) {
+      let normalizedTargets = Array(targetSquares.prefix(2))
+      guard !normalizedTargets.isEmpty else {
+        activeKnightForkBinding = nil
+        return
+      }
+
+      if let attackedColor = normalizedTargets.compactMap({ gameState.board[$0]?.color }).first {
+        activeKnightForkBinding = ActiveKnightForkBinding(
+          targetSquares: normalizedTargets,
+          clearsOnMoveBy: attackedColor
+        )
+      }
+
+      for (index, square) in normalizedTargets.enumerated() {
+        guard let victim = piecesContainer.findEntity(named: pieceName(square)),
+              let piece = gameState.board[square] else {
           continue
         }
 
-        let shackle = makeKnightForkChainEntity(seed: index)
-        shackle.position = SIMD3<Float>(0, 0.020, 0)
-        shackle.scale = SIMD3<Float>(repeating: 1.16)
-        shackle.orientation = simd_quatf(angle: Float(index) * .pi / 9, axis: SIMD3<Float>(0, 1, 0))
+        attachKnightForkShackle(to: victim, piece: piece, seed: index, animated: true)
+      }
+    }
+
+    private func attachKnightForkShackle(
+      to victim: Entity,
+      piece: ChessPieceState,
+      seed: Int,
+      animated: Bool
+    ) {
+      victim.findEntity(named: "knight_fork_shackle")?.removeFromParent()
+
+      let shackle = makeKnightForkChainEntity(seed: seed)
+      shackle.name = "knight_fork_shackle"
+      let anchorHeight = knightForkChainAnchorHeight(for: piece.kind)
+      let settledRotation = simd_quatf(angle: Float(seed + 1) * .pi / 12, axis: SIMD3<Float>(0, 1, 0))
+      let settledTranslation = SIMD3<Float>(0, anchorHeight, 0)
+
+      if animated {
+        shackle.position = settledTranslation
+        shackle.scale = SIMD3<Float>(repeating: 1.14)
+        shackle.orientation = simd_quatf(angle: Float(seed) * .pi / 9, axis: SIMD3<Float>(0, 1, 0))
         victim.addChild(shackle)
 
         let settle = Transform(
-          scale: SIMD3<Float>(repeating: 0.90),
-          rotation: simd_quatf(angle: Float(index + 1) * .pi / 12, axis: SIMD3<Float>(0, 1, 0)),
-          translation: shackle.position + SIMD3<Float>(0, -0.0015, 0)
+          scale: SIMD3<Float>(repeating: 0.88),
+          rotation: settledRotation,
+          translation: settledTranslation
         )
         shackle.move(to: settle, relativeTo: victim, duration: 0.16, timingFunction: .easeOut)
+      } else {
+        shackle.position = settledTranslation
+        shackle.scale = SIMD3<Float>(repeating: 0.88)
+        shackle.orientation = settledRotation
+        victim.addChild(shackle)
+      }
+    }
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.42) { [weak shackle, weak victim] in
-          guard let shackle, let victim else {
-            return
-          }
-
-          let release = Transform(
-            scale: SIMD3<Float>(repeating: 0.42),
-            rotation: simd_quatf(angle: .pi / 2.6, axis: SIMD3<Float>(0, 1, 0)),
-            translation: shackle.position + SIMD3<Float>(0, 0.010, 0)
-          )
-          shackle.move(to: release, relativeTo: victim, duration: 0.18, timingFunction: .easeIn)
-
-          DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) { [weak shackle] in
-            shackle?.removeFromParent()
-          }
-        }
+    private func knightForkChainAnchorHeight(for kind: ChessPieceKind) -> Float {
+      switch kind {
+      case .pawn:
+        return 0.010
+      case .knight:
+        return 0.012
+      case .bishop:
+        return 0.015
+      case .rook:
+        return 0.015
+      case .queen:
+        return 0.017
+      case .king:
+        return 0.018
       }
     }
 
@@ -8168,6 +8202,15 @@ private struct NativeARView: UIViewRepresentable {
         if selectedSquare == square {
           pieceEntity.position.y += 0.016
           pieceEntity.scale = SIMD3<Float>(repeating: 1.06)
+        }
+
+        if activeKnightForkBinding?.targetSquares.contains(square) == true {
+          attachKnightForkShackle(
+            to: pieceEntity,
+            piece: piece,
+            seed: square.file + (square.rank * 8),
+            animated: false
+          )
         }
 
         pieceEntity.generateCollisionShapes(recursive: true)
