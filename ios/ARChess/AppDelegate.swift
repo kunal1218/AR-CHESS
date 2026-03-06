@@ -4972,14 +4972,8 @@ private struct NativeARExperienceView: View {
         }
 
         if let activeDebugPanel {
-          Group {
-            if activeDebugPanel == .stockfish {
-              stockfishDebugPanel
-            } else {
-              geminiDebugPanel
-            }
-          }
-          .id(activeDebugPanel)
+          debugOverlayPager
+            .id(activeDebugPanel)
           .transition(.move(edge: .bottom).combined(with: .opacity))
         }
 
@@ -5144,10 +5138,7 @@ private struct NativeARExperienceView: View {
   }
 
   private var geminiDebugPanel: some View {
-    debugOverlayCard(
-      swipeDirection: .right,
-      destination: .stockfish
-    ) {
+    debugOverlayCard {
       VStack(alignment: .leading, spacing: 10) {
         Text("Gemini debug")
           .font(.system(size: 12, weight: .bold, design: .rounded))
@@ -5196,10 +5187,7 @@ private struct NativeARExperienceView: View {
   }
 
   private var stockfishDebugPanel: some View {
-    debugOverlayCard(
-      swipeDirection: .left,
-      destination: .gemini
-    ) {
+    debugOverlayCard {
       VStack(alignment: .leading, spacing: 10) {
         Text("Stockfish debug")
           .font(.system(size: 12, weight: .bold, design: .rounded))
@@ -5253,6 +5241,18 @@ private struct NativeARExperienceView: View {
     }
   }
 
+  private var debugOverlayPager: some View {
+    TabView(selection: debugPanelSelection) {
+      stockfishDebugPanel
+        .tag(DebugOverlayPanel.stockfish)
+
+      geminiDebugPanel
+        .tag(DebugOverlayPanel.gemini)
+    }
+    .tabViewStyle(.page(indexDisplayMode: .never))
+    .frame(maxWidth: .infinity, maxHeight: overlayPanelMaxHeight(ratio: 0.42), alignment: .top)
+  }
+
   private var debugPanelBackground: some View {
     RoundedRectangle(cornerRadius: 24, style: .continuous)
       .fill(Color(red: 0.07, green: 0.08, blue: 0.12).opacity(0.86))
@@ -5266,14 +5266,14 @@ private struct NativeARExperienceView: View {
     UIScreen.main.bounds.height * ratio
   }
 
-  private enum DebugSwipeDirection {
-    case left
-    case right
+  private var debugPanelSelection: Binding<DebugOverlayPanel> {
+    Binding(
+      get: { activeDebugPanel ?? .gemini },
+      set: { activeDebugPanel = $0 }
+    )
   }
 
   private func debugOverlayCard<Content: View>(
-    swipeDirection: DebugSwipeDirection,
-    destination: DebugOverlayPanel,
     @ViewBuilder content: () -> Content
   ) -> some View {
     ZStack {
@@ -5288,27 +5288,6 @@ private struct NativeARExperienceView: View {
     }
     .frame(maxWidth: .infinity, maxHeight: overlayPanelMaxHeight(ratio: 0.42), alignment: .top)
     .contentShape(Rectangle())
-    .simultaneousGesture(
-      DragGesture(minimumDistance: 18)
-        .onEnded { value in
-          let horizontal = value.translation.width
-          let vertical = value.translation.height
-          guard abs(horizontal) > max(70, abs(vertical) * 1.2) else {
-            return
-          }
-
-          switch swipeDirection {
-          case .right:
-            guard horizontal > 0 else { return }
-          case .left:
-            guard horizontal < 0 else { return }
-          }
-
-          withAnimation(.spring(response: 0.30, dampingFraction: 0.86)) {
-            activeDebugPanel = destination
-          }
-        }
-    )
   }
 
   private var modeTitle: String {
