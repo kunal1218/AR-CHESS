@@ -4847,11 +4847,6 @@ private struct QueueMatchView: View {
 }
 
 private struct NativeARExperienceView: View {
-  private enum DebugOverlayPanel {
-    case gemini
-    case stockfish
-  }
-
   let mode: ExperienceMode
   @ObservedObject var queueMatch: QueueMatchStore
   let closeExperience: () -> Void
@@ -4859,7 +4854,8 @@ private struct NativeARExperienceView: View {
   @StateObject private var commentary = PiecePersonalityDirector()
   @State private var isModePanelVisible = false
   @State private var isMatchLogVisible = false
-  @State private var activeDebugPanel: DebugOverlayPanel?
+  @State private var isGeminiDebugVisible = false
+  @State private var isStockfishDebugVisible = false
 
   var body: some View {
     ZStack {
@@ -4971,9 +4967,14 @@ private struct NativeARExperienceView: View {
           .transition(.move(edge: .bottom).combined(with: .opacity))
         }
 
-        if let activeDebugPanel {
-          debugOverlayPager
-          .transition(.move(edge: .bottom).combined(with: .opacity))
+        if isGeminiDebugVisible {
+          geminiDebugPanel
+            .transition(.move(edge: .bottom).combined(with: .opacity))
+        }
+
+        if isStockfishDebugVisible {
+          stockfishDebugPanel
+            .transition(.move(edge: .bottom).combined(with: .opacity))
         }
 
         if isMatchLogVisible {
@@ -5064,14 +5065,31 @@ private struct NativeARExperienceView: View {
             }
 
             overlayToggleButton(
-              title: activeDebugPanel == nil ? "Show Gemini Debug" : "Hide Gemini Debug",
+              title: isGeminiDebugVisible ? "Hide Gemini Debug" : "Show Gemini Debug",
               systemImage: "sparkles.rectangle.stack"
             ) {
-              let nextPanel: DebugOverlayPanel? = activeDebugPanel == nil ? .gemini : nil
+              let nextVisible = !isGeminiDebugVisible
               withAnimation(.spring(response: 0.30, dampingFraction: 0.86)) {
-                activeDebugPanel = nextPanel
+                isGeminiDebugVisible = nextVisible
+                if nextVisible {
+                  isStockfishDebugVisible = false
+                }
               }
-              commentary.setGeminiDebugVisible(nextPanel != nil)
+              syncStockfishDebugVisibility()
+            }
+
+            overlayToggleButton(
+              title: isStockfishDebugVisible ? "Hide Stockfish Debug" : "Show Stockfish Debug",
+              systemImage: "list.number"
+            ) {
+              let nextVisible = !isStockfishDebugVisible
+              withAnimation(.spring(response: 0.30, dampingFraction: 0.86)) {
+                isStockfishDebugVisible = nextVisible
+                if nextVisible {
+                  isGeminiDebugVisible = false
+                }
+              }
+              syncStockfishDebugVisibility()
             }
           }
 
@@ -5165,10 +5183,6 @@ private struct NativeARExperienceView: View {
             .lineLimit(2)
         }
 
-        Text("Swipe right for Stockfish-only debug.")
-          .font(.system(size: 12, weight: .semibold, design: .rounded))
-          .foregroundStyle(Color.white.opacity(0.70))
-
         if commentary.geminiDebugLines.isEmpty {
           Text("No Gemini activity yet.")
             .font(.system(size: 13, weight: .medium, design: .rounded))
@@ -5197,9 +5211,22 @@ private struct NativeARExperienceView: View {
           .font(.system(size: 13, weight: .semibold, design: .rounded))
           .foregroundStyle(Color.white.opacity(0.82))
 
-        Text("Swipe left to return to Gemini debug.")
-          .font(.system(size: 12, weight: .semibold, design: .rounded))
-          .foregroundStyle(Color.white.opacity(0.70))
+        Button {
+          Task {
+            await commentary.analyzeCurrentPosition()
+          }
+        } label: {
+          Text("Analyze position")
+            .font(.system(size: 12, weight: .bold, design: .rounded))
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .foregroundStyle(Color.black.opacity(0.88))
+            .background(
+              Capsule(style: .continuous)
+                .fill(Color(red: 0.95, green: 0.88, blue: 0.73))
+            )
+        }
+        .buttonStyle(.plain)
 
         if commentary.stockfishDebugWhiteLines.isEmpty && commentary.stockfishDebugBlackLines.isEmpty {
           Text("No Stockfish move lines yet.")
@@ -5240,41 +5267,6 @@ private struct NativeARExperienceView: View {
     }
   }
 
-  private var debugOverlayPager: some View {
-    TabView(selection: debugPanelSelection) {
-      stockfishDebugPanel
-        .tag(DebugOverlayPanel.stockfish)
-
-      geminiDebugPanel
-        .tag(DebugOverlayPanel.gemini)
-    }
-    .tabViewStyle(.page(indexDisplayMode: .never))
-    .frame(maxWidth: .infinity, maxHeight: overlayPanelMaxHeight(ratio: 0.42), alignment: .top)
-    .highPriorityGesture(
-      DragGesture(minimumDistance: 20)
-        .onEnded { value in
-          let horizontal = value.translation.width
-          let vertical = value.translation.height
-          guard abs(horizontal) > max(60, abs(vertical) * 1.2) else {
-            return
-          }
-
-          switch activeDebugPanel {
-          case .gemini where horizontal > 0:
-            withAnimation(.spring(response: 0.30, dampingFraction: 0.86)) {
-              activeDebugPanel = .stockfish
-            }
-          case .stockfish where horizontal < 0:
-            withAnimation(.spring(response: 0.30, dampingFraction: 0.86)) {
-              activeDebugPanel = .gemini
-            }
-          default:
-            break
-          }
-        }
-    )
-  }
-
   private var debugPanelBackground: some View {
     RoundedRectangle(cornerRadius: 24, style: .continuous)
       .fill(Color(red: 0.07, green: 0.08, blue: 0.12).opacity(0.86))
@@ -5286,13 +5278,6 @@ private struct NativeARExperienceView: View {
 
   private func overlayPanelMaxHeight(ratio: CGFloat) -> CGFloat {
     UIScreen.main.bounds.height * ratio
-  }
-
-  private var debugPanelSelection: Binding<DebugOverlayPanel> {
-    Binding(
-      get: { activeDebugPanel ?? .gemini },
-      set: { activeDebugPanel = $0 }
-    )
   }
 
   private func debugOverlayCard<Content: View>(
@@ -5310,6 +5295,10 @@ private struct NativeARExperienceView: View {
     }
     .frame(maxWidth: .infinity, maxHeight: overlayPanelMaxHeight(ratio: 0.42), alignment: .top)
     .contentShape(Rectangle())
+  }
+
+  private func syncStockfishDebugVisibility() {
+    commentary.setGeminiDebugVisible(isStockfishDebugVisible)
   }
 
   private var modeTitle: String {
