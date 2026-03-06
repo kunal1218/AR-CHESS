@@ -4979,6 +4979,7 @@ private struct NativeARExperienceView: View {
               geminiDebugPanel
             }
           }
+          .id(activeDebugPanel)
           .transition(.move(edge: .bottom).combined(with: .opacity))
         }
 
@@ -5143,7 +5144,10 @@ private struct NativeARExperienceView: View {
   }
 
   private var geminiDebugPanel: some View {
-    ScrollView(showsIndicators: true) {
+    debugOverlayCard(
+      swipeDirection: .right,
+      destination: .stockfish
+    ) {
       VStack(alignment: .leading, spacing: 10) {
         Text("Gemini debug")
           .font(.system(size: 12, weight: .bold, design: .rounded))
@@ -5188,27 +5192,14 @@ private struct NativeARExperienceView: View {
           }
         }
       }
-      .frame(maxWidth: .infinity, alignment: .leading)
-      .padding(18)
     }
-    .frame(maxWidth: .infinity, maxHeight: overlayPanelMaxHeight(ratio: 0.42), alignment: .top)
-    .background(debugPanelBackground)
-    .contentShape(Rectangle())
-    .simultaneousGesture(
-      DragGesture(minimumDistance: 24)
-        .onEnded { value in
-          guard value.translation.width > 70, abs(value.translation.height) < 60 else {
-            return
-          }
-          withAnimation(.spring(response: 0.30, dampingFraction: 0.86)) {
-            activeDebugPanel = .stockfish
-          }
-        }
-    )
   }
 
   private var stockfishDebugPanel: some View {
-    ScrollView(showsIndicators: true) {
+    debugOverlayCard(
+      swipeDirection: .left,
+      destination: .gemini
+    ) {
       VStack(alignment: .leading, spacing: 10) {
         Text("Stockfish debug")
           .font(.system(size: 12, weight: .bold, design: .rounded))
@@ -5259,23 +5250,7 @@ private struct NativeARExperienceView: View {
           }
         }
       }
-      .frame(maxWidth: .infinity, alignment: .leading)
-      .padding(18)
     }
-    .frame(maxWidth: .infinity, maxHeight: overlayPanelMaxHeight(ratio: 0.42), alignment: .top)
-    .background(debugPanelBackground)
-    .contentShape(Rectangle())
-    .simultaneousGesture(
-      DragGesture(minimumDistance: 24)
-        .onEnded { value in
-          guard value.translation.width < -70, abs(value.translation.height) < 60 else {
-            return
-          }
-          withAnimation(.spring(response: 0.30, dampingFraction: 0.86)) {
-            activeDebugPanel = .gemini
-          }
-        }
-    )
   }
 
   private var debugPanelBackground: some View {
@@ -5289,6 +5264,51 @@ private struct NativeARExperienceView: View {
 
   private func overlayPanelMaxHeight(ratio: CGFloat) -> CGFloat {
     UIScreen.main.bounds.height * ratio
+  }
+
+  private enum DebugSwipeDirection {
+    case left
+    case right
+  }
+
+  private func debugOverlayCard<Content: View>(
+    swipeDirection: DebugSwipeDirection,
+    destination: DebugOverlayPanel,
+    @ViewBuilder content: () -> Content
+  ) -> some View {
+    ZStack {
+      debugPanelBackground
+
+      ScrollView(showsIndicators: true) {
+        content()
+          .frame(maxWidth: .infinity, alignment: .leading)
+          .padding(18)
+      }
+      .frame(maxWidth: .infinity, maxHeight: overlayPanelMaxHeight(ratio: 0.42), alignment: .top)
+    }
+    .frame(maxWidth: .infinity, maxHeight: overlayPanelMaxHeight(ratio: 0.42), alignment: .top)
+    .contentShape(Rectangle())
+    .simultaneousGesture(
+      DragGesture(minimumDistance: 18)
+        .onEnded { value in
+          let horizontal = value.translation.width
+          let vertical = value.translation.height
+          guard abs(horizontal) > max(70, abs(vertical) * 1.2) else {
+            return
+          }
+
+          switch swipeDirection {
+          case .right:
+            guard horizontal > 0 else { return }
+          case .left:
+            guard horizontal < 0 else { return }
+          }
+
+          withAnimation(.spring(response: 0.30, dampingFraction: 0.86)) {
+            activeDebugPanel = destination
+          }
+        }
+    )
   }
 
   private var modeTitle: String {
