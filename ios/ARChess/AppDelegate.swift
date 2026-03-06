@@ -4855,6 +4855,7 @@ private struct NativeARExperienceView: View {
   @State private var isModePanelVisible = false
   @State private var isMatchLogVisible = false
   @State private var isGeminiDebugVisible = false
+  @State private var isStockfishDebugPanelVisible = false
 
   var body: some View {
     ZStack {
@@ -4964,90 +4965,13 @@ private struct NativeARExperienceView: View {
         }
 
         if isGeminiDebugVisible {
-          VStack(alignment: .leading, spacing: 10) {
-            Text("Gemini debug")
-              .font(.system(size: 12, weight: .bold, design: .rounded))
-              .tracking(1.8)
-              .foregroundStyle(Color(red: 0.88, green: 0.82, blue: 0.70))
-
-            Text(commentary.hintStatusText)
-              .font(.system(size: 14, weight: .semibold, design: .rounded))
-              .foregroundStyle(Color.white.opacity(0.86))
-
-            HStack(spacing: 8) {
-              Text("Live:")
-                .font(.system(size: 13, weight: .bold, design: .monospaced))
-                .foregroundStyle(Color.white.opacity(0.76))
-
-              Text(commentary.geminiConnectionState.rawValue)
-                .font(.system(size: 13, weight: .bold, design: .monospaced))
-                .foregroundStyle(connectionStateColor)
-            }
-
-            if let connectionError = commentary.geminiConnectionLastError {
-              Text(connectionError)
-                .font(.system(size: 12, weight: .medium, design: .rounded))
-                .foregroundStyle(Color(red: 0.95, green: 0.70, blue: 0.62))
-                .lineLimit(2)
-            }
-
-            Text(commentary.stockfishDebugStatusText)
-              .font(.system(size: 12, weight: .semibold, design: .rounded))
-              .foregroundStyle(Color.white.opacity(0.70))
-
-            if !commentary.stockfishDebugWhiteLines.isEmpty {
-              VStack(alignment: .leading, spacing: 4) {
-                Text("Stockfish top 5: White")
-                  .font(.system(size: 12, weight: .bold, design: .rounded))
-                  .foregroundStyle(Color.white.opacity(0.86))
-
-                ForEach(Array(commentary.stockfishDebugWhiteLines.enumerated()), id: \.offset) { _, line in
-                  Text(line)
-                    .font(.system(size: 11, weight: .medium, design: .monospaced))
-                    .foregroundStyle(Color.white.opacity(0.80))
-                    .textSelection(.enabled)
-                }
-              }
-            }
-
-            if !commentary.stockfishDebugBlackLines.isEmpty {
-              VStack(alignment: .leading, spacing: 4) {
-                Text("Stockfish top 5: Black")
-                  .font(.system(size: 12, weight: .bold, design: .rounded))
-                  .foregroundStyle(Color.white.opacity(0.86))
-
-                ForEach(Array(commentary.stockfishDebugBlackLines.enumerated()), id: \.offset) { _, line in
-                  Text(line)
-                    .font(.system(size: 11, weight: .medium, design: .monospaced))
-                    .foregroundStyle(Color.white.opacity(0.80))
-                    .textSelection(.enabled)
-                }
-              }
-            }
-
-            if commentary.geminiDebugLines.isEmpty {
-              Text("No Gemini activity yet.")
-                .font(.system(size: 13, weight: .medium, design: .rounded))
-                .foregroundStyle(Color.white.opacity(0.68))
+          Group {
+            if isStockfishDebugPanelVisible {
+              stockfishDebugPanel
             } else {
-              ForEach(Array(commentary.geminiDebugLines.reversed()), id: \.self) { line in
-                Text(line)
-                  .font(.system(size: 12, weight: .medium, design: .monospaced))
-                  .foregroundStyle(Color.white.opacity(0.80))
-                  .textSelection(.enabled)
-              }
+              geminiDebugPanel
             }
           }
-          .frame(maxWidth: .infinity, alignment: .leading)
-          .padding(18)
-          .background(
-            RoundedRectangle(cornerRadius: 24, style: .continuous)
-              .fill(Color(red: 0.07, green: 0.08, blue: 0.12).opacity(0.86))
-              .overlay(
-                RoundedRectangle(cornerRadius: 24, style: .continuous)
-                  .stroke(Color.white.opacity(0.14), lineWidth: 1)
-              )
-          )
           .transition(.move(edge: .bottom).combined(with: .opacity))
         }
 
@@ -5139,10 +5063,14 @@ private struct NativeARExperienceView: View {
               title: isGeminiDebugVisible ? "Hide Gemini Debug" : "Show Gemini Debug",
               systemImage: "sparkles.rectangle.stack"
             ) {
+              let nextVisible = !isGeminiDebugVisible
               withAnimation(.spring(response: 0.30, dampingFraction: 0.86)) {
-                isGeminiDebugVisible.toggle()
+                isGeminiDebugVisible = nextVisible
+                if !nextVisible {
+                  isStockfishDebugPanelVisible = false
+                }
               }
-              commentary.setGeminiDebugVisible(isGeminiDebugVisible)
+              commentary.setGeminiDebugVisible(nextVisible)
             }
           }
 
@@ -5205,6 +5133,145 @@ private struct NativeARExperienceView: View {
         )
     }
     .accessibilityLabel(title)
+  }
+
+  private var geminiDebugPanel: some View {
+    VStack(alignment: .leading, spacing: 10) {
+      Text("Gemini debug")
+        .font(.system(size: 12, weight: .bold, design: .rounded))
+        .tracking(1.8)
+        .foregroundStyle(Color(red: 0.88, green: 0.82, blue: 0.70))
+
+      Text(commentary.hintStatusText)
+        .font(.system(size: 14, weight: .semibold, design: .rounded))
+        .foregroundStyle(Color.white.opacity(0.86))
+
+      HStack(spacing: 8) {
+        Text("Live:")
+          .font(.system(size: 13, weight: .bold, design: .monospaced))
+          .foregroundStyle(Color.white.opacity(0.76))
+
+        Text(commentary.geminiConnectionState.rawValue)
+          .font(.system(size: 13, weight: .bold, design: .monospaced))
+          .foregroundStyle(connectionStateColor)
+      }
+
+      if let connectionError = commentary.geminiConnectionLastError {
+        Text(connectionError)
+          .font(.system(size: 12, weight: .medium, design: .rounded))
+          .foregroundStyle(Color(red: 0.95, green: 0.70, blue: 0.62))
+          .lineLimit(2)
+      }
+
+      Text("Swipe right for Stockfish-only debug.")
+        .font(.system(size: 12, weight: .semibold, design: .rounded))
+        .foregroundStyle(Color.white.opacity(0.70))
+
+      if commentary.geminiDebugLines.isEmpty {
+        Text("No Gemini activity yet.")
+          .font(.system(size: 13, weight: .medium, design: .rounded))
+          .foregroundStyle(Color.white.opacity(0.68))
+      } else {
+        ForEach(Array(commentary.geminiDebugLines.reversed()), id: \.self) { line in
+          Text(line)
+            .font(.system(size: 12, weight: .medium, design: .monospaced))
+            .foregroundStyle(Color.white.opacity(0.80))
+            .textSelection(.enabled)
+        }
+      }
+    }
+    .frame(maxWidth: .infinity, alignment: .leading)
+    .padding(18)
+    .background(debugPanelBackground)
+    .contentShape(Rectangle())
+    .gesture(
+      DragGesture(minimumDistance: 24)
+        .onEnded { value in
+          guard value.translation.width > 70, abs(value.translation.height) < 60 else {
+            return
+          }
+          withAnimation(.spring(response: 0.30, dampingFraction: 0.86)) {
+            isStockfishDebugPanelVisible = true
+          }
+        }
+    )
+  }
+
+  private var stockfishDebugPanel: some View {
+    VStack(alignment: .leading, spacing: 10) {
+      Text("Stockfish debug")
+        .font(.system(size: 12, weight: .bold, design: .rounded))
+        .tracking(1.8)
+        .foregroundStyle(Color(red: 0.88, green: 0.82, blue: 0.70))
+
+      Text(commentary.stockfishDebugStatusText)
+        .font(.system(size: 13, weight: .semibold, design: .rounded))
+        .foregroundStyle(Color.white.opacity(0.82))
+
+      Text("Swipe left to return to Gemini debug.")
+        .font(.system(size: 12, weight: .semibold, design: .rounded))
+        .foregroundStyle(Color.white.opacity(0.70))
+
+      if commentary.stockfishDebugWhiteLines.isEmpty && commentary.stockfishDebugBlackLines.isEmpty {
+        Text("No Stockfish move lines yet.")
+          .font(.system(size: 13, weight: .medium, design: .rounded))
+          .foregroundStyle(Color.white.opacity(0.68))
+      } else {
+        if !commentary.stockfishDebugWhiteLines.isEmpty {
+          VStack(alignment: .leading, spacing: 4) {
+            Text("Stockfish top 5: White")
+              .font(.system(size: 12, weight: .bold, design: .rounded))
+              .foregroundStyle(Color.white.opacity(0.86))
+
+            ForEach(Array(commentary.stockfishDebugWhiteLines.enumerated()), id: \.offset) { _, line in
+              Text(line)
+                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                .foregroundStyle(Color.white.opacity(0.80))
+                .textSelection(.enabled)
+            }
+          }
+        }
+
+        if !commentary.stockfishDebugBlackLines.isEmpty {
+          VStack(alignment: .leading, spacing: 4) {
+            Text("Stockfish top 5: Black")
+              .font(.system(size: 12, weight: .bold, design: .rounded))
+              .foregroundStyle(Color.white.opacity(0.86))
+
+            ForEach(Array(commentary.stockfishDebugBlackLines.enumerated()), id: \.offset) { _, line in
+              Text(line)
+                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                .foregroundStyle(Color.white.opacity(0.80))
+                .textSelection(.enabled)
+            }
+          }
+        }
+      }
+    }
+    .frame(maxWidth: .infinity, alignment: .leading)
+    .padding(18)
+    .background(debugPanelBackground)
+    .contentShape(Rectangle())
+    .gesture(
+      DragGesture(minimumDistance: 24)
+        .onEnded { value in
+          guard value.translation.width < -70, abs(value.translation.height) < 60 else {
+            return
+          }
+          withAnimation(.spring(response: 0.30, dampingFraction: 0.86)) {
+            isStockfishDebugPanelVisible = false
+          }
+        }
+    )
+  }
+
+  private var debugPanelBackground: some View {
+    RoundedRectangle(cornerRadius: 24, style: .continuous)
+      .fill(Color(red: 0.07, green: 0.08, blue: 0.12).opacity(0.86))
+      .overlay(
+        RoundedRectangle(cornerRadius: 24, style: .continuous)
+          .stroke(Color.white.opacity(0.14), lineWidth: 1)
+      )
   }
 
   private var modeTitle: String {
