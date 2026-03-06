@@ -4973,7 +4973,6 @@ private struct NativeARExperienceView: View {
 
         if let activeDebugPanel {
           debugOverlayPager
-            .id(activeDebugPanel)
           .transition(.move(edge: .bottom).combined(with: .opacity))
         }
 
@@ -5251,6 +5250,29 @@ private struct NativeARExperienceView: View {
     }
     .tabViewStyle(.page(indexDisplayMode: .never))
     .frame(maxWidth: .infinity, maxHeight: overlayPanelMaxHeight(ratio: 0.42), alignment: .top)
+    .highPriorityGesture(
+      DragGesture(minimumDistance: 20)
+        .onEnded { value in
+          let horizontal = value.translation.width
+          let vertical = value.translation.height
+          guard abs(horizontal) > max(60, abs(vertical) * 1.2) else {
+            return
+          }
+
+          switch activeDebugPanel {
+          case .gemini where horizontal > 0:
+            withAnimation(.spring(response: 0.30, dampingFraction: 0.86)) {
+              activeDebugPanel = .stockfish
+            }
+          case .stockfish where horizontal < 0:
+            withAnimation(.spring(response: 0.30, dampingFraction: 0.86)) {
+              activeDebugPanel = .gemini
+            }
+          default:
+            break
+          }
+        }
+    )
   }
 
   private var debugPanelBackground: some View {
