@@ -3695,7 +3695,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
 
     let knightForkTargets = knightForkTargets(after: move, in: afterState)
     if knightForkTargets.count >= 2 {
-      reactionHandler?(ReactionCue(kind: .knightFork(targets: Array(knightForkTargets.prefix(2)))))
+      reactionHandler?(ReactionCue(kind: .knightFork(targets: knightForkTargets)))
     }
 
     guard completedPlyCount >= nextCommentaryPly else {
@@ -7701,7 +7701,7 @@ private struct NativeARView: UIViewRepresentable {
     }
 
     private func activateKnightForkChains(on targetSquares: [BoardSquare]) {
-      let normalizedTargets = Array(targetSquares.prefix(2))
+      let normalizedTargets = targetSquares
       guard !normalizedTargets.isEmpty else {
         activeKnightForkBinding = nil
         return
