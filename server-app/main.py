@@ -9,6 +9,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 import psycopg
+import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, status
 from fastapi.responses import JSONResponse
@@ -387,6 +388,52 @@ def build_gemini_coach_query() -> str:
     )
 
 
+GEMINI_COACH_RESPONSE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["side_to_move", "top_3_workers", "top_3_traitors", "coach_lines"],
+    "properties": {
+        "side_to_move": {
+            "type": "string",
+            "enum": ["white", "black"],
+        },
+        "top_3_workers": {
+            "type": "array",
+            "minItems": 3,
+            "maxItems": 3,
+            "items": {
+                "type": "object",
+                "required": ["piece", "square", "reason"],
+                "properties": {
+                    "piece": {"type": "string"},
+                    "square": {"type": "string"},
+                    "reason": {"type": "string"},
+                },
+            },
+        },
+        "top_3_traitors": {
+            "type": "array",
+            "minItems": 3,
+            "maxItems": 3,
+            "items": {
+                "type": "object",
+                "required": ["piece", "square", "reason"],
+                "properties": {
+                    "piece": {"type": "string"},
+                    "square": {"type": "string"},
+                    "reason": {"type": "string"},
+                },
+            },
+        },
+        "coach_lines": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 3,
+            "items": {"type": "string"},
+        },
+    },
+}
+
+
 def _extract_json_object(raw_text: str) -> str:
     trimmed = raw_text.strip()
     if trimmed.startswith("```"):
@@ -413,6 +460,82 @@ def parse_gemini_coach_response(raw_text: str) -> GeminiCoachResponse:
     return response
 
 
+def validate_gemini_coach_configuration() -> None:
+    api_key = (os.getenv("GEMINI_API_KEY") or "").strip()
+    if not api_key:
+        raise GeminiLiveConfigurationError("GEMINI_API_KEY is not configured on the backend.")
+
+    if not GEMINI_COACH_MODEL.strip():
+        raise GeminiLiveConfigurationError("GEMINI_COACH_MODEL is empty.")
+
+
+async def fetch_gemini_coach_commentary(payload: GeminiCoachRequest) -> GeminiCoachResponse:
+    validate_gemini_coach_configuration()
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_COACH_MODEL}:generateContent"
+    request_payload = {
+        "systemInstruction": {
+            "parts": [{"text": GEMINI_COACH_SYSTEM_PROMPT}],
+        },
+        "contents": [
+            {
+                "role": "user",
+                "parts": [
+                    {
+                        "text": (
+                            f"{build_gemini_coach_query()} "
+                            f"Current FEN: {payload.fen}. "
+                            "Return only one JSON object."
+                        )
+                    }
+                ],
+            }
+        ],
+        "generationConfig": {
+            "temperature": env_float("GEMINI_COACH_TEMPERATURE", 0.3),
+            "topP": env_float("GEMINI_COACH_TOP_P", 0.9),
+            "topK": env_int("GEMINI_COACH_TOP_K", 32),
+            "maxOutputTokens": env_int("GEMINI_COACH_MAX_OUTPUT_TOKENS", 480),
+            "responseMimeType": "application/json",
+            "responseJsonSchema": GEMINI_COACH_RESPONSE_SCHEMA,
+        },
+    }
+
+    async with httpx.AsyncClient(timeout=GEMINI_COACH_TIMEOUT_SECONDS) as client:
+        response = await client.post(
+            url,
+            headers={
+                "Content-Type": "application/json",
+                "x-goog-api-key": os.getenv("GEMINI_API_KEY", "").strip(),
+            },
+            json=request_payload,
+        )
+
+    if response.status_code == 429:
+        raise GeminiLiveBusyError("Gemini coach request is rate limited. Try again in a moment.")
+
+    if response.status_code in {400, 401, 403}:
+        raise GeminiLiveConfigurationError(response.text)
+
+    if response.status_code >= 500:
+        raise GeminiLiveConnectionError(response.text)
+
+    response.raise_for_status()
+
+    body = response.json()
+    candidates = body.get("candidates") or []
+    if not candidates:
+        raise ValueError("Gemini coach response contained no candidates.")
+
+    parts = ((candidates[0].get("content") or {}).get("parts") or [])
+    text_parts = [part.get("text", "") for part in parts if isinstance(part, dict)]
+    raw_text = "".join(text_parts).strip()
+    if not raw_text:
+        raise ValueError("Gemini coach response contained no text.")
+
+    return parse_gemini_coach_response(raw_text)
+
+
 GEMINI_LIVE_CLIENT = GeminiLiveClient(
     api_key=os.getenv("GEMINI_API_KEY"),
     model=os.getenv("GEMINI_LIVE_MODEL", GeminiLiveClient.DEFAULT_MODEL),
@@ -427,19 +550,8 @@ GEMINI_LIVE_CLIENT = GeminiLiveClient(
     logger=logging.getLogger("archess.server.gemini_live"),
 )
 GEMINI_LIVE_TURN_TIMEOUT_SECONDS = env_float("GEMINI_LIVE_TURN_TIMEOUT_SECONDS", 12.0)
-GEMINI_COACH_LIVE_CLIENT = GeminiLiveClient(
-    api_key=os.getenv("GEMINI_API_KEY"),
-    model=os.getenv("GEMINI_LIVE_MODEL", GeminiLiveClient.DEFAULT_MODEL),
-    system_prompt=GEMINI_COACH_SYSTEM_PROMPT,
-    generation_config={
-        "temperature": env_float("GEMINI_COACH_TEMPERATURE", 0.6),
-        "top_p": env_float("GEMINI_COACH_TOP_P", 0.9),
-        "top_k": env_int("GEMINI_COACH_TOP_K", 32),
-        "max_output_tokens": env_int("GEMINI_COACH_MAX_OUTPUT_TOKENS", 320),
-    },
-    ws_url=os.getenv("GEMINI_LIVE_WS_URL") or None,
-    logger=logging.getLogger("archess.server.gemini_coach_live"),
-)
+GEMINI_COACH_MODEL = os.getenv("GEMINI_COACH_MODEL", "gemini-2.5-flash")
+GEMINI_COACH_TIMEOUT_SECONDS = env_float("GEMINI_COACH_TIMEOUT_SECONDS", 12.0)
 
 
 def utcnow() -> datetime:
@@ -1103,13 +1215,11 @@ def get_queue_match_moves(
 @app.on_event("startup")
 async def startup_gemini_live() -> None:
     GEMINI_LIVE_CLIENT.ensure_connection_background()
-    GEMINI_COACH_LIVE_CLIENT.ensure_connection_background()
 
 
 @app.on_event("shutdown")
 async def shutdown_gemini_live() -> None:
     await GEMINI_LIVE_CLIENT.disconnect()
-    await GEMINI_COACH_LIVE_CLIENT.disconnect()
 
 
 @app.get("/health/ping")
@@ -1129,7 +1239,6 @@ def health_ping() -> dict[str, Any]:
 @app.get("/v1/gemini/status", response_model=GeminiLiveStatusResponse)
 async def get_gemini_live_status() -> dict[str, Any]:
     GEMINI_LIVE_CLIENT.ensure_connection_background()
-    GEMINI_COACH_LIVE_CLIENT.ensure_connection_background()
     return GEMINI_LIVE_CLIENT.get_status()
 
 
@@ -1168,17 +1277,8 @@ async def create_gemini_hint(payload: GeminiHintRequest) -> dict[str, Any]:
 
 @app.post("/v1/gemini/commentary", response_model=GeminiCoachResponse)
 async def create_gemini_commentary(payload: GeminiCoachRequest) -> dict[str, Any]:
-    metadata = {
-        "current_fen": payload.fen,
-    }
-
     try:
-        raw_commentary = await GEMINI_COACH_LIVE_CLIENT.run_turn(
-            build_gemini_coach_query(),
-            metadata=metadata,
-            timeout_seconds=GEMINI_LIVE_TURN_TIMEOUT_SECONDS,
-        )
-        commentary = parse_gemini_coach_response(raw_commentary)
+        commentary = await fetch_gemini_coach_commentary(payload)
     except ValueError as exc:
         raise HTTPException(status_code=503, detail=f"Gemini coach returned invalid JSON: {exc}") from exc
     except GeminiLiveConfigurationError as exc:

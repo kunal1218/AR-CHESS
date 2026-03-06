@@ -419,34 +419,54 @@ def test_parse_gemini_coach_response_extracts_json_object() -> None:
 
 
 def test_create_gemini_commentary_returns_structured_json(monkeypatch) -> None:
-    async def fake_run_turn(prompt: str, *, metadata=None, timeout_seconds: float = 0.0) -> str:
-        assert "Analyze this FEN and return the top 3 workers" in prompt
-        assert metadata["current_fen"].startswith("rnbqkbnr")
-        _ = timeout_seconds
-        return """
-        {
-          "side_to_move": "white",
-          "top_3_workers": [
+    async def fake_fetch(payload):
+        assert payload.fen.startswith("rnbqkbnr")
+        return parse_gemini_coach_response(
+            """
             {
-              "piece": "White Knight",
-              "square": "f3",
-              "reason": "Controls e5 and g5."
+              "side_to_move": "white",
+              "top_3_workers": [
+                {
+                  "piece": "White Knight",
+                  "square": "f3",
+                  "reason": "Controls e5 and g5."
+                },
+                {
+                  "piece": "White Bishop",
+                  "square": "c4",
+                  "reason": "Leans on f7."
+                },
+                {
+                  "piece": "White Pawn",
+                  "square": "e4",
+                  "reason": "Claims central space."
+                }
+              ],
+              "top_3_traitors": [
+                {
+                  "piece": "White Rook",
+                  "square": "h1",
+                  "reason": "Still boxed in."
+                },
+                {
+                  "piece": "White Pawn",
+                  "square": "a2",
+                  "reason": "Not influencing the main fight."
+                },
+                {
+                  "piece": "White Pawn",
+                  "square": "h2",
+                  "reason": "Also quiet for now."
+                }
+              ],
+              "coach_lines": [
+                "Your knight on f3 is your hardest worker right now."
+              ]
             }
-          ],
-          "top_3_traitors": [
-            {
-              "piece": "White Rook",
-              "square": "h1",
-              "reason": "Still boxed in."
-            }
-          ],
-          "coach_lines": [
-            "Your knight on f3 is your hardest worker right now."
-          ]
-        }
-        """
+            """
+        )
 
-    monkeypatch.setattr("main.GEMINI_COACH_LIVE_CLIENT.run_turn", fake_run_turn)
+    monkeypatch.setattr("main.fetch_gemini_coach_commentary", fake_fetch)
 
     client = TestClient(app)
     response = client.post(
@@ -464,14 +484,34 @@ def test_create_gemini_commentary_returns_structured_json(monkeypatch) -> None:
                 "piece": "White Knight",
                 "square": "f3",
                 "reason": "Controls e5 and g5.",
-            }
+            },
+            {
+                "piece": "White Bishop",
+                "square": "c4",
+                "reason": "Leans on f7.",
+            },
+            {
+                "piece": "White Pawn",
+                "square": "e4",
+                "reason": "Claims central space.",
+            },
         ],
         "top_3_traitors": [
             {
                 "piece": "White Rook",
                 "square": "h1",
                 "reason": "Still boxed in.",
-            }
+            },
+            {
+                "piece": "White Pawn",
+                "square": "a2",
+                "reason": "Not influencing the main fight.",
+            },
+            {
+                "piece": "White Pawn",
+                "square": "h2",
+                "reason": "Also quiet for now.",
+            },
         ],
         "coach_lines": [
             "Your knight on f3 is your hardest worker right now."
