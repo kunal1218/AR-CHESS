@@ -7200,14 +7200,21 @@ private struct NativeARView: UIViewRepresentable {
 
     private func brilliantMarkerFrame(forPieceNamed pieceName: String) -> CGRect? {
       guard let arView,
-            let center = projectedPiecePoint(named: pieceName, verticalOffset: 0.082),
-            let shoulder = projectedPiecePoint(named: pieceName, verticalOffset: 0.046) else {
+            let head = projectedPiecePoint(named: pieceName, verticalOffset: 0.082),
+            let neck = projectedPiecePoint(named: pieceName, verticalOffset: 0.046) else {
         return nil
       }
 
-      let projectedHeight = abs(shoulder.y - center.y)
-      let size = max(56, min(160, projectedHeight * 3.6))
-      let origin = CGPoint(x: center.x - (size * 0.5), y: center.y - (size * 0.5))
+      // Keep the brilliant badge visually similar to a chess-app "!!" exponent:
+      // smaller than the piece and offset above-right of the crown while still
+      // tracking the piece's world position through projection.
+      let projectedHeadHeight = abs(neck.y - head.y)
+      let size = max(28, min(74, projectedHeadHeight * 1.85))
+      let exponentCenter = CGPoint(
+        x: head.x + max(size * 0.18, projectedHeadHeight * 0.55),
+        y: head.y - max(size * 0.22, projectedHeadHeight * 0.35)
+      )
+      let origin = CGPoint(x: exponentCenter.x - (size * 0.5), y: exponentCenter.y - (size * 0.5))
       let frame = CGRect(origin: origin, size: CGSize(width: size, height: size))
       return frame.intersects(arView.bounds) ? frame : nil
     }
