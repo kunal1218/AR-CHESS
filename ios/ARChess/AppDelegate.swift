@@ -1798,6 +1798,7 @@ private struct MoveEvaluationDelta {
 
 private enum GameReviewPhase: Equatable {
   case idle
+  case prompt
   case loading
   case active
 }
@@ -1826,6 +1827,7 @@ private final class GameReviewStore: ObservableObject {
   @Published private(set) var checkpointReloadVersion = 0
 
   private var recordedDrops: [GameReviewCheckpoint] = []
+  private var stagedCheckpoints: [GameReviewCheckpoint] = []
 
   var currentCheckpoint: GameReviewCheckpoint? {
     guard reviewCheckpoints.indices.contains(currentReviewIndex) else {
@@ -1839,8 +1841,16 @@ private final class GameReviewStore: ObservableObject {
     phase == .loading
   }
 
+  var isAwaitingEntryDecision: Bool {
+    phase == .prompt
+  }
+
   var isReviewMode: Bool {
     phase == .active
+  }
+
+  var stagedCheckpointCount: Int {
+    stagedCheckpoints.count
   }
 
   func recordNegativeDrop(_ checkpoint: GameReviewCheckpoint) {
@@ -1851,17 +1861,30 @@ private final class GameReviewStore: ObservableObject {
     recordedDrops.append(checkpoint)
   }
 
-  func prepareReviewSequence() async -> Bool {
+  func stageReviewPrompt() -> Bool {
+    guard phase == .idle else {
+      return false
+    }
+
+    let selected = selectedCheckpoints()
+    guard !selected.isEmpty else {
+      return false
+    }
+
+    stagedCheckpoints = selected
+    phase = .prompt
+    return true
+  }
+
+  func startStagedReviewSequence() async -> Bool {
+    guard phase == .prompt, !stagedCheckpoints.isEmpty else {
+      return false
+    }
+
     phase = .loading
     reviewCheckpoints = []
     currentReviewIndex = 0
     checkpointReloadVersion += 1
-
-    let selected = Array(
-      recordedDrops
-        .sorted(by: { $0.deltaW < $1.deltaW })
-        .prefix(Self.maximumCheckpointCount)
-    )
 
     try? await Task.sleep(nanoseconds: Self.loadingDelayNs)
 
@@ -1870,12 +1893,12 @@ private final class GameReviewStore: ObservableObject {
       return false
     }
 
-    guard !selected.isEmpty else {
+    guard !stagedCheckpoints.isEmpty else {
       resetSession()
       return false
     }
 
-    reviewCheckpoints = selected
+    reviewCheckpoints = stagedCheckpoints
     currentReviewIndex = 0
     checkpointReloadVersion += 1
     phase = .active
@@ -1912,6 +1935,15 @@ private final class GameReviewStore: ObservableObject {
     currentReviewIndex = 0
     checkpointReloadVersion = 0
     recordedDrops = []
+    stagedCheckpoints = []
+  }
+
+  private func selectedCheckpoints() -> [GameReviewCheckpoint] {
+    Array(
+      recordedDrops
+        .sorted(by: { $0.deltaW < $1.deltaW })
+        .prefix(Self.maximumCheckpointCount)
+    )
   }
 }
 
@@ -5838,7 +5870,9 @@ private struct NativeARExperienceView: View {
         }
       }
 
-      if gameReview.isLoading {
+      if gameReview.isAwaitingEntryDecision {
+        reviewDecisionOverlay
+      } else if gameReview.isLoading {
         reviewLoadingOverlay
       } else if gameReview.isReviewMode {
         reviewCheckpointOverlay
@@ -5919,6 +5953,50 @@ private struct NativeARExperienceView: View {
         Text("Preparing your biggest evaluation drops...")
           .font(.system(size: 15, weight: .semibold, design: .rounded))
           .foregroundStyle(Color.white.opacity(0.82))
+      }
+      .padding(.horizontal, 28)
+      .padding(.vertical, 30)
+      .background(
+        RoundedRectangle(cornerRadius: 30, style: .continuous)
+          .fill(Color(red: 0.07, green: 0.10, blue: 0.14).opacity(0.92))
+          .overlay(
+            RoundedRectangle(cornerRadius: 30, style: .continuous)
+              .stroke(Color.white.opacity(0.12), lineWidth: 1)
+          )
+      )
+      .padding(.horizontal, 24)
+    }
+  }
+
+  private var reviewDecisionOverlay: some View {
+    ZStack {
+      Color.black.opacity(0.72)
+        .ignoresSafeArea()
+
+      VStack(alignment: .leading, spacing: 16) {
+        Text("Game Review")
+          .font(.system(size: 34, weight: .heavy, design: .rounded))
+          .foregroundStyle(.white)
+
+        Text("Review your \(gameReview.stagedCheckpointCount) biggest evaluation drops, or leave the match now.")
+          .font(.system(size: 16, weight: .semibold, design: .rounded))
+          .foregroundStyle(Color.white.opacity(0.84))
+          .lineSpacing(3)
+
+        HStack(spacing: 12) {
+          NativeActionButton(title: "Leave", style: .outline) {
+            gameReview.resetSession()
+            returnHome()
+          }
+
+          NativeActionButton(title: "Game Review", style: .solid) {
+            Task {
+              if !(await gameReview.startStagedReviewSequence()) {
+                returnHome()
+              }
+            }
+          }
+        }
       }
       .padding(.horizontal, 28)
       .padding(.vertical, 30)
@@ -8023,10 +8101,7 @@ private struct NativeARView: UIViewRepresentable {
       reviewEngineTask = nil
       clearSelection()
 
-      let hasCheckpoints = await gameReview.prepareReviewSequence()
-      if hasCheckpoints {
-        syncReviewStateIfNeeded(force: true)
-      } else {
+      if !gameReview.stageReviewPrompt() {
         onReviewFinished()
       }
     }
