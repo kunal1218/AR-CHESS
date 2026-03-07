@@ -104,12 +104,15 @@ private enum PlayerMode: String, Hashable {
 }
 
 private enum PlayModeChoice: Hashable {
+  case course
   case passAndPlay
   case queueMatch
   case playVsStockfish
 
   var title: String {
     switch self {
+    case .course:
+      return "Course"
     case .passAndPlay:
       return "Pass & Play"
     case .queueMatch:
@@ -120,19 +123,56 @@ private enum PlayModeChoice: Hashable {
   }
 }
 
+private enum StockfishMatchLaunchKind: Hashable {
+  case standard
+  case devCheck
+}
+
 private struct StockfishMatchConfiguration: Hashable {
   let humanColor: ChessColor
+  let startingFEN: String?
+  let launchKind: StockfishMatchLaunchKind
 
   var engineColor: ChessColor {
     humanColor.opponent
   }
 
-  var coinTossSummary: String {
-    "Coin toss assigned you \(humanColor.displayName)."
+  var statusSummary: String {
+    switch launchKind {
+    case .standard:
+      return "Coin toss assigned you \(humanColor.displayName)."
+    case .devCheck:
+      return "devCheck loaded. You are \(humanColor.displayName) because that side is to move in the FEN."
+    }
+  }
+
+  var modeTitle: String {
+    switch launchKind {
+    case .standard:
+      return "Stockfish Match • You are \(humanColor.displayName)"
+    case .devCheck:
+      return "Stockfish devCheck • You are \(humanColor.displayName)"
+    }
+  }
+
+  var supportsPostGameReview: Bool {
+    launchKind == .standard
   }
 
   static func coinToss() -> StockfishMatchConfiguration {
-    StockfishMatchConfiguration(humanColor: Bool.random() ? .white : .black)
+    StockfishMatchConfiguration(
+      humanColor: Bool.random() ? .white : .black,
+      startingFEN: nil,
+      launchKind: .standard
+    )
+  }
+
+  static func devCheck(fen: String, humanColor: ChessColor) -> StockfishMatchConfiguration {
+    StockfishMatchConfiguration(
+      humanColor: humanColor,
+      startingFEN: fen,
+      launchKind: .devCheck
+    )
   }
 }
 
@@ -145,8 +185,10 @@ private enum ExperienceMode: Hashable {
     switch self {
     case .passAndPlay:
       return false
-    case .queueMatch, .playVsStockfish:
+    case .queueMatch:
       return true
+    case .playVsStockfish(let configuration):
+      return configuration.supportsPostGameReview
     }
   }
 
@@ -177,14 +219,81 @@ private enum ExperienceMode: Hashable {
       return false
     }
   }
+
+  var allowsRemoteMatchLogSync: Bool {
+    switch self {
+    case .passAndPlay:
+      return true
+    case .queueMatch:
+      return false
+    case .playVsStockfish(let configuration):
+      return configuration.launchKind == .standard
+    }
+  }
+
+  var matchLogStatusSummary: String? {
+    guard case .playVsStockfish(let configuration) = self,
+          configuration.launchKind == .devCheck else {
+      return nil
+    }
+
+    return "devCheck keeps moves local only because the game started from a custom FEN."
+  }
 }
 
 private enum NativeScreen {
   case modeSelection
+  case course
+  case stockfishSetup
   case landing
   case lobby(PlayerMode)
   case queueMatch
   case experience(ExperienceMode)
+}
+
+private struct CourseCatalogEntry: Identifiable, Hashable {
+  let id = UUID()
+  let title: String
+
+  static let pageSize = 81
+
+  static let mockCatalog: [CourseCatalogEntry] = {
+    let featuredTitles = [
+      "Learn the Italian Opening",
+      "Learn How to Use the Knight",
+      "Learn Basic Checkmates",
+      "Learn Fork Tactics",
+      "Learn Pins and Skewers",
+      "Learn Pawn Breaks",
+      "Learn King Safety",
+      "Learn Rook Endgames",
+      "Learn Queen Trades",
+      "Learn Time Management",
+      "Learn Deflection Tactics",
+      "Learn Discovered Attacks",
+      "Learn Passed Pawns",
+      "Learn Opposition",
+      "Learn Outposts",
+      "Learn Piece Activity",
+      "Learn the Sicilian Defense",
+      "Learn the French Defense",
+      "Learn the London System",
+      "Learn the Caro-Kann",
+    ]
+
+    let generatedTitles = (1...142).map { index in
+      CourseCatalogEntry(title: "Mock Course \(index)")
+    }
+
+    return featuredTitles.map(CourseCatalogEntry.init(title:)) + generatedTitles
+  }()
+
+  static var mockPages: [[CourseCatalogEntry]] {
+    stride(from: 0, to: mockCatalog.count, by: pageSize).map { start in
+      let end = min(start + pageSize, mockCatalog.count)
+      return Array(mockCatalog[start..<end])
+    }
+  }
 }
 
 private struct AppRuntimeConfig {
@@ -653,12 +762,33 @@ private final class MatchLogStore: ObservableObject {
   @Published private(set) var remoteGameID: String?
 
   private let apiBaseURL: URL?
+  private var remoteSyncEnabled = true
 
   init(apiBaseURL: URL? = AppRuntimeConfig.current.apiBaseURL) {
     self.apiBaseURL = apiBaseURL
   }
 
+  func configureRemoteSync(enabled: Bool, disabledReason: String? = nil) {
+    remoteSyncEnabled = enabled
+
+    guard enabled else {
+      remoteGameID = nil
+      syncStatus = disabledReason ?? "Moves are logging locally only."
+      return
+    }
+
+    if let remoteGameID {
+      syncStatus = "Connected to Railway game log \(remoteGameID.prefix(8))."
+    } else {
+      syncStatus = "Moves stay local until ARChessAPIBaseURL is set."
+    }
+  }
+
   func prepareRemoteGameIfNeeded() async {
+    guard remoteSyncEnabled else {
+      return
+    }
+
     guard remoteGameID == nil else {
       return
     }
@@ -681,6 +811,10 @@ private final class MatchLogStore: ObservableObject {
     let entry = Entry(ply: entries.count + 1, color: color, moveUCI: moveUCI)
     entries.append(entry)
 
+    guard remoteSyncEnabled else {
+      return
+    }
+
     Task {
       await persistEntry(withID: entry.id)
     }
@@ -689,10 +823,15 @@ private final class MatchLogStore: ObservableObject {
   func resetSession() {
     entries = []
     remoteGameID = nil
+    remoteSyncEnabled = true
     syncStatus = "Moves stay local until ARChessAPIBaseURL is set."
   }
 
   private func persistEntry(withID entryID: UUID) async {
+    guard remoteSyncEnabled else {
+      return
+    }
+
     guard let entryIndex = entries.firstIndex(where: { $0.id == entryID }) else {
       return
     }
@@ -1723,6 +1862,46 @@ private enum StockfishFENValidator {
     _ = halfmoveValue
     _ = fullmoveValue
     return StockfishValidatedFEN(fen: trimmed, sideToMove: sideToMove)
+  }
+}
+
+private enum StockfishDevCheckInputError: LocalizedError {
+  case empty
+  case tooManyFields
+
+  var errorDescription: String? {
+    switch self {
+    case .empty:
+      return "Paste a FEN before launching devCheck."
+    case .tooManyFields:
+      return "devCheck accepts between 1 and 6 FEN fields."
+    }
+  }
+}
+
+private enum StockfishDevCheckFENResolver {
+  static func resolve(_ input: String) throws -> StockfishValidatedFEN {
+    let fields = input
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+      .components(separatedBy: .whitespacesAndNewlines)
+      .filter { !$0.isEmpty }
+
+    guard !fields.isEmpty else {
+      throw StockfishDevCheckInputError.empty
+    }
+
+    guard fields.count <= 6 else {
+      throw StockfishDevCheckInputError.tooManyFields
+    }
+
+    // devCheck accepts shorthand FEN and fills the omitted trailing fields with
+    // standard defaults before reusing the normal validator.
+    var normalizedFields = ["", "w", "-", "-", "0", "1"]
+    for (index, field) in fields.enumerated() {
+      normalizedFields[index] = field
+    }
+
+    return try StockfishFENValidator.validate(normalizedFields.joined(separator: " "))
   }
 }
 
@@ -5192,15 +5371,36 @@ private struct ARChessRootView: View {
         ModeSelectionView { mode in
           withAnimation(.spring(response: 0.42, dampingFraction: 0.88)) {
             switch mode {
+            case .course:
+              screen = .course
             case .passAndPlay:
               screen = .landing
             case .queueMatch:
               screen = .queueMatch
             case .playVsStockfish:
-              screen = .experience(.playVsStockfish(.coinToss()))
+              screen = .stockfishSetup
             }
           }
         }
+      case .course:
+        CourseLibraryView {
+          withAnimation(.spring(response: 0.42, dampingFraction: 0.88)) {
+            screen = .modeSelection
+          }
+        }
+      case .stockfishSetup:
+        StockfishSetupView(
+          openExperience: { configuration in
+            withAnimation(.spring(response: 0.42, dampingFraction: 0.88)) {
+              screen = .experience(.playVsStockfish(configuration))
+            }
+          },
+          goBack: {
+            withAnimation(.spring(response: 0.42, dampingFraction: 0.88)) {
+              screen = .modeSelection
+            }
+          }
+        )
       case .landing:
         LandingView { mode in
           withAnimation(.spring(response: 0.42, dampingFraction: 0.88)) {
@@ -5257,7 +5457,7 @@ private struct ARChessRootView: View {
               }
             case .playVsStockfish:
               withAnimation(.spring(response: 0.42, dampingFraction: 0.88)) {
-                screen = .modeSelection
+                screen = .stockfishSetup
               }
             }
           },
@@ -5305,7 +5505,7 @@ private struct ModeSelectionView: View {
 
           WarChessTitle()
 
-          Text("Choose pass-and-play, a full game versus Stockfish, or a synced queue match.")
+          Text("Choose Course, pass-and-play, a full game versus Stockfish, or a synced queue match.")
             .font(.system(size: 18, weight: .medium, design: .rounded))
             .foregroundStyle(Color.white.opacity(0.82))
             .multilineTextAlignment(.center)
@@ -5313,6 +5513,10 @@ private struct ModeSelectionView: View {
         }
 
         VStack(spacing: 14) {
+          NativeActionButton(title: "Course", style: .solid) {
+            onSelect(.course)
+          }
+
           NativeActionButton(title: "Pass & Play", style: .solid) {
             onSelect(.passAndPlay)
           }
@@ -5327,7 +5531,7 @@ private struct ModeSelectionView: View {
         }
         .frame(maxWidth: 340)
 
-        Text("Post-game review runs after Queue Match and full Play vs Stockfish games only")
+        Text("Post-game review runs after Queue Match and full Play vs Stockfish games only. Course opens the mock lesson catalog.")
           .font(.system(size: 14, weight: .medium, design: .rounded))
           .foregroundStyle(Color.white.opacity(0.72))
           .multilineTextAlignment(.center)
@@ -5337,6 +5541,306 @@ private struct ModeSelectionView: View {
       }
       .padding(.horizontal, 24)
       .padding(.vertical, 30)
+    }
+  }
+}
+
+private struct CourseLibraryView: View {
+  let goBack: () -> Void
+  @State private var selectedPage = 0
+
+  private let pages = CourseCatalogEntry.mockPages
+
+  var body: some View {
+    ZStack {
+      ChessboardBackdrop()
+      LinearGradient(
+        colors: [
+          Color(red: 0.03, green: 0.05, blue: 0.08).opacity(0.26),
+          Color(red: 0.03, green: 0.05, blue: 0.08).opacity(0.78),
+          Color(red: 0.03, green: 0.05, blue: 0.08).opacity(0.96),
+        ],
+        startPoint: .top,
+        endPoint: .bottom
+      )
+      .ignoresSafeArea()
+
+      VStack(spacing: 18) {
+        VStack(alignment: .leading, spacing: 10) {
+          Text("Course")
+            .font(.system(size: 12, weight: .bold, design: .rounded))
+            .tracking(2.2)
+            .foregroundStyle(Color(red: 0.84, green: 0.78, blue: 0.66))
+
+          Text("Mock Course Library")
+            .font(.system(size: 32, weight: .heavy, design: .rounded))
+            .foregroundStyle(.white)
+
+          Text("Swipe between pages. Each page shows a 9 by 9 grid of mock courses.")
+            .font(.system(size: 15, weight: .medium, design: .rounded))
+            .foregroundStyle(Color.white.opacity(0.80))
+            .lineSpacing(3)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.top, 30)
+
+        TabView(selection: $selectedPage) {
+          ForEach(Array(pages.enumerated()), id: \.offset) { index, page in
+            CoursePageGrid(
+              courses: page,
+              pageIndex: index,
+              pageCount: pages.count
+            )
+            .tag(index)
+          }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .tabViewStyle(.page(indexDisplayMode: pages.count > 1 ? .automatic : .never))
+
+        NativeActionButton(title: "Back", style: .outline) {
+          goBack()
+        }
+        .padding(.bottom, 26)
+      }
+      .padding(.horizontal, 20)
+    }
+  }
+}
+
+private struct CoursePageGrid: View {
+  let courses: [CourseCatalogEntry]
+  let pageIndex: Int
+  let pageCount: Int
+
+  private let columnCount = 9
+  private let gridSpacing: CGFloat = 4
+
+  var body: some View {
+    GeometryReader { geometry in
+      let horizontalPadding: CGFloat = 18
+      let cellSide = max(
+        28,
+        floor((geometry.size.width - (horizontalPadding * 2) - (gridSpacing * CGFloat(columnCount - 1))) / CGFloat(columnCount))
+      )
+      let columns = Array(repeating: GridItem(.fixed(cellSide), spacing: gridSpacing), count: columnCount)
+
+      VStack(alignment: .leading, spacing: 12) {
+        HStack {
+          Text("Page \(pageIndex + 1) of \(pageCount)")
+            .font(.system(size: 12, weight: .bold, design: .rounded))
+            .foregroundStyle(Color(red: 0.95, green: 0.88, blue: 0.73))
+
+          Spacer(minLength: 12)
+
+          Text("\(courses.count) courses")
+            .font(.system(size: 12, weight: .semibold, design: .rounded))
+            .foregroundStyle(Color.white.opacity(0.68))
+        }
+
+        LazyVGrid(columns: columns, spacing: gridSpacing) {
+          ForEach(courses) { course in
+            CourseBoxView(course: course)
+              .frame(width: cellSide, height: cellSide)
+          }
+        }
+      }
+      .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+      .padding(.horizontal, horizontalPadding)
+      .padding(.vertical, 18)
+      .background(
+        RoundedRectangle(cornerRadius: 28, style: .continuous)
+          .fill(Color(red: 0.07, green: 0.10, blue: 0.14).opacity(0.90))
+          .overlay(
+            RoundedRectangle(cornerRadius: 28, style: .continuous)
+              .stroke(Color.white.opacity(0.12), lineWidth: 1)
+          )
+      )
+      .padding(.bottom, 16)
+    }
+  }
+}
+
+private struct CourseBoxView: View {
+  let course: CourseCatalogEntry
+
+  var body: some View {
+    RoundedRectangle(cornerRadius: 10, style: .continuous)
+      .fill(
+        LinearGradient(
+          colors: [
+            Color(red: 0.14, green: 0.20, blue: 0.28),
+            Color(red: 0.08, green: 0.11, blue: 0.16),
+          ],
+          startPoint: .topLeading,
+          endPoint: .bottomTrailing
+        )
+      )
+      .overlay(
+        RoundedRectangle(cornerRadius: 10, style: .continuous)
+          .stroke(Color.white.opacity(0.14), lineWidth: 1)
+      )
+      .overlay {
+        Text(course.title)
+          .font(.system(size: 7, weight: .bold, design: .rounded))
+          .foregroundStyle(.white)
+          .multilineTextAlignment(.center)
+          .lineLimit(4)
+          .minimumScaleFactor(0.58)
+          .padding(4)
+      }
+  }
+}
+
+private struct StockfishSetupView: View {
+  let openExperience: (StockfishMatchConfiguration) -> Void
+  let goBack: () -> Void
+
+  @State private var devCheckFEN = ""
+  @State private var devCheckError: String?
+
+  private let exampleFEN = "2r4k/p3q1pp/3p1p2/1R1Pp3/n3P3/5P2/P1rBQ1PP/5RK1 w"
+
+  var body: some View {
+    ZStack {
+      ChessboardBackdrop()
+      Color.black.opacity(0.60).ignoresSafeArea()
+
+      ScrollView(showsIndicators: false) {
+        VStack(spacing: 22) {
+          Spacer(minLength: 44)
+
+          VStack(alignment: .leading, spacing: 16) {
+            Text("Play vs Stockfish")
+              .font(.system(size: 12, weight: .bold, design: .rounded))
+              .tracking(2.0)
+              .foregroundStyle(Color(red: 0.84, green: 0.78, blue: 0.66))
+
+            Text("Stockfish Setup")
+              .font(.system(size: 34, weight: .heavy, design: .rounded))
+              .foregroundStyle(.white)
+
+            Text("Start a full match with a coin-tossed color, or use devCheck to jump into a custom FEN.")
+              .font(.system(size: 16, weight: .medium, design: .rounded))
+              .foregroundStyle(Color.white.opacity(0.82))
+              .lineSpacing(3)
+
+            VStack(alignment: .leading, spacing: 10) {
+              Text("Full match")
+                .font(.system(size: 18, weight: .bold, design: .rounded))
+                .foregroundStyle(.white)
+
+              Text("Coin toss assigns White or Black. Full matches keep normal post-game review.")
+                .font(.system(size: 14, weight: .medium, design: .rounded))
+                .foregroundStyle(Color.white.opacity(0.74))
+                .lineSpacing(2)
+
+              NativeActionButton(title: "Start Match", style: .solid) {
+                openExperience(.coinToss())
+              }
+            }
+
+            Rectangle()
+              .fill(Color.white.opacity(0.10))
+              .frame(height: 1)
+              .padding(.vertical, 4)
+
+            VStack(alignment: .leading, spacing: 10) {
+              Text("devCheck")
+                .font(.system(size: 18, weight: .bold, design: .rounded))
+                .foregroundStyle(.white)
+
+              Text("Paste a FEN. The side to move in that FEN becomes the human side for this session.")
+                .font(.system(size: 14, weight: .medium, design: .rounded))
+                .foregroundStyle(Color.white.opacity(0.74))
+                .lineSpacing(2)
+
+              ZStack(alignment: .topLeading) {
+                RoundedRectangle(cornerRadius: 22, style: .continuous)
+                  .fill(Color.white.opacity(0.06))
+                  .overlay(
+                    RoundedRectangle(cornerRadius: 22, style: .continuous)
+                      .stroke(Color.white.opacity(0.16), lineWidth: 1)
+                  )
+
+                if devCheckFEN.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                  Text(exampleFEN)
+                    .font(.system(size: 15, weight: .medium, design: .monospaced))
+                    .foregroundStyle(Color.white.opacity(0.34))
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 16)
+                }
+
+                if #available(iOS 16.0, *) {
+                  TextEditor(text: $devCheckFEN)
+                    .font(.system(size: 15, weight: .medium, design: .monospaced))
+                    .foregroundColor(.white)
+                    .scrollContentBackground(.hidden)
+                    .background(Color.clear)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled(true)
+                    .frame(minHeight: 120)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 10)
+                } else {
+                  TextEditor(text: $devCheckFEN)
+                    .font(.system(size: 15, weight: .medium, design: .monospaced))
+                    .foregroundColor(.white)
+                    .background(Color.clear)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled(true)
+                    .frame(minHeight: 120)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 10)
+                }
+              }
+              .frame(minHeight: 120)
+
+              Text("Shorthand is fine here. Missing FEN fields default to: side `w`, castling `-`, en passant `-`, halfmove `0`, fullmove `1`.")
+                .font(.system(size: 12, weight: .semibold, design: .rounded))
+                .foregroundStyle(Color(red: 0.95, green: 0.88, blue: 0.73).opacity(0.88))
+                .lineSpacing(2)
+
+              if let devCheckError {
+                Text(devCheckError)
+                  .font(.system(size: 13, weight: .semibold, design: .rounded))
+                  .foregroundStyle(Color(red: 0.95, green: 0.66, blue: 0.62))
+                  .lineSpacing(2)
+              }
+
+              NativeActionButton(title: "devCheck", style: .outline) {
+                launchDevCheck()
+              }
+            }
+
+            NativeActionButton(title: "Back", style: .outline) {
+              goBack()
+            }
+          }
+          .padding(24)
+          .background(
+            RoundedRectangle(cornerRadius: 30, style: .continuous)
+              .fill(Color(red: 0.07, green: 0.10, blue: 0.14).opacity(0.88))
+              .overlay(
+                RoundedRectangle(cornerRadius: 30, style: .continuous)
+                  .stroke(Color.white.opacity(0.12), lineWidth: 1)
+              )
+          )
+
+          Spacer(minLength: 44)
+        }
+        .padding(.horizontal, 24)
+        .padding(.vertical, 30)
+      }
+    }
+  }
+
+  private func launchDevCheck() {
+    do {
+      let validatedFEN = try StockfishDevCheckFENResolver.resolve(devCheckFEN)
+      devCheckError = nil
+      openExperience(.devCheck(fen: validatedFEN.fen, humanColor: validatedFEN.sideToMove))
+    } catch {
+      devCheckError = error.localizedDescription
     }
   }
 }
@@ -5880,7 +6384,15 @@ private struct NativeARExperienceView: View {
     }
     .task {
       if mode.usesLocalMatchLog {
-        await matchLog.prepareRemoteGameIfNeeded()
+        // Remote move logs assume a standard game start, so custom-FEN devCheck
+        // sessions keep their history on-device only.
+        matchLog.configureRemoteSync(
+          enabled: mode.allowsRemoteMatchLogSync,
+          disabledReason: mode.matchLogStatusSummary
+        )
+        if mode.allowsRemoteMatchLogSync {
+          await matchLog.prepareRemoteGameIfNeeded()
+        }
       } else {
         await queueMatch.activateMatchSync()
       }
@@ -6317,7 +6829,7 @@ private struct NativeARExperienceView: View {
     case .queueMatch:
       return "Queue Match"
     case .playVsStockfish(let configuration):
-      return "Stockfish Match • You are \(configuration.humanColor.displayName)"
+      return configuration.modeTitle
     }
   }
 
@@ -7508,6 +8020,12 @@ private struct NativeARView: UIViewRepresentable {
       self.commentary = commentary
       self.gameReview = gameReview
       self.onReviewFinished = onReviewFinished
+
+      if case .playVsStockfish(let configuration) = mode,
+         let startingFEN = configuration.startingFEN,
+         let restoredState = try? ChessGameState(fen: startingFEN) {
+        self.gameState = restoredState
+      }
     }
 
     deinit {
@@ -7532,7 +8050,7 @@ private struct NativeARView: UIViewRepresentable {
       }
       noteWarmupStatus("Waiting for board placement before warming Stockfish...")
       if case .playVsStockfish(let configuration) = mode {
-        commentary.noteExternalStatus(configuration.coinTossSummary)
+        commentary.noteExternalStatus(configuration.statusSummary)
       }
 
       let tapRecognizer = UITapGestureRecognizer(target: self, action: #selector(handleTap(_:)))
