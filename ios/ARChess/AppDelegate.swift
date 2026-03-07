@@ -2266,6 +2266,7 @@ private final class GameReviewStore: ObservableObject {
 private struct OpeningLessonStep: Identifiable, Equatable, Hashable {
   let id: String
   let startingFEN: String
+  let sideToMove: ChessColor
   let correctMoveUCI: String
   let prompt: String
   let focus: String
@@ -2284,6 +2285,7 @@ private struct OpeningLessonDefinition: Equatable, Hashable {
   let id: String
   let title: String
   let summary: String
+  let studentColor: ChessColor
   let steps: [OpeningLessonStep]
 
   static let italianOpening = buildItalianOpening()
@@ -2310,6 +2312,7 @@ private struct OpeningLessonDefinition: Equatable, Hashable {
         OpeningLessonStep(
           id: "italian-opening-step-\(index)",
           startingFEN: state.fenString,
+          sideToMove: state.turn,
           correctMoveUCI: move.uciString,
           prompt: item.prompt,
           focus: item.focus
@@ -2321,7 +2324,8 @@ private struct OpeningLessonDefinition: Equatable, Hashable {
     return OpeningLessonDefinition(
       id: "learn-the-italian-opening",
       title: "Learn the Italian Opening",
-      summary: "Predict the core Italian Opening moves for both sides, one step at a time.",
+      summary: "Play the White side of the Italian Opening while Black replies automatically.",
+      studentColor: .white,
       steps: steps
     )
   }
@@ -2363,6 +2367,43 @@ private final class OpeningLessonStore: ObservableObject {
 
   var isComplete: Bool {
     phase == .complete
+  }
+
+  var isAwaitingPlayerMove: Bool {
+    guard let activeLesson else {
+      return false
+    }
+
+    return phase == .active && currentStep?.sideToMove == activeLesson.studentColor
+  }
+
+  var isAutoPlayingOpponentMove: Bool {
+    guard let activeLesson else {
+      return false
+    }
+
+    return phase == .active && currentStep?.sideToMove == activeLesson.studentColor.opponent
+  }
+
+  var currentPlayableStepNumber: Int {
+    guard let activeLesson, !activeLesson.steps.isEmpty else {
+      return 0
+    }
+
+    let cappedIndex = min(currentStepIndex, activeLesson.steps.count - 1)
+    let completed = activeLesson.steps[...cappedIndex].filter { $0.sideToMove == activeLesson.studentColor }.count
+    if completed == 0 {
+      return 1
+    }
+    return min(completed, totalPlayableStepCount)
+  }
+
+  var totalPlayableStepCount: Int {
+    guard let activeLesson else {
+      return 0
+    }
+
+    return activeLesson.steps.filter { $0.sideToMove == activeLesson.studentColor }.count
   }
 
   func configure(for mode: ExperienceMode) {
@@ -7123,7 +7164,7 @@ private struct NativeARExperienceView: View {
           )
           .padding(.horizontal, 24)
         }
-      } else if let lesson = lessonStore.activeLesson, let step = lessonStore.currentStep {
+      } else if let lesson = lessonStore.activeLesson, let step = lessonStore.currentStep, lessonStore.isAwaitingPlayerMove {
         VStack(spacing: 14) {
           HStack(alignment: .top, spacing: 16) {
             VStack(alignment: .leading, spacing: 8) {
@@ -7136,13 +7177,18 @@ private struct NativeARExperienceView: View {
                 .font(.system(size: 25, weight: .heavy, design: .rounded))
                 .foregroundStyle(.white)
 
-              Text("Step \(lessonStore.currentStepIndex + 1) of \(lesson.steps.count)")
+              Text("Step \(lessonStore.currentPlayableStepNumber) of \(lessonStore.totalPlayableStepCount)")
                 .font(.system(size: 14, weight: .semibold, design: .rounded))
                 .foregroundStyle(Color.white.opacity(0.88))
 
               Text("Remaining tries: \(lessonStore.remainingTries)")
                 .font(.system(size: 13, weight: .bold, design: .rounded))
                 .foregroundStyle(Color(red: 0.95, green: 0.88, blue: 0.73))
+
+              Text("You play \(lesson.studentColor.displayName). \(lesson.studentColor.opponent.displayName) replies automatically.")
+                .font(.system(size: 12, weight: .semibold, design: .rounded))
+                .foregroundStyle(Color.white.opacity(0.76))
+                .lineSpacing(2)
 
               Text(step.prompt)
                 .font(.system(size: 14, weight: .semibold, design: .rounded))
@@ -7221,6 +7267,33 @@ private struct NativeARExperienceView: View {
             )
           }
         }
+        .padding(.horizontal, 18)
+        .padding(.top, 78)
+      } else if let lesson = lessonStore.activeLesson, lessonStore.isAutoPlayingOpponentMove {
+        VStack(alignment: .leading, spacing: 10) {
+          Text(lesson.title)
+            .font(.system(size: 18, weight: .heavy, design: .rounded))
+            .foregroundStyle(.white)
+
+          Text("\(lesson.studentColor.opponent.displayName) replies automatically in this lesson.")
+            .font(.system(size: 14, weight: .semibold, design: .rounded))
+            .foregroundStyle(Color.white.opacity(0.84))
+
+          Text("Watch the move play out, then make your next prediction.")
+            .font(.system(size: 13, weight: .medium, design: .rounded))
+            .foregroundStyle(Color.white.opacity(0.74))
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 18)
+        .padding(.vertical, 16)
+        .background(
+          RoundedRectangle(cornerRadius: 20, style: .continuous)
+            .fill(Color(red: 0.07, green: 0.10, blue: 0.14).opacity(0.88))
+            .overlay(
+              RoundedRectangle(cornerRadius: 20, style: .continuous)
+                .stroke(Color.white.opacity(0.12), lineWidth: 1)
+            )
+        )
         .padding(.horizontal, 18)
         .padding(.top, 78)
       }
@@ -8848,6 +8921,7 @@ private struct NativeARView: UIViewRepresentable {
     func syncRuntimeState(queueAssignedColor: ChessColor?) {
       self.queueAssignedColor = queueAssignedColor
       syncLessonStateIfNeeded()
+      syncLessonAutoplayIfNeeded()
       syncReviewStateIfNeeded()
       syncAutomatedOpponentTurnIfNeeded()
     }
@@ -9183,6 +9257,7 @@ private struct NativeARView: UIViewRepresentable {
     private func applyLessonMove(_ move: ChessMove) {
       guard case .lesson(let lesson) = mode,
             lessonStore.isActive,
+            lessonStore.isAwaitingPlayerMove,
             let step = lessonStore.currentStep,
             let correctMove = expectedLessonMove(for: step, in: gameState) else {
         clearSelection()
@@ -9244,6 +9319,7 @@ private struct NativeARView: UIViewRepresentable {
             } else if let nextStep = self.lessonStore.currentStep {
               self.commentary.noteExternalStatus(nextStep.focus)
             }
+            self.syncLessonAutoplayIfNeeded()
           }
         )
       )
@@ -9269,6 +9345,65 @@ private struct NativeARView: UIViewRepresentable {
       }
 
       requestLiveEngineMove(for: gameState, configuration: configuration)
+    }
+
+    private func syncLessonAutoplayIfNeeded() {
+      guard case .lesson(let lesson) = mode,
+            lessonStore.isAutoPlayingOpponentMove,
+            boardAnchor != nil,
+            pendingAnimatedMoves.isEmpty,
+            liveEngineTask == nil,
+            let step = lessonStore.currentStep,
+            gameState.fenString == step.startingFEN,
+            expectedLessonMove(for: step, in: gameState) != nil else {
+        return
+      }
+
+      let requestedFEN = gameState.fenString
+      liveEngineTask?.cancel()
+      liveEngineTask = Task { @MainActor [weak self] in
+        guard let self else {
+          return
+        }
+        defer {
+          self.liveEngineTask = nil
+        }
+
+        try? await Task.sleep(nanoseconds: 350_000_000)
+
+        guard case .lesson(let confirmedLesson) = self.mode,
+              confirmedLesson == lesson,
+              self.lessonStore.isAutoPlayingOpponentMove,
+              self.gameState.fenString == requestedFEN,
+              self.pendingAnimatedMoves.isEmpty,
+              let confirmedStep = self.lessonStore.currentStep,
+              confirmedStep == step,
+              let confirmedMove = self.expectedLessonMove(for: confirmedStep, in: self.gameState) else {
+          return
+        }
+
+        let beforeState = self.gameState
+        let afterState = beforeState.applying(confirmedMove)
+        self.enqueueMoveAnimation(
+          AnimatedMoveContext(
+            move: confirmedMove,
+            beforeState: beforeState,
+            afterState: afterState,
+            postApply: { [weak self] in
+              guard let self else {
+                return
+              }
+
+              if self.lessonStore.advanceAfterCorrectMove() != nil {
+                self.commentary.noteExternalStatus("\(lesson.title) complete.")
+              } else if let nextStep = self.lessonStore.currentStep {
+                self.commentary.noteExternalStatus(nextStep.focus)
+              }
+              self.syncLessonAutoplayIfNeeded()
+            }
+          )
+        )
+      }
     }
 
     private func requestLiveEngineMove(
@@ -10061,7 +10196,13 @@ private struct NativeARView: UIViewRepresentable {
 
       switch mode {
       case .lesson:
-        return true
+        guard let lesson = lessonStore.activeLesson,
+              lessonStore.isAwaitingPlayerMove,
+              lesson.studentColor == gameState.turn else {
+          clearSelection()
+          return false
+        }
+        return piece.color == lesson.studentColor
       case .passAndPlay(_):
         return true
       case .queueMatch:
@@ -10434,6 +10575,7 @@ private struct NativeARView: UIViewRepresentable {
 
       trackedPlaneID = selectedPlane.identifier
       maybeScheduleInitialAnalysis()
+      syncLessonAutoplayIfNeeded()
       syncAutomatedOpponentTurnIfNeeded()
     }
 
