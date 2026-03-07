@@ -157,6 +157,43 @@ class GeminiHintResponse(BaseModel):
     hint: str
 
 
+class GeminiLessonFeedbackRequest(BaseModel):
+    fen: str = Field(..., min_length=1, max_length=256)
+    lesson_title: str = Field(..., min_length=1, max_length=160)
+    attempted_move: str
+    correct_move: str
+    side_to_move: str
+    focus: str = Field(..., min_length=1, max_length=280)
+
+    @field_validator("fen", "lesson_title", "focus")
+    @classmethod
+    def validate_text_field(cls, value: str) -> str:
+        normalized = re.sub(r"\s+", " ", value).strip()
+        if not normalized:
+            raise ValueError("text fields must not be empty.")
+        return normalized
+
+    @field_validator("attempted_move", "correct_move")
+    @classmethod
+    def validate_lesson_move(cls, value: str) -> str:
+        move = value.strip().lower()
+        if not UCI_MOVE_PATTERN.match(move):
+            raise ValueError("lesson moves must use UCI notation such as e2e4.")
+        return move
+
+    @field_validator("side_to_move")
+    @classmethod
+    def validate_lesson_side_to_move(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"white", "black"}:
+            raise ValueError("side_to_move must be 'white' or 'black'.")
+        return normalized
+
+
+class GeminiLessonFeedbackResponse(BaseModel):
+    explanation: str
+
+
 class GeminiLiveStatusResponse(BaseModel):
     state: str
     lastError: str | None
@@ -364,6 +401,26 @@ def sanitize_hint_text(raw_text: str, fallback: str) -> str:
     return condensed or fallback
 
 
+def gemini_fallback_lesson_feedback(payload: GeminiLessonFeedbackRequest) -> str:
+    return (
+        "That move is playable, but it is not the lesson move here. "
+        "Look for a move that better supports development, center control, or pressure in the Italian Opening. "
+        f"{payload.focus}"
+    )
+
+
+def sanitize_lesson_feedback_text(raw_text: str, fallback: str) -> str:
+    condensed = re.sub(r"\s+", " ", raw_text).strip()
+    if not condensed:
+        return fallback
+
+    if len(condensed) > 280:
+        shortened = condensed[:277].rsplit(" ", 1)[0].strip()
+        return f"{shortened}..." if shortened else fallback
+
+    return condensed
+
+
 def build_gemini_user_query(payload: GeminiHintRequest) -> str:
     piece_name = payload.moving_piece or "piece"
     capture_text = "yes" if payload.is_capture else "no"
@@ -378,6 +435,22 @@ def build_gemini_user_query(payload: GeminiHintRequest) -> str:
         f"Is capture: {capture_text}. "
         f"Gives check: {check_text}. "
         f"Themes: {themes}."
+    )
+
+
+def build_gemini_lesson_feedback_query(payload: GeminiLessonFeedbackRequest) -> str:
+    return (
+        "You are teaching a beginner-friendly chess opening lesson. "
+        "Explain briefly why the student's attempted move is not the best continuation in this position. "
+        "Keep it short, helpful, and instructional. "
+        "Focus on opening ideas like development, center control, king safety, piece activity, and Italian Opening goals. "
+        "Do not give a long engine line or a harsh critique. "
+        "Use at most two short sentences. "
+        f"Lesson title: {payload.lesson_title}. "
+        f"Side to move: {payload.side_to_move}. "
+        f"Student attempted: {payload.attempted_move}. "
+        f"Correct lesson move: {payload.correct_move}. "
+        f"Teaching focus: {payload.focus}."
     )
 
 
@@ -1363,6 +1436,40 @@ async def create_gemini_hint(payload: GeminiHintRequest) -> dict[str, Any]:
 
     return {
         "hint": sanitize_hint_text(raw_hint, fallback),
+    }
+
+
+@app.post("/v1/gemini/lesson-feedback", response_model=GeminiLessonFeedbackResponse)
+async def create_gemini_lesson_feedback(payload: GeminiLessonFeedbackRequest) -> dict[str, Any]:
+    fallback = gemini_fallback_lesson_feedback(payload)
+    query = build_gemini_lesson_feedback_query(payload)
+    metadata = {
+        "current_fen": payload.fen,
+        "lesson_title": payload.lesson_title,
+        "attempted_move": payload.attempted_move,
+        "correct_move": payload.correct_move,
+        "side_to_move": payload.side_to_move,
+        "focus": payload.focus,
+    }
+
+    try:
+        raw_explanation = await GEMINI_LIVE_CLIENT.run_turn(
+            query,
+            metadata=metadata,
+            timeout_seconds=GEMINI_LIVE_TURN_TIMEOUT_SECONDS,
+        )
+    except GeminiLiveConfigurationError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except GeminiLiveBusyError as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
+    except GeminiLiveConnectionError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:  # pragma: no cover - integration guarded
+        logger.exception("Gemini Live lesson feedback request failed unexpectedly")
+        raise HTTPException(status_code=503, detail=f"Gemini lesson feedback failed: {exc}") from exc
+
+    return {
+        "explanation": sanitize_lesson_feedback_text(raw_explanation, fallback),
     }
 
 

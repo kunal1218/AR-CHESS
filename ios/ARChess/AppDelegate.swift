@@ -177,12 +177,15 @@ private struct StockfishMatchConfiguration: Hashable {
 }
 
 private enum ExperienceMode: Hashable {
+  case lesson(OpeningLessonDefinition)
   case passAndPlay(PlayerMode)
   case queueMatch
   case playVsStockfish(StockfishMatchConfiguration)
 
   var supportsPostGameReview: Bool {
     switch self {
+    case .lesson:
+      return false
     case .passAndPlay:
       return false
     case .queueMatch:
@@ -194,6 +197,8 @@ private enum ExperienceMode: Hashable {
 
   func humanPlayerColor(queueAssignedColor: ChessColor?) -> ChessColor? {
     switch self {
+    case .lesson:
+      return nil
     case .passAndPlay:
       return nil
     case .queueMatch:
@@ -213,6 +218,8 @@ private enum ExperienceMode: Hashable {
 
   var usesLocalMatchLog: Bool {
     switch self {
+    case .lesson:
+      return false
     case .passAndPlay, .playVsStockfish:
       return true
     case .queueMatch:
@@ -222,6 +229,8 @@ private enum ExperienceMode: Hashable {
 
   var allowsRemoteMatchLogSync: Bool {
     switch self {
+    case .lesson:
+      return false
     case .passAndPlay:
       return true
     case .queueMatch:
@@ -239,6 +248,22 @@ private enum ExperienceMode: Hashable {
 
     return "devCheck keeps moves local only because the game started from a custom FEN."
   }
+
+  var isLessonMode: Bool {
+    if case .lesson = self {
+      return true
+    }
+    return false
+  }
+
+  var warmsStockfishAnalysis: Bool {
+    switch self {
+    case .lesson:
+      return false
+    case .passAndPlay, .queueMatch, .playVsStockfish:
+      return true
+    }
+  }
 }
 
 private enum NativeScreen {
@@ -251,41 +276,58 @@ private enum NativeScreen {
   case experience(ExperienceMode)
 }
 
+private enum CourseCatalogKind: Hashable {
+  case italianOpening
+  case mock
+}
+
 private struct CourseCatalogEntry: Identifiable, Hashable {
-  let id = UUID()
+  let id: String
   let title: String
+  let kind: CourseCatalogKind
+
+  var lessonID: String? {
+    switch kind {
+    case .italianOpening:
+      return OpeningLessonDefinition.italianOpening.id
+    case .mock:
+      return nil
+    }
+  }
 
   static let pageSize = 81
 
   static let mockCatalog: [CourseCatalogEntry] = {
-    let featuredTitles = [
-      "Learn the Italian Opening",
-      "Learn How to Use the Knight",
-      "Learn Basic Checkmates",
-      "Learn Fork Tactics",
-      "Learn Pins and Skewers",
-      "Learn Pawn Breaks",
-      "Learn King Safety",
-      "Learn Rook Endgames",
-      "Learn Queen Trades",
-      "Learn Time Management",
-      "Learn Deflection Tactics",
-      "Learn Discovered Attacks",
-      "Learn Passed Pawns",
-      "Learn Opposition",
-      "Learn Outposts",
-      "Learn Piece Activity",
-      "Learn the Sicilian Defense",
-      "Learn the French Defense",
-      "Learn the London System",
-      "Learn the Caro-Kann",
+    let featuredTitles: [(String, CourseCatalogKind)] = [
+      ("Learn the Italian Opening", .italianOpening),
+      ("Learn How to Use the Knight", .mock),
+      ("Learn Basic Checkmates", .mock),
+      ("Learn Fork Tactics", .mock),
+      ("Learn Pins and Skewers", .mock),
+      ("Learn Pawn Breaks", .mock),
+      ("Learn King Safety", .mock),
+      ("Learn Rook Endgames", .mock),
+      ("Learn Queen Trades", .mock),
+      ("Learn Time Management", .mock),
+      ("Learn Deflection Tactics", .mock),
+      ("Learn Discovered Attacks", .mock),
+      ("Learn Passed Pawns", .mock),
+      ("Learn Opposition", .mock),
+      ("Learn Outposts", .mock),
+      ("Learn Piece Activity", .mock),
+      ("Learn the Sicilian Defense", .mock),
+      ("Learn the French Defense", .mock),
+      ("Learn the London System", .mock),
+      ("Learn the Caro-Kann", .mock),
     ]
 
     let generatedTitles = (1...142).map { index in
-      CourseCatalogEntry(title: "Mock Course \(index)")
+      CourseCatalogEntry(id: "mock-course-\(index)", title: "Mock Course \(index)", kind: .mock)
     }
 
-    return featuredTitles.map(CourseCatalogEntry.init(title:)) + generatedTitles
+    return featuredTitles.enumerated().map { offset, item in
+      CourseCatalogEntry(id: "featured-course-\(offset)", title: item.0, kind: item.1)
+    } + generatedTitles
   }()
 
   static var mockPages: [[CourseCatalogEntry]] {
@@ -341,6 +383,19 @@ private struct GeminiHintResponsePayload: Decodable {
   let hint: String
 }
 
+private struct GeminiLessonFeedbackRequestPayload: Encodable {
+  let fen: String
+  let lesson_title: String
+  let attempted_move: String
+  let correct_move: String
+  let side_to_move: String
+  let focus: String
+}
+
+private struct GeminiLessonFeedbackResponsePayload: Decodable {
+  let explanation: String
+}
+
 private struct GeminiCoachCommentaryRequestPayload: Encodable {
   let fen: String
 }
@@ -391,6 +446,15 @@ private struct GeminiHintContext {
 
 private struct GeminiCoachCommentaryContext: Equatable {
   let fen: String
+}
+
+private struct GeminiLessonFeedbackContext {
+  let fen: String
+  let lessonTitle: String
+  let attemptedMove: String
+  let correctMove: String
+  let sideToMove: ChessColor
+  let focus: String
 }
 
 private final class GeminiHintService {
@@ -476,6 +540,71 @@ private final class GeminiHintService {
 
     let sanitized = sanitize(rawText, fallback: fallbackHint(for: context))
     Self.logger.info("Gemini hint ready via backend duration_ms=\(durationMs, privacy: .public)")
+    return sanitized
+  }
+
+  func fetchLessonFeedback(for context: GeminiLessonFeedbackContext) async throws -> String {
+    guard let baseURL = apiBaseURL else {
+      throw NSError(
+        domain: "ARChess.GeminiHint",
+        code: -1010,
+        userInfo: [NSLocalizedDescriptionKey: "Gemini lesson feedback is disabled until ARChessAPIBaseURL is configured."]
+      )
+    }
+
+    var request = URLRequest(
+      url: baseURL
+        .appendingPathComponent("v1")
+        .appendingPathComponent("gemini")
+        .appendingPathComponent("lesson-feedback")
+    )
+    request.httpMethod = "POST"
+    request.timeoutInterval = 8.0
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.setValue("application/json", forHTTPHeaderField: "Accept")
+    request.httpBody = try JSONEncoder().encode(
+      GeminiLessonFeedbackRequestPayload(
+        fen: context.fen,
+        lesson_title: context.lessonTitle,
+        attempted_move: context.attemptedMove,
+        correct_move: context.correctMove,
+        side_to_move: context.sideToMove.displayName.lowercased(),
+        focus: context.focus
+      )
+    )
+
+    let startedAt = Date()
+    let (data, response) = try await session.data(for: request)
+    let durationMs = Int(Date().timeIntervalSince(startedAt) * 1_000)
+    guard let httpResponse = response as? HTTPURLResponse else {
+      throw NSError(
+        domain: "ARChess.GeminiHint",
+        code: -1011,
+        userInfo: [NSLocalizedDescriptionKey: "Gemini lesson feedback did not return an HTTP response."]
+      )
+    }
+
+    guard (200..<300).contains(httpResponse.statusCode) else {
+      let message = String(data: data, encoding: .utf8) ?? "Unexpected Gemini lesson feedback response."
+      Self.logger.error("Gemini lesson feedback request failed status=\(httpResponse.statusCode, privacy: .public) duration_ms=\(durationMs, privacy: .public)")
+      throw NSError(
+        domain: "ARChess.GeminiHint",
+        code: httpResponse.statusCode,
+        userInfo: [NSLocalizedDescriptionKey: message]
+      )
+    }
+
+    let payload = try JSONDecoder().decode(GeminiLessonFeedbackResponsePayload.self, from: data)
+    let sanitized = sanitizeLessonFeedback(payload.explanation)
+    guard !sanitized.isEmpty else {
+      throw NSError(
+        domain: "ARChess.GeminiHint",
+        code: -1012,
+        userInfo: [NSLocalizedDescriptionKey: "Gemini lesson feedback returned no explanation text."]
+      )
+    }
+
+    Self.logger.info("Gemini lesson feedback ready via backend duration_ms=\(durationMs, privacy: .public)")
     return sanitized
   }
 
@@ -584,6 +713,14 @@ private final class GeminiHintService {
     )
     let final = condensed.trimmingCharacters(in: .whitespacesAndNewlines)
     return final.isEmpty ? fallback : final
+  }
+
+  private func sanitizeLessonFeedback(_ raw: String) -> String {
+    let condensed = raw
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+      .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+
+    return condensed
   }
 
   private func fallbackHint(for context: GeminiHintContext) -> String {
@@ -2123,6 +2260,223 @@ private final class GameReviewStore: ObservableObject {
         .sorted(by: { $0.deltaW < $1.deltaW })
         .prefix(Self.maximumCheckpointCount)
     )
+  }
+}
+
+private struct OpeningLessonStep: Identifiable, Equatable, Hashable {
+  let id: String
+  let startingFEN: String
+  let correctMoveUCI: String
+  let prompt: String
+  let focus: String
+
+  var destinationSquare: BoardSquare? {
+    let trimmed = correctMoveUCI.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    guard trimmed.count >= 4 else {
+      return nil
+    }
+
+    return BoardSquare(algebraic: String(trimmed.dropFirst(2).prefix(2)))
+  }
+}
+
+private struct OpeningLessonDefinition: Equatable, Hashable {
+  let id: String
+  let title: String
+  let summary: String
+  let steps: [OpeningLessonStep]
+
+  static let italianOpening = buildItalianOpening()
+
+  private static func buildItalianOpening() -> OpeningLessonDefinition {
+    let sequence: [(uci: String, prompt: String, focus: String)] = [
+      ("e2e4", "White starts by claiming the center. What is the first Italian Opening move?", "Open with a central pawn so your bishop and queen can breathe."),
+      ("e7e5", "Black answers in the center. Find the matching reply.", "Mirror the central space grab and keep the position classical."),
+      ("g1f3", "Now continue with White. Which move develops while attacking e5?", "Develop a knight, hit the center, and prepare to castle."),
+      ("b8c6", "Black should support the center and develop. What fits?", "Develop a knight toward the center instead of wasting time."),
+      ("f1c4", "White now enters the Italian structure. What move defines it?", "Develop the bishop to the active c4 diagonal and eye f7."),
+      ("f8c5", "Finish the core setup for Black. What is the thematic bishop move?", "Meet bishop with bishop so both sides finish quick development.")
+    ]
+
+    var state = ChessGameState.initial()
+    var steps: [OpeningLessonStep] = []
+
+    for (index, item) in sequence.enumerated() {
+      guard let move = state.move(forUCI: item.uci) else {
+        preconditionFailure("Italian Opening lesson sequence contains an illegal move: \(item.uci)")
+      }
+
+      steps.append(
+        OpeningLessonStep(
+          id: "italian-opening-step-\(index)",
+          startingFEN: state.fenString,
+          correctMoveUCI: move.uciString,
+          prompt: item.prompt,
+          focus: item.focus
+        )
+      )
+      state = state.applying(move)
+    }
+
+    return OpeningLessonDefinition(
+      id: "learn-the-italian-opening",
+      title: "Learn the Italian Opening",
+      summary: "Predict the core Italian Opening moves for both sides, one step at a time.",
+      steps: steps
+    )
+  }
+}
+
+private enum OpeningLessonPhase: Equatable {
+  case idle
+  case active
+  case complete
+}
+
+@MainActor
+private final class OpeningLessonStore: ObservableObject {
+  private static let maximumTriesPerStep = 3
+
+  @Published private(set) var phase: OpeningLessonPhase = .idle
+  @Published private(set) var activeLesson: OpeningLessonDefinition?
+  @Published private(set) var currentStepIndex = 0
+  @Published private(set) var remainingTries = 3
+  @Published private(set) var feedbackText: String?
+  @Published private(set) var isLoadingFeedback = false
+  @Published private(set) var isMoveRevealed = false
+  @Published private(set) var reloadVersion = 0
+
+  private var feedbackRequestID = 0
+
+  var currentStep: OpeningLessonStep? {
+    guard let activeLesson,
+          activeLesson.steps.indices.contains(currentStepIndex) else {
+      return nil
+    }
+
+    return activeLesson.steps[currentStepIndex]
+  }
+
+  var isActive: Bool {
+    phase == .active
+  }
+
+  var isComplete: Bool {
+    phase == .complete
+  }
+
+  func configure(for mode: ExperienceMode) {
+    guard case .lesson(let lesson) = mode else {
+      resetSession()
+      return
+    }
+
+    guard activeLesson?.id != lesson.id || phase == .idle else {
+      return
+    }
+
+    startLesson(lesson)
+  }
+
+  func restartLesson() {
+    guard let activeLesson else {
+      return
+    }
+
+    startLesson(activeLesson)
+  }
+
+  func revealCurrentMove() {
+    guard phase == .active, currentStep != nil else {
+      return
+    }
+
+    isMoveRevealed = true
+    isLoadingFeedback = false
+    if feedbackText == nil {
+      feedbackText = "The move is revealed. Now play the highlighted move yourself to continue."
+    }
+  }
+
+  func noteRevealedMoveReminder() {
+    guard phase == .active, isMoveRevealed else {
+      return
+    }
+
+    feedbackText = "Follow the highlighted destination square and move the real piece there to continue."
+  }
+
+  func registerIncorrectAttempt() -> Int? {
+    guard phase == .active, currentStep != nil, !isMoveRevealed else {
+      return nil
+    }
+
+    remainingTries = max(0, remainingTries - 1)
+    isLoadingFeedback = true
+    feedbackText = nil
+    feedbackRequestID += 1
+    let requestID = feedbackRequestID
+
+    if remainingTries == 0 {
+      isMoveRevealed = true
+    }
+
+    return requestID
+  }
+
+  func applyFeedback(_ text: String, for requestID: Int) {
+    guard phase == .active, requestID == feedbackRequestID else {
+      return
+    }
+
+    isLoadingFeedback = false
+    feedbackText = text
+  }
+
+  func advanceAfterCorrectMove() -> String? {
+    guard let activeLesson else {
+      return nil
+    }
+
+    feedbackRequestID += 1
+    isLoadingFeedback = false
+    feedbackText = nil
+    isMoveRevealed = false
+
+    let nextIndex = currentStepIndex + 1
+    guard activeLesson.steps.indices.contains(nextIndex) else {
+      phase = .complete
+      remainingTries = Self.maximumTriesPerStep
+      return activeLesson.id
+    }
+
+    currentStepIndex = nextIndex
+    remainingTries = Self.maximumTriesPerStep
+    return nil
+  }
+
+  func startLesson(_ lesson: OpeningLessonDefinition) {
+    activeLesson = lesson
+    phase = .active
+    currentStepIndex = 0
+    remainingTries = Self.maximumTriesPerStep
+    feedbackText = nil
+    isLoadingFeedback = false
+    isMoveRevealed = false
+    feedbackRequestID += 1
+    reloadVersion += 1
+  }
+
+  func resetSession() {
+    phase = .idle
+    activeLesson = nil
+    currentStepIndex = 0
+    remainingTries = Self.maximumTriesPerStep
+    feedbackText = nil
+    isLoadingFeedback = false
+    isMoveRevealed = false
+    reloadVersion = 0
+    feedbackRequestID = 0
   }
 }
 
@@ -4131,6 +4485,44 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     }
   }
 
+  func lessonWrongMoveFeedback(
+    lesson: OpeningLessonDefinition,
+    step: OpeningLessonStep,
+    state: ChessGameState,
+    attemptedMove: ChessMove,
+    correctMove: ChessMove
+  ) async -> String {
+    let fallback = fallbackLessonFeedback(for: step)
+
+    guard hintService.isConfigured else {
+      appendGeminiDebug("Lesson feedback fell back because ARChessAPIBaseURL is not configured.")
+      return fallback
+    }
+
+    if geminiConnectionState == .error, geminiLooksTerminal(geminiConnectionLastError) {
+      appendGeminiDebug("Lesson feedback fell back because Gemini Live reported a terminal error.")
+      return fallback
+    }
+
+    let context = GeminiLessonFeedbackContext(
+      fen: state.fenString,
+      lessonTitle: lesson.title,
+      attemptedMove: attemptedMove.uciString,
+      correctMove: correctMove.uciString,
+      sideToMove: state.turn,
+      focus: step.focus
+    )
+
+    do {
+      let explanation = try await hintService.fetchLessonFeedback(for: context)
+      appendGeminiDebug("Gemini lesson feedback ready for \(lesson.id) move \(attemptedMove.uciString).")
+      return explanation
+    } catch {
+      appendGeminiDebug("Gemini lesson feedback failed: \(error.localizedDescription)")
+      return fallback
+    }
+  }
+
   func bindReactionHandler(_ handler: @escaping (ReactionCue) -> Void) {
     reactionHandler = handler
   }
@@ -4731,6 +5123,10 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     coachLines = normalizedLines
     topWorkers = Array(commentary.topWorkers.prefix(3))
     topTraitors = Array(commentary.topTraitors.prefix(3))
+  }
+
+  private func fallbackLessonFeedback(for step: OpeningLessonStep) -> String {
+    "That move is playable, but it is not the lesson move here. Look for a move that better supports development, center control, or pressure in the Italian Opening. \(step.focus)"
   }
 
   private func narrateGeminiHintIfNeeded(text: String, key: String, allowRepeat: Bool = false) {
@@ -5363,6 +5759,7 @@ private struct PiecePortraitView: View {
 private struct ARChessRootView: View {
   @State private var screen: NativeScreen = .modeSelection
   @StateObject private var queueMatch = QueueMatchStore()
+  @State private var completedLessonIDs: Set<String> = []
 
   var body: some View {
     ZStack {
@@ -5383,11 +5780,19 @@ private struct ARChessRootView: View {
           }
         }
       case .course:
-        CourseLibraryView {
-          withAnimation(.spring(response: 0.42, dampingFraction: 0.88)) {
-            screen = .modeSelection
+        CourseLibraryView(
+          completedLessonIDs: completedLessonIDs,
+          openLesson: { lesson in
+            withAnimation(.spring(response: 0.42, dampingFraction: 0.88)) {
+              screen = .experience(.lesson(lesson))
+            }
+          },
+          goBack: {
+            withAnimation(.spring(response: 0.42, dampingFraction: 0.88)) {
+              screen = .modeSelection
+            }
           }
-        }
+        )
       case .stockfishSetup:
         StockfishSetupView(
           openExperience: { configuration in
@@ -5444,6 +5849,10 @@ private struct ARChessRootView: View {
           queueMatch: queueMatch,
           closeExperience: {
             switch mode {
+            case .lesson:
+              withAnimation(.spring(response: 0.42, dampingFraction: 0.88)) {
+                screen = .course
+              }
             case .passAndPlay(let playerMode):
               withAnimation(.spring(response: 0.42, dampingFraction: 0.88)) {
                 screen = .lobby(playerMode)
@@ -5462,14 +5871,24 @@ private struct ARChessRootView: View {
             }
           },
           returnHome: {
+            withAnimation(.spring(response: 0.42, dampingFraction: 0.88)) {
+              switch mode {
+              case .lesson:
+                screen = .course
+              case .queueMatch:
+                screen = .modeSelection
+              case .passAndPlay, .playVsStockfish:
+                screen = .modeSelection
+              }
+            }
             if case .queueMatch = mode {
               Task {
                 await queueMatch.exitQueueFlow()
               }
             }
-            withAnimation(.spring(response: 0.42, dampingFraction: 0.88)) {
-              screen = .modeSelection
-            }
+          },
+          markLessonComplete: { lessonID in
+            completedLessonIDs.insert(lessonID)
           }
         )
       }
@@ -5546,8 +5965,12 @@ private struct ModeSelectionView: View {
 }
 
 private struct CourseLibraryView: View {
+  let completedLessonIDs: Set<String>
+  let openLesson: (OpeningLessonDefinition) -> Void
   let goBack: () -> Void
   @State private var selectedPage = 0
+  @State private var unavailableCourseTitle = ""
+  @State private var isUnavailableCourseAlertPresented = false
 
   private let pages = CourseCatalogEntry.mockPages
 
@@ -5567,16 +5990,16 @@ private struct CourseLibraryView: View {
 
       VStack(spacing: 18) {
         VStack(alignment: .leading, spacing: 10) {
-          Text("Course")
+          Text("Lessons")
             .font(.system(size: 12, weight: .bold, design: .rounded))
             .tracking(2.2)
             .foregroundStyle(Color(red: 0.84, green: 0.78, blue: 0.66))
 
-          Text("Mock Course Library")
+          Text("Opening Lessons")
             .font(.system(size: 32, weight: .heavy, design: .rounded))
             .foregroundStyle(.white)
 
-          Text("Swipe between pages. Each page shows a 9 by 9 grid of mock courses.")
+          Text("Swipe between pages. The Italian Opening lesson is live; the other boxes are mock entries for the current catalog layout.")
             .font(.system(size: 15, weight: .medium, design: .rounded))
             .foregroundStyle(Color.white.opacity(0.80))
             .lineSpacing(3)
@@ -5589,7 +6012,13 @@ private struct CourseLibraryView: View {
             CoursePageGrid(
               courses: page,
               pageIndex: index,
-              pageCount: pages.count
+              pageCount: pages.count,
+              completedLessonIDs: completedLessonIDs,
+              openLesson: openLesson,
+              showUnavailableCourse: { course in
+                unavailableCourseTitle = course.title
+                isUnavailableCourseAlertPresented = true
+              }
             )
             .tag(index)
           }
@@ -5604,6 +6033,13 @@ private struct CourseLibraryView: View {
       }
       .padding(.horizontal, 20)
     }
+    .alert(isPresented: $isUnavailableCourseAlertPresented) {
+      Alert(
+        title: Text(unavailableCourseTitle),
+        message: Text("This lesson card is still a mock entry. Only Learn the Italian Opening is interactive right now."),
+        dismissButton: .default(Text("OK"))
+      )
+    }
   }
 }
 
@@ -5611,6 +6047,9 @@ private struct CoursePageGrid: View {
   let courses: [CourseCatalogEntry]
   let pageIndex: Int
   let pageCount: Int
+  let completedLessonIDs: Set<String>
+  let openLesson: (OpeningLessonDefinition) -> Void
+  let showUnavailableCourse: (CourseCatalogEntry) -> Void
 
   private let columnCount = 9
   private let gridSpacing: CGFloat = 4
@@ -5639,8 +6078,16 @@ private struct CoursePageGrid: View {
 
         LazyVGrid(columns: columns, spacing: gridSpacing) {
           ForEach(courses) { course in
-            CourseBoxView(course: course)
+            Button {
+              handleSelection(for: course)
+            } label: {
+              CourseBoxView(
+                course: course,
+                isCompleted: course.lessonID.map(completedLessonIDs.contains) ?? false
+              )
               .frame(width: cellSide, height: cellSide)
+            }
+            .buttonStyle(.plain)
           }
         }
       }
@@ -5658,18 +6105,32 @@ private struct CoursePageGrid: View {
       .padding(.bottom, 16)
     }
   }
+
+  private func handleSelection(for course: CourseCatalogEntry) {
+    switch course.kind {
+    case .italianOpening:
+      openLesson(.italianOpening)
+    case .mock:
+      showUnavailableCourse(course)
+    }
+  }
 }
 
 private struct CourseBoxView: View {
   let course: CourseCatalogEntry
+  let isCompleted: Bool
 
   var body: some View {
     RoundedRectangle(cornerRadius: 10, style: .continuous)
       .fill(
         LinearGradient(
           colors: [
-            Color(red: 0.14, green: 0.20, blue: 0.28),
-            Color(red: 0.08, green: 0.11, blue: 0.16),
+            course.kind == .italianOpening
+              ? Color(red: 0.24, green: 0.20, blue: 0.10)
+              : Color(red: 0.14, green: 0.20, blue: 0.28),
+            course.kind == .italianOpening
+              ? Color(red: 0.12, green: 0.10, blue: 0.05)
+              : Color(red: 0.08, green: 0.11, blue: 0.16),
           ],
           startPoint: .topLeading,
           endPoint: .bottomTrailing
@@ -5677,7 +6138,14 @@ private struct CourseBoxView: View {
       )
       .overlay(
         RoundedRectangle(cornerRadius: 10, style: .continuous)
-          .stroke(Color.white.opacity(0.14), lineWidth: 1)
+          .stroke(
+            isCompleted
+              ? Color(red: 0.57, green: 0.90, blue: 0.68)
+              : (course.kind == .italianOpening
+                ? Color(red: 0.95, green: 0.88, blue: 0.73).opacity(0.72)
+                : Color.white.opacity(0.14)),
+            lineWidth: 1
+          )
       )
       .overlay {
         Text(course.title)
@@ -5687,6 +6155,14 @@ private struct CourseBoxView: View {
           .lineLimit(4)
           .minimumScaleFactor(0.58)
           .padding(4)
+      }
+      .overlay(alignment: .topTrailing) {
+        if isCompleted {
+          Image(systemName: "checkmark.circle.fill")
+            .font(.system(size: 9, weight: .bold))
+            .foregroundStyle(Color(red: 0.57, green: 0.90, blue: 0.68))
+            .padding(4)
+        }
       }
   }
 }
@@ -6104,13 +6580,16 @@ private struct NativeARExperienceView: View {
   @ObservedObject var queueMatch: QueueMatchStore
   let closeExperience: () -> Void
   let returnHome: () -> Void
+  let markLessonComplete: (String) -> Void
   @StateObject private var matchLog = MatchLogStore()
   @StateObject private var commentary = PiecePersonalityDirector()
   @StateObject private var gameReview = GameReviewStore()
+  @StateObject private var lessonStore = OpeningLessonStore()
   @State private var isModePanelVisible = false
   @State private var isMatchLogVisible = false
   @State private var isGeminiDebugVisible = false
   @State private var isStockfishDebugVisible = false
+  @State private var notifiedCompletedLessonID: String?
 
   var body: some View {
     ZStack {
@@ -6120,6 +6599,7 @@ private struct NativeARExperienceView: View {
         mode: mode,
         commentary: commentary,
         gameReview: gameReview,
+        lessonStore: lessonStore,
         onReviewFinished: returnHome
       )
         .ignoresSafeArea()
@@ -6136,7 +6616,7 @@ private struct NativeARExperienceView: View {
       .ignoresSafeArea()
       .allowsHitTesting(false)
 
-      if gameReview.phase == .idle {
+      if gameReview.phase == .idle && !isLessonMode {
         VStack(spacing: 16) {
           if isModePanelVisible {
             ScrollView(showsIndicators: true) {
@@ -6310,55 +6790,59 @@ private struct NativeARExperienceView: View {
       if gameReview.phase == .idle {
         VStack {
           HStack(alignment: .top) {
-            HStack(spacing: 10) {
-              overlayToggleButton(
-                title: isModePanelVisible ? "Hide Mode" : "Show Mode",
-                systemImage: "rectangle.topthird.inset.filled"
-              ) {
-                withAnimation(.spring(response: 0.30, dampingFraction: 0.86)) {
-                  isModePanelVisible.toggle()
-                }
-              }
-
-              overlayToggleButton(
-                title: isMatchLogVisible ? "Hide Log" : "Show Log",
-                systemImage: "text.append"
-              ) {
-                withAnimation(.spring(response: 0.30, dampingFraction: 0.86)) {
-                  isMatchLogVisible.toggle()
-                }
-              }
-
-              overlayToggleButton(
-                title: isGeminiDebugVisible ? "Hide Gemini Debug" : "Show Gemini Debug",
-                systemImage: "sparkles.rectangle.stack"
-              ) {
-                let nextVisible = !isGeminiDebugVisible
-                withAnimation(.spring(response: 0.30, dampingFraction: 0.86)) {
-                  isGeminiDebugVisible = nextVisible
-                  if nextVisible {
-                    isStockfishDebugVisible = false
+            if !isLessonMode {
+              HStack(spacing: 10) {
+                overlayToggleButton(
+                  title: isModePanelVisible ? "Hide Mode" : "Show Mode",
+                  systemImage: "rectangle.topthird.inset.filled"
+                ) {
+                  withAnimation(.spring(response: 0.30, dampingFraction: 0.86)) {
+                    isModePanelVisible.toggle()
                   }
                 }
-                syncStockfishDebugVisibility()
-              }
 
-              overlayToggleButton(
-                title: isStockfishDebugVisible ? "Hide Stockfish Debug" : "Show Stockfish Debug",
-                systemImage: "list.number"
-              ) {
-                let nextVisible = !isStockfishDebugVisible
-                withAnimation(.spring(response: 0.30, dampingFraction: 0.86)) {
-                  isStockfishDebugVisible = nextVisible
-                  if nextVisible {
-                    isGeminiDebugVisible = false
+                overlayToggleButton(
+                  title: isMatchLogVisible ? "Hide Log" : "Show Log",
+                  systemImage: "text.append"
+                ) {
+                  withAnimation(.spring(response: 0.30, dampingFraction: 0.86)) {
+                    isMatchLogVisible.toggle()
                   }
                 }
-                syncStockfishDebugVisibility()
+
+                overlayToggleButton(
+                  title: isGeminiDebugVisible ? "Hide Gemini Debug" : "Show Gemini Debug",
+                  systemImage: "sparkles.rectangle.stack"
+                ) {
+                  let nextVisible = !isGeminiDebugVisible
+                  withAnimation(.spring(response: 0.30, dampingFraction: 0.86)) {
+                    isGeminiDebugVisible = nextVisible
+                    if nextVisible {
+                      isStockfishDebugVisible = false
+                    }
+                  }
+                  syncStockfishDebugVisibility()
+                }
+
+                overlayToggleButton(
+                  title: isStockfishDebugVisible ? "Hide Stockfish Debug" : "Show Stockfish Debug",
+                  systemImage: "list.number"
+                ) {
+                  let nextVisible = !isStockfishDebugVisible
+                  withAnimation(.spring(response: 0.30, dampingFraction: 0.86)) {
+                    isStockfishDebugVisible = nextVisible
+                    if nextVisible {
+                      isGeminiDebugVisible = false
+                    }
+                  }
+                  syncStockfishDebugVisibility()
+                }
               }
+
+              Spacer(minLength: 16)
+            } else {
+              Spacer(minLength: 0)
             }
-
-            Spacer(minLength: 16)
 
             overlayToggleButton(
               title: "Exit AR",
@@ -6381,8 +6865,13 @@ private struct NativeARExperienceView: View {
       } else if gameReview.isReviewMode {
         reviewCheckpointOverlay
       }
+
+      if isLessonMode {
+        lessonOverlay
+      }
     }
     .task {
+      lessonStore.configure(for: mode)
       if mode.usesLocalMatchLog {
         // Remote move logs assume a standard game start, so custom-FEN devCheck
         // sessions keep their history on-device only.
@@ -6393,7 +6882,7 @@ private struct NativeARExperienceView: View {
         if mode.allowsRemoteMatchLogSync {
           await matchLog.prepareRemoteGameIfNeeded()
         }
-      } else {
+      } else if case .queueMatch = mode {
         await queueMatch.activateMatchSync()
       }
     }
@@ -6408,14 +6897,28 @@ private struct NativeARExperienceView: View {
       isStockfishDebugVisible = false
       syncStockfishDebugVisibility()
     }
+    .onChange(of: lessonStore.phase) { phase in
+      guard phase == .complete,
+            let lessonID = lessonStore.activeLesson?.id,
+            notifiedCompletedLessonID != lessonID else {
+        return
+      }
+
+      notifiedCompletedLessonID = lessonID
+      markLessonComplete(lessonID)
+    }
     .onDisappear {
       gameReview.resetSession()
+      lessonStore.resetSession()
+      notifiedCompletedLessonID = nil
       commentary.resetSession()
       commentary.unbindStateProvider()
       commentary.unbindHintAvailabilityProvider()
       commentary.unbindRecentHistoryProvider()
       commentary.unbindReactionHandler()
       switch mode {
+      case .lesson:
+        break
       case .passAndPlay(_), .playVsStockfish:
         matchLog.resetSession()
       case .queueMatch:
@@ -6575,6 +7078,151 @@ private struct NativeARExperienceView: View {
         }
         .padding(.horizontal, 18)
         .padding(.top, 24)
+      }
+
+      Spacer()
+    }
+  }
+
+  private var lessonOverlay: some View {
+    VStack {
+      if lessonStore.isComplete, let lesson = lessonStore.activeLesson {
+        ZStack {
+          Color.black.opacity(0.72)
+            .ignoresSafeArea()
+
+          VStack(alignment: .leading, spacing: 16) {
+            Text("Lesson Complete")
+              .font(.system(size: 34, weight: .heavy, design: .rounded))
+              .foregroundStyle(.white)
+
+            Text("\(lesson.title) is complete. You can restart it now or head back to the lessons catalog.")
+              .font(.system(size: 16, weight: .semibold, design: .rounded))
+              .foregroundStyle(Color.white.opacity(0.84))
+              .lineSpacing(3)
+
+            HStack(spacing: 12) {
+              NativeActionButton(title: "Restart Lesson", style: .outline) {
+                lessonStore.restartLesson()
+              }
+
+              NativeActionButton(title: "Back to Lessons", style: .solid) {
+                closeExperience()
+              }
+            }
+          }
+          .padding(.horizontal, 28)
+          .padding(.vertical, 30)
+          .background(
+            RoundedRectangle(cornerRadius: 30, style: .continuous)
+              .fill(Color(red: 0.07, green: 0.10, blue: 0.14).opacity(0.92))
+              .overlay(
+                RoundedRectangle(cornerRadius: 30, style: .continuous)
+                  .stroke(Color.white.opacity(0.12), lineWidth: 1)
+              )
+          )
+          .padding(.horizontal, 24)
+        }
+      } else if let lesson = lessonStore.activeLesson, let step = lessonStore.currentStep {
+        VStack(spacing: 14) {
+          HStack(alignment: .top, spacing: 16) {
+            VStack(alignment: .leading, spacing: 8) {
+              Text("Lesson")
+                .font(.system(size: 12, weight: .bold, design: .rounded))
+                .tracking(2.0)
+                .foregroundStyle(Color(red: 0.88, green: 0.82, blue: 0.70))
+
+              Text(lesson.title)
+                .font(.system(size: 25, weight: .heavy, design: .rounded))
+                .foregroundStyle(.white)
+
+              Text("Step \(lessonStore.currentStepIndex + 1) of \(lesson.steps.count)")
+                .font(.system(size: 14, weight: .semibold, design: .rounded))
+                .foregroundStyle(Color.white.opacity(0.88))
+
+              Text("Remaining tries: \(lessonStore.remainingTries)")
+                .font(.system(size: 13, weight: .bold, design: .rounded))
+                .foregroundStyle(Color(red: 0.95, green: 0.88, blue: 0.73))
+
+              Text(step.prompt)
+                .font(.system(size: 14, weight: .semibold, design: .rounded))
+                .foregroundStyle(Color.white.opacity(0.88))
+                .lineSpacing(2)
+
+              if lessonStore.isMoveRevealed {
+                Text("Move revealed. Follow the highlighted destination square and ghost piece, then make the move yourself.")
+                  .font(.system(size: 12, weight: .bold, design: .rounded))
+                  .foregroundStyle(Color(red: 0.57, green: 0.90, blue: 0.68))
+                  .lineSpacing(2)
+              }
+            }
+            .padding(18)
+            .background(
+              RoundedRectangle(cornerRadius: 24, style: .continuous)
+                .fill(Color(red: 0.07, green: 0.10, blue: 0.14).opacity(0.88))
+                .overlay(
+                  RoundedRectangle(cornerRadius: 24, style: .continuous)
+                    .stroke(Color.white.opacity(0.12), lineWidth: 1)
+                )
+            )
+
+            Spacer(minLength: 0)
+
+            VStack(spacing: 10) {
+              NativeActionButton(title: "See Move", style: .solid) {
+                lessonStore.revealCurrentMove()
+              }
+              .frame(width: 170)
+            }
+          }
+
+          if lessonStore.isLoadingFeedback {
+            HStack(spacing: 10) {
+              ProgressView()
+                .tint(Color(red: 0.95, green: 0.88, blue: 0.73))
+
+              Text("Gemini is explaining the opening idea...")
+                .font(.system(size: 13, weight: .semibold, design: .rounded))
+                .foregroundStyle(Color.white.opacity(0.82))
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 18)
+            .padding(.vertical, 14)
+            .background(
+              RoundedRectangle(cornerRadius: 20, style: .continuous)
+                .fill(Color(red: 0.07, green: 0.10, blue: 0.14).opacity(0.88))
+                .overlay(
+                  RoundedRectangle(cornerRadius: 20, style: .continuous)
+                    .stroke(Color.white.opacity(0.12), lineWidth: 1)
+                )
+            )
+          } else if let feedback = lessonStore.feedbackText {
+            VStack(alignment: .leading, spacing: 8) {
+              Text("Feedback")
+                .font(.system(size: 12, weight: .bold, design: .rounded))
+                .tracking(1.6)
+                .foregroundStyle(Color(red: 0.88, green: 0.82, blue: 0.70))
+
+              Text(feedback)
+                .font(.system(size: 14, weight: .semibold, design: .rounded))
+                .foregroundStyle(Color.white.opacity(0.88))
+                .lineSpacing(2)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 18)
+            .padding(.vertical, 14)
+            .background(
+              RoundedRectangle(cornerRadius: 20, style: .continuous)
+                .fill(Color(red: 0.07, green: 0.10, blue: 0.14).opacity(0.88))
+                .overlay(
+                  RoundedRectangle(cornerRadius: 20, style: .continuous)
+                    .stroke(Color.white.opacity(0.12), lineWidth: 1)
+                )
+            )
+          }
+        }
+        .padding(.horizontal, 18)
+        .padding(.top, 78)
       }
 
       Spacer()
@@ -6824,6 +7472,8 @@ private struct NativeARExperienceView: View {
 
   private var modeTitle: String {
     switch mode {
+    case .lesson(let lesson):
+      return lesson.title
     case .passAndPlay(let playerMode):
       return playerMode.title + " Mode"
     case .queueMatch:
@@ -6835,6 +7485,8 @@ private struct NativeARExperienceView: View {
 
   private var activeEntries: [MatchLogStore.Entry] {
     switch mode {
+    case .lesson:
+      return []
     case .passAndPlay(_), .playVsStockfish:
       return matchLog.entries
     case .queueMatch:
@@ -6844,6 +7496,8 @@ private struct NativeARExperienceView: View {
 
   private var activeRemoteGameID: String? {
     switch mode {
+    case .lesson:
+      return nil
     case .passAndPlay(_), .playVsStockfish:
       return matchLog.remoteGameID
     case .queueMatch:
@@ -6853,6 +7507,8 @@ private struct NativeARExperienceView: View {
 
   private var activeSyncStatus: String {
     switch mode {
+    case .lesson:
+      return "Lesson mode keeps the board local to this guided opening flow."
     case .passAndPlay(_), .playVsStockfish:
       return matchLog.syncStatus
     case .queueMatch:
@@ -6871,6 +7527,10 @@ private struct NativeARExperienceView: View {
     case .disconnected:
       return Color.white.opacity(0.70)
     }
+  }
+
+  private var isLessonMode: Bool {
+    mode.isLessonMode
   }
 }
 
@@ -7919,6 +8579,7 @@ private struct NativeARView: UIViewRepresentable {
   let mode: ExperienceMode
   @ObservedObject var commentary: PiecePersonalityDirector
   @ObservedObject var gameReview: GameReviewStore
+  @ObservedObject var lessonStore: OpeningLessonStore
   let onReviewFinished: () -> Void
 
   func makeCoordinator() -> Coordinator {
@@ -7928,6 +8589,7 @@ private struct NativeARView: UIViewRepresentable {
       mode: mode,
       commentary: commentary,
       gameReview: gameReview,
+      lessonStore: lessonStore,
       onReviewFinished: onReviewFinished
     )
   }
@@ -7971,6 +8633,7 @@ private struct NativeARView: UIViewRepresentable {
     private let mode: ExperienceMode
     private let commentary: PiecePersonalityDirector
     private let gameReview: GameReviewStore
+    private let lessonStore: OpeningLessonStore
     private let onReviewFinished: () -> Void
     private weak var arView: ARView?
     private var boardAnchor: AnchorEntity?
@@ -8005,6 +8668,7 @@ private struct NativeARView: UIViewRepresentable {
     private var hasTriggeredPostGameFlow = false
     private var loadedReviewCheckpointID: UUID?
     private var loadedReviewReloadVersion = 0
+    private var loadedLessonReloadVersion = 0
 
     init(
       matchLog: MatchLogStore,
@@ -8012,6 +8676,7 @@ private struct NativeARView: UIViewRepresentable {
       mode: ExperienceMode,
       commentary: PiecePersonalityDirector,
       gameReview: GameReviewStore,
+      lessonStore: OpeningLessonStore,
       onReviewFinished: @escaping () -> Void
     ) {
       self.matchLog = matchLog
@@ -8019,12 +8684,22 @@ private struct NativeARView: UIViewRepresentable {
       self.mode = mode
       self.commentary = commentary
       self.gameReview = gameReview
+      self.lessonStore = lessonStore
       self.onReviewFinished = onReviewFinished
 
-      if case .playVsStockfish(let configuration) = mode,
-         let startingFEN = configuration.startingFEN,
-         let restoredState = try? ChessGameState(fen: startingFEN) {
-        self.gameState = restoredState
+      switch mode {
+      case .lesson(let lesson):
+        if let startingFEN = lesson.steps.first?.startingFEN,
+           let restoredState = try? ChessGameState(fen: startingFEN) {
+          self.gameState = restoredState
+        }
+      case .playVsStockfish(let configuration):
+        if let startingFEN = configuration.startingFEN,
+           let restoredState = try? ChessGameState(fen: startingFEN) {
+          self.gameState = restoredState
+        }
+      case .passAndPlay, .queueMatch:
+        break
       }
     }
 
@@ -8048,9 +8723,15 @@ private struct NativeARView: UIViewRepresentable {
       Task { @MainActor [weak self] in
         self?.commentary.attachEngineHost(to: arView)
       }
-      noteWarmupStatus("Waiting for board placement before warming Stockfish...")
+      noteWarmupStatus(
+        mode.warmsStockfishAnalysis
+          ? "Waiting for board placement before warming Stockfish..."
+          : "Waiting for board placement to start the lesson..."
+      )
       if case .playVsStockfish(let configuration) = mode {
         commentary.noteExternalStatus(configuration.statusSummary)
+      } else if case .lesson(let lesson) = mode {
+        commentary.noteExternalStatus(lesson.summary)
       }
 
       let tapRecognizer = UITapGestureRecognizer(target: self, action: #selector(handleTap(_:)))
@@ -8098,6 +8779,8 @@ private struct NativeARView: UIViewRepresentable {
             }
 
             switch self.mode {
+            case .lesson:
+              return false
             case .passAndPlay(_):
               return true
             case .queueMatch:
@@ -8164,6 +8847,7 @@ private struct NativeARView: UIViewRepresentable {
 
     func syncRuntimeState(queueAssignedColor: ChessColor?) {
       self.queueAssignedColor = queueAssignedColor
+      syncLessonStateIfNeeded()
       syncReviewStateIfNeeded()
       syncAutomatedOpponentTurnIfNeeded()
     }
@@ -8350,6 +9034,11 @@ private struct NativeARView: UIViewRepresentable {
         return
       }
 
+      if mode.isLessonMode {
+        applyLessonMove(move)
+        return
+      }
+
       if case .queueMatch = mode {
         let targetPly = syncedQueueMoves.count + 1
         Task { @MainActor in
@@ -8491,6 +9180,82 @@ private struct NativeARView: UIViewRepresentable {
       )
     }
 
+    private func applyLessonMove(_ move: ChessMove) {
+      guard case .lesson(let lesson) = mode,
+            lessonStore.isActive,
+            let step = lessonStore.currentStep,
+            let correctMove = expectedLessonMove(for: step, in: gameState) else {
+        clearSelection()
+        return
+      }
+
+      if lessonStore.isMoveRevealed {
+        guard move.uciString == correctMove.uciString else {
+          clearSelection()
+          lessonStore.noteRevealedMoveReminder()
+          return
+        }
+
+        commitLessonMove(move, lesson: lesson)
+        return
+      }
+
+      guard move.uciString == correctMove.uciString else {
+        clearSelection()
+        guard let requestID = lessonStore.registerIncorrectAttempt() else {
+          return
+        }
+
+        Task { @MainActor [weak self] in
+          guard let self else {
+            return
+          }
+
+          let feedback = await self.commentary.lessonWrongMoveFeedback(
+            lesson: lesson,
+            step: step,
+            state: self.gameState,
+            attemptedMove: move,
+            correctMove: correctMove
+          )
+          self.lessonStore.applyFeedback(feedback, for: requestID)
+        }
+        return
+      }
+
+      commitLessonMove(move, lesson: lesson)
+    }
+
+    private func commitLessonMove(_ move: ChessMove, lesson: OpeningLessonDefinition) {
+      let beforeState = gameState
+      let afterState = gameState.applying(move)
+      enqueueMoveAnimation(
+        AnimatedMoveContext(
+          move: move,
+          beforeState: beforeState,
+          afterState: afterState,
+          postApply: { [weak self] in
+            guard let self else {
+              return
+            }
+
+            if self.lessonStore.advanceAfterCorrectMove() != nil {
+              self.commentary.noteExternalStatus("\(lesson.title) complete.")
+            } else if let nextStep = self.lessonStore.currentStep {
+              self.commentary.noteExternalStatus(nextStep.focus)
+            }
+          }
+        )
+      )
+    }
+
+    private func expectedLessonMove(
+      for step: OpeningLessonStep,
+      in state: ChessGameState
+    ) -> ChessMove? {
+      state.move(forUCI: step.correctMoveUCI)
+    }
+
     private func syncAutomatedOpponentTurnIfNeeded() {
       guard case .playVsStockfish(let configuration) = mode,
             !gameReview.isLoading,
@@ -8621,6 +9386,47 @@ private struct NativeARView: UIViewRepresentable {
 
       if !gameReview.stageReviewPrompt() {
         onReviewFinished()
+      }
+    }
+
+    private func syncLessonStateIfNeeded(force: Bool = false) {
+      guard mode.isLessonMode,
+            lessonStore.isActive,
+            let step = lessonStore.currentStep else {
+        loadedLessonReloadVersion = 0
+        return
+      }
+
+      guard force || loadedLessonReloadVersion != lessonStore.reloadVersion else {
+        return
+      }
+
+      loadLessonStep(step)
+    }
+
+    private func loadLessonStep(_ step: OpeningLessonStep) {
+      liveEngineTask?.cancel()
+      liveEngineTask = nil
+      reviewEngineTask?.cancel()
+      reviewEngineTask = nil
+      initialAnalysisTask?.cancel()
+      initialAnalysisTask = nil
+      moveAnimationTask?.cancel()
+      moveAnimationTask = nil
+      pendingAnimatedMoves.removeAll()
+      activeKnightForkBinding = nil
+      narrativeHistory.removeAll()
+      selectedSquare = nil
+      selectedMoves = []
+
+      do {
+        gameState = try ChessGameState(fen: step.startingFEN)
+        loadedLessonReloadVersion = lessonStore.reloadVersion
+        refreshBoardPresentation()
+        commentary.noteExternalStatus(step.focus)
+      } catch {
+        commentary.noteExternalStatus("Lesson step could not load.")
+        lessonStore.resetSession()
       }
     }
 
@@ -9254,6 +10060,8 @@ private struct NativeARView: UIViewRepresentable {
       }
 
       switch mode {
+      case .lesson:
+        return true
       case .passAndPlay(_):
         return true
       case .queueMatch:
@@ -9645,15 +10453,28 @@ private struct NativeARView: UIViewRepresentable {
       }
 
       if boardAnchor == nil {
-        noteWarmupStatus("Waiting for board placement before warming Stockfish...")
+        noteWarmupStatus(
+          mode.warmsStockfishAnalysis
+            ? "Waiting for board placement before warming Stockfish..."
+            : "Waiting for board placement to start the lesson..."
+        )
       } else if stableTrackingFrames < 60 {
-        noteWarmupStatus("Waiting for AR tracking to stabilize before warming Stockfish...")
+        noteWarmupStatus(
+          mode.warmsStockfishAnalysis
+            ? "Waiting for AR tracking to stabilize before warming Stockfish..."
+            : "Waiting for AR tracking to stabilize before starting the lesson..."
+        )
       } else {
         maybeScheduleInitialAnalysis()
       }
     }
 
     private func maybeScheduleInitialAnalysis() {
+      guard mode.warmsStockfishAnalysis else {
+        noteWarmupStatus("Lesson board ready. Predict the next move.")
+        return
+      }
+
       guard !hasScheduledInitialAnalysis else {
         return
       }
@@ -9928,6 +10749,32 @@ private struct NativeARView: UIViewRepresentable {
         highlight.position = boardPosition(move.to, squareSize: squareSize) + SIMD3<Float>(0, 0.0026, 0)
         highlightsContainer.addChild(highlight)
       }
+
+      if mode.isLessonMode,
+         lessonStore.isActive,
+         lessonStore.isMoveRevealed,
+         let step = lessonStore.currentStep,
+         let expectedMove = expectedLessonMove(for: step, in: gameState),
+         let revealSquare = step.destinationSquare {
+        let revealHighlight = makeHighlightEntity(
+          size: squareSize * 0.94,
+          color: UIColor(red: 0.35, green: 0.67, blue: 0.96, alpha: 0.42)
+        )
+        revealHighlight.position = boardPosition(revealSquare, squareSize: squareSize) + SIMD3<Float>(0, 0.0036, 0)
+        highlightsContainer.addChild(revealHighlight)
+
+        let ghost = makePieceEntity(
+          kind: expectedMove.piece.kind,
+          material: ghostPieceMaterial(for: expectedMove.piece.color)
+        )
+        ghost.name = "lesson_ghost_piece"
+        ghost.position = boardPosition(revealSquare, squareSize: squareSize) + SIMD3<Float>(0, 0.0015, 0)
+        ghost.scale = SIMD3<Float>(repeating: 0.96)
+        if expectedMove.piece.color == .black {
+          ghost.orientation = simd_quatf(angle: .pi, axis: SIMD3<Float>(0, 1, 0))
+        }
+        highlightsContainer.addChild(ghost)
+      }
     }
 
     private func makeHighlightEntity(size: Float, color: UIColor) -> ModelEntity {
@@ -9974,6 +10821,23 @@ private struct NativeARView: UIViewRepresentable {
       case .black:
         return SimpleMaterial(
           color: UIColor(red: 0.26, green: 0.27, blue: 0.30, alpha: 1),
+          roughness: 0.98,
+          isMetallic: false
+        )
+      }
+    }
+
+    private func ghostPieceMaterial(for color: ChessColor) -> SimpleMaterial {
+      switch color {
+      case .white:
+        return SimpleMaterial(
+          color: UIColor(red: 0.96, green: 0.96, blue: 0.95, alpha: 0.34),
+          roughness: 0.98,
+          isMetallic: false
+        )
+      case .black:
+        return SimpleMaterial(
+          color: UIColor(red: 0.26, green: 0.27, blue: 0.30, alpha: 0.34),
           roughness: 0.98,
           isMetallic: false
         )
