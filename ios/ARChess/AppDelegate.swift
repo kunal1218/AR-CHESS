@@ -106,6 +106,7 @@ private enum PlayerMode: String, Hashable {
 private enum PlayModeChoice: Hashable {
   case passAndPlay
   case queueMatch
+  case playVsStockfish
 
   var title: String {
     switch self {
@@ -113,13 +114,69 @@ private enum PlayModeChoice: Hashable {
       return "Pass & Play"
     case .queueMatch:
       return "Queue Match"
+    case .playVsStockfish:
+      return "Play vs Stockfish"
     }
+  }
+}
+
+private struct StockfishMatchConfiguration: Hashable {
+  let humanColor: ChessColor
+
+  var engineColor: ChessColor {
+    humanColor.opponent
+  }
+
+  var coinTossSummary: String {
+    "Coin toss assigned you \(humanColor.displayName)."
+  }
+
+  static func coinToss() -> StockfishMatchConfiguration {
+    StockfishMatchConfiguration(humanColor: Bool.random() ? .white : .black)
   }
 }
 
 private enum ExperienceMode: Hashable {
   case passAndPlay(PlayerMode)
   case queueMatch
+  case playVsStockfish(StockfishMatchConfiguration)
+
+  var supportsPostGameReview: Bool {
+    switch self {
+    case .passAndPlay:
+      return false
+    case .queueMatch, .playVsStockfish:
+      return true
+    }
+  }
+
+  func humanPlayerColor(queueAssignedColor: ChessColor?) -> ChessColor? {
+    switch self {
+    case .passAndPlay:
+      return nil
+    case .queueMatch:
+      return queueAssignedColor
+    case .playVsStockfish(let configuration):
+      return configuration.humanColor
+    }
+  }
+
+  var localEngineOpponentColor: ChessColor? {
+    guard case .playVsStockfish(let configuration) = self else {
+      return nil
+    }
+
+    return configuration.engineColor
+  }
+
+  var usesLocalMatchLog: Bool {
+    switch self {
+    case .passAndPlay, .playVsStockfish:
+      return true
+    case .queueMatch:
+      return false
+    }
+  }
 }
 
 private enum NativeScreen {
@@ -3519,6 +3576,11 @@ private final class StockfishWASMAnalyzer: NSObject, WKScriptMessageHandler, WKN
 
 @MainActor
 private final class PiecePersonalityDirector: NSObject, ObservableObject, @preconcurrency AVSpeechSynthesizerDelegate {
+  private enum EngineReplySelection {
+    case best
+    case reviewThirdBest
+  }
+
   private static let preferredMovetimeMs = 80
   private static let preferredHardTimeoutMs = 600
   private static let commentaryIntervalRange = 2...3
@@ -3766,7 +3828,18 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     return analysis.topUniqueMoves.contains { $0.move == move.uciString }
   }
 
+  func gameplayReplyMove(for state: ChessGameState) async -> ChessMove? {
+    await engineReplyMove(for: state, selection: .best)
+  }
+
   func reviewReplyMove(for state: ChessGameState) async -> ChessMove? {
+    await engineReplyMove(for: state, selection: .reviewThirdBest)
+  }
+
+  private func engineReplyMove(
+    for state: ChessGameState,
+    selection: EngineReplySelection
+  ) async -> ChessMove? {
     do {
       let analysis = try await analyzer.analyze(
         fen: state.fenString,
@@ -3776,7 +3849,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
           multiPV: StockfishAnalysisDefaults.multiPV
         )
       )
-      let preferredMove = preferredReviewCandidateMove(from: analysis)
+      let preferredMove = preferredEngineCandidateMove(from: analysis, selection: selection)
       return preferredMove.flatMap { state.move(forUCI: $0) }
     } catch {
       return nil
@@ -4189,14 +4262,22 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     )
   }
 
-  private func preferredReviewCandidateMove(from analysis: StockfishAnalysis) -> String? {
-    // Review mode deliberately chooses a softer engine reply so the player can
-    // continue the position instead of getting crushed by the top line every time.
+  private func preferredEngineCandidateMove(
+    from analysis: StockfishAnalysis,
+    selection: EngineReplySelection
+  ) -> String? {
     let rankedMoves = analysis.topUniqueMoves.compactMap(\.move)
-    return rankedMoves.dropFirst(2).first
-      ?? rankedMoves.dropFirst().first
-      ?? rankedMoves.first
-      ?? analysis.bestMove
+    switch selection {
+    case .best:
+      return rankedMoves.first ?? analysis.bestMove
+    case .reviewThirdBest:
+      // Review mode deliberately chooses a softer engine reply so the player can
+      // continue the position instead of getting crushed by the top line every time.
+      return rankedMoves.dropFirst(2).first
+        ?? rankedMoves.dropFirst().first
+        ?? rankedMoves.first
+        ?? analysis.bestMove
+    }
   }
 
   private func describe(analysis: StockfishAnalysis, moverColor: ChessColor) -> String {
@@ -5083,6 +5164,8 @@ private struct ARChessRootView: View {
               screen = .landing
             case .queueMatch:
               screen = .queueMatch
+            case .playVsStockfish:
+              screen = .experience(.playVsStockfish(.coinToss()))
             }
           }
         }
@@ -5140,6 +5223,10 @@ private struct ARChessRootView: View {
               withAnimation(.spring(response: 0.42, dampingFraction: 0.88)) {
                 screen = .queueMatch
               }
+            case .playVsStockfish:
+              withAnimation(.spring(response: 0.42, dampingFraction: 0.88)) {
+                screen = .modeSelection
+              }
             }
           },
           returnHome: {
@@ -5186,16 +5273,20 @@ private struct ModeSelectionView: View {
 
           WarChessTitle()
 
-          Text("Choose a local pass-and-play board or a synced queue match.")
+          Text("Choose pass-and-play, a full game versus Stockfish, or a synced queue match.")
             .font(.system(size: 18, weight: .medium, design: .rounded))
             .foregroundStyle(Color.white.opacity(0.82))
             .multilineTextAlignment(.center)
-            .frame(maxWidth: 320)
+            .frame(maxWidth: 340)
         }
 
         VStack(spacing: 14) {
           NativeActionButton(title: "Pass & Play", style: .solid) {
             onSelect(.passAndPlay)
+          }
+
+          NativeActionButton(title: "Play vs Stockfish", style: .outline) {
+            onSelect(.playVsStockfish)
           }
 
           NativeActionButton(title: "Queue Match", style: .outline) {
@@ -5204,11 +5295,11 @@ private struct ModeSelectionView: View {
         }
         .frame(maxWidth: 340)
 
-        Text("Pass & Play stays unchanged • Queue Match syncs through Railway")
+        Text("Post-game review runs after Queue Match and full Play vs Stockfish games only")
           .font(.system(size: 14, weight: .medium, design: .rounded))
           .foregroundStyle(Color.white.opacity(0.72))
           .multilineTextAlignment(.center)
-          .frame(maxWidth: 320)
+          .frame(maxWidth: 340)
 
         Spacer()
       }
@@ -5754,7 +5845,7 @@ private struct NativeARExperienceView: View {
       }
     }
     .task {
-      if case .passAndPlay(_) = mode {
+      if mode.usesLocalMatchLog {
         await matchLog.prepareRemoteGameIfNeeded()
       } else {
         await queueMatch.activateMatchSync()
@@ -5779,7 +5870,7 @@ private struct NativeARExperienceView: View {
       commentary.unbindRecentHistoryProvider()
       commentary.unbindReactionHandler()
       switch mode {
-      case .passAndPlay(_):
+      case .passAndPlay(_), .playVsStockfish:
         matchLog.resetSession()
       case .queueMatch:
         Task {
@@ -6147,12 +6238,14 @@ private struct NativeARExperienceView: View {
       return playerMode.title + " Mode"
     case .queueMatch:
       return "Queue Match"
+    case .playVsStockfish(let configuration):
+      return "Stockfish Match • You are \(configuration.humanColor.displayName)"
     }
   }
 
   private var activeEntries: [MatchLogStore.Entry] {
     switch mode {
-    case .passAndPlay(_):
+    case .passAndPlay(_), .playVsStockfish:
       return matchLog.entries
     case .queueMatch:
       return queueMatch.logEntries
@@ -6161,7 +6254,7 @@ private struct NativeARExperienceView: View {
 
   private var activeRemoteGameID: String? {
     switch mode {
-    case .passAndPlay(_):
+    case .passAndPlay(_), .playVsStockfish:
       return matchLog.remoteGameID
     case .queueMatch:
       return queueMatch.remoteGameID
@@ -6170,7 +6263,7 @@ private struct NativeARExperienceView: View {
 
   private var activeSyncStatus: String {
     switch mode {
-    case .passAndPlay(_):
+    case .passAndPlay(_), .playVsStockfish:
       return matchLog.syncStatus
     case .queueMatch:
       return queueMatch.statusText
@@ -7317,6 +7410,7 @@ private struct NativeARView: UIViewRepresentable {
     private var brilliantMarkerPieceName: String?
     private var brilliantMarkerDisplayLink: CADisplayLink?
     private var brilliantMarkerHideWorkItem: DispatchWorkItem?
+    private var liveEngineTask: Task<Void, Never>?
     private var reviewEngineTask: Task<Void, Never>?
     private var hasTriggeredPostGameFlow = false
     private var loadedReviewCheckpointID: UUID?
@@ -7341,6 +7435,7 @@ private struct NativeARView: UIViewRepresentable {
     deinit {
       initialAnalysisTask?.cancel()
       moveAnimationTask?.cancel()
+      liveEngineTask?.cancel()
       reviewEngineTask?.cancel()
       brilliantMarkerDisplayLink?.invalidate()
       brilliantMarkerHideWorkItem?.cancel()
@@ -7358,6 +7453,9 @@ private struct NativeARView: UIViewRepresentable {
         self?.commentary.attachEngineHost(to: arView)
       }
       noteWarmupStatus("Waiting for board placement before warming Stockfish...")
+      if case .playVsStockfish(let configuration) = mode {
+        commentary.noteExternalStatus(configuration.coinTossSummary)
+      }
 
       let tapRecognizer = UITapGestureRecognizer(target: self, action: #selector(handleTap(_:)))
       arView.addGestureRecognizer(tapRecognizer)
@@ -7408,6 +7506,8 @@ private struct NativeARView: UIViewRepresentable {
               return true
             case .queueMatch:
               return self.queueAssignedColor == self.gameState.turn
+            case .playVsStockfish(let configuration):
+              return self.gameState.turn == configuration.humanColor
             }
           }
         }
@@ -7469,6 +7569,7 @@ private struct NativeARView: UIViewRepresentable {
     func syncRuntimeState(queueAssignedColor: ChessColor?) {
       self.queueAssignedColor = queueAssignedColor
       syncReviewStateIfNeeded()
+      syncAutomatedOpponentTurnIfNeeded()
     }
 
     nonisolated func session(_ session: ARSession, didAdd anchors: [ARAnchor]) {
@@ -7667,6 +7768,8 @@ private struct NativeARView: UIViewRepresentable {
         return
       }
 
+      liveEngineTask?.cancel()
+      liveEngineTask = nil
       let movingColor = gameState.turn
       let beforeState = gameState
       let afterState = gameState.applying(move)
@@ -7691,6 +7794,7 @@ private struct NativeARView: UIViewRepresentable {
               before: beforeState,
               evaluationDelta: evaluationDelta
             )
+            self.syncAutomatedOpponentTurnIfNeeded()
           }
         )
       )
@@ -7791,6 +7895,84 @@ private struct NativeARView: UIViewRepresentable {
       )
     }
 
+    private func syncAutomatedOpponentTurnIfNeeded() {
+      guard case .playVsStockfish(let configuration) = mode,
+            !gameReview.isLoading,
+            !gameReview.isReviewMode,
+            boardAnchor != nil,
+            pendingAnimatedMoves.isEmpty,
+            liveEngineTask == nil,
+            gameState.outcome == nil,
+            gameState.turn == configuration.engineColor else {
+        return
+      }
+
+      requestLiveEngineMove(for: gameState, configuration: configuration)
+    }
+
+    private func requestLiveEngineMove(
+      for state: ChessGameState,
+      configuration: StockfishMatchConfiguration
+    ) {
+      let requestedFEN = state.fenString
+      liveEngineTask?.cancel()
+      liveEngineTask = Task { @MainActor [weak self] in
+        guard let self else {
+          return
+        }
+        defer {
+          self.liveEngineTask = nil
+        }
+
+        guard case .playVsStockfish(let currentConfiguration) = self.mode,
+              currentConfiguration == configuration,
+              !self.gameReview.isLoading,
+              !self.gameReview.isReviewMode,
+              self.gameState.fenString == requestedFEN else {
+          return
+        }
+
+        guard let replyMove = await self.commentary.gameplayReplyMove(for: state) else {
+          self.commentary.noteExternalStatus("Stockfish could not produce a move.")
+          return
+        }
+
+        guard !Task.isCancelled,
+              case .playVsStockfish(let confirmedConfiguration) = self.mode,
+              confirmedConfiguration == configuration,
+              !self.gameReview.isLoading,
+              !self.gameReview.isReviewMode,
+              self.gameState.fenString == requestedFEN,
+              self.pendingAnimatedMoves.isEmpty else {
+          return
+        }
+
+        let afterState = state.applying(replyMove)
+        self.enqueueMoveAnimation(
+          AnimatedMoveContext(
+            move: replyMove,
+            beforeState: state,
+            afterState: afterState,
+            postApply: { [weak self] in
+              guard let self else {
+                return
+              }
+
+              self.matchLog.recordMove(replyMove.uciString, color: state.turn)
+              self.recordNarrativeMove(replyMove, before: state)
+              let evaluationDelta = await self.commentary.handleMove(move: replyMove, before: state, after: afterState)
+              self.recordReviewCheckpointIfNeeded(
+                for: replyMove,
+                before: state,
+                evaluationDelta: evaluationDelta
+              )
+              self.syncAutomatedOpponentTurnIfNeeded()
+            }
+          )
+        )
+      }
+    }
+
     private func recordReviewCheckpointIfNeeded(
       for move: ChessMove,
       before state: ChessGameState,
@@ -7816,17 +7998,17 @@ private struct NativeARView: UIViewRepresentable {
     }
 
     private func shouldTrackMoveForReview(moverColor: ChessColor) -> Bool {
-      switch mode {
-      case .passAndPlay(_):
-        return true
-      case .queueMatch:
-        return queueAssignedColor == moverColor
+      guard mode.supportsPostGameReview else {
+        return false
       }
+
+      return mode.humanPlayerColor(queueAssignedColor: queueAssignedColor) == moverColor
     }
 
     @MainActor
     private func maybeBeginPostGameFlowIfNeeded(after state: ChessGameState) async {
-      guard gameReview.phase == .idle,
+      guard mode.supportsPostGameReview,
+            gameReview.phase == .idle,
             !hasTriggeredPostGameFlow,
             state.outcome != nil else {
         return
@@ -7835,6 +8017,8 @@ private struct NativeARView: UIViewRepresentable {
       hasTriggeredPostGameFlow = true
       initialAnalysisTask?.cancel()
       initialAnalysisTask = nil
+      liveEngineTask?.cancel()
+      liveEngineTask = nil
       reviewEngineTask?.cancel()
       reviewEngineTask = nil
       clearSelection()
@@ -7865,6 +8049,8 @@ private struct NativeARView: UIViewRepresentable {
     }
 
     private func loadReviewCheckpoint(_ checkpoint: GameReviewCheckpoint) {
+      liveEngineTask?.cancel()
+      liveEngineTask = nil
       reviewEngineTask?.cancel()
       reviewEngineTask = nil
       initialAnalysisTask?.cancel()
@@ -8484,6 +8670,12 @@ private struct NativeARView: UIViewRepresentable {
           return false
         }
         return piece.color == assignedColor
+      case .playVsStockfish(let configuration):
+        guard configuration.humanColor == gameState.turn else {
+          clearSelection()
+          return false
+        }
+        return piece.color == configuration.humanColor
       }
     }
 
@@ -8841,6 +9033,7 @@ private struct NativeARView: UIViewRepresentable {
 
       trackedPlaneID = selectedPlane.identifier
       maybeScheduleInitialAnalysis()
+      syncAutomatedOpponentTurnIfNeeded()
     }
 
     private func updateTrackingReadiness(_ frame: ARFrame) {
@@ -8896,6 +9089,7 @@ private struct NativeARView: UIViewRepresentable {
         }
 
         await self.commentary.prepare(with: self.gameState, force: true)
+        self.syncAutomatedOpponentTurnIfNeeded()
       }
     }
 
