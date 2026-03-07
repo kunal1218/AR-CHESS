@@ -388,6 +388,17 @@ def build_gemini_coach_query() -> str:
     )
 
 
+def build_gemini_coach_repair_query(payload: GeminiCoachRequest, previous_response: str) -> str:
+    trimmed_previous = re.sub(r"\s+", " ", previous_response).strip()
+    return (
+        "Return STRICT JSON only for this chess commentary task. "
+        "If the previous response was malformed, ignore its formatting but preserve any useful chess ideas. "
+        f"Current FEN: {payload.fen}. "
+        f"Previous response: {trimmed_previous or '(empty)'}. "
+        "Return exactly one JSON object with side_to_move, top_3_workers, top_3_traitors, and coach_lines."
+    )
+
+
 GEMINI_COACH_RESPONSE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "required": ["side_to_move", "top_3_workers", "top_3_traitors", "coach_lines"],
@@ -432,6 +443,50 @@ GEMINI_COACH_RESPONSE_SCHEMA: dict[str, Any] = {
         },
     },
 }
+GEMINI_COACH_RESPONSE_OPENAPI_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "side_to_move": {
+            "type": "string",
+            "enum": ["white", "black"],
+        },
+        "top_3_workers": {
+            "type": "array",
+            "minItems": 3,
+            "maxItems": 3,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "piece": {"type": "string"},
+                    "square": {"type": "string"},
+                    "reason": {"type": "string"},
+                },
+                "required": ["piece", "square", "reason"],
+            },
+        },
+        "top_3_traitors": {
+            "type": "array",
+            "minItems": 3,
+            "maxItems": 3,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "piece": {"type": "string"},
+                    "square": {"type": "string"},
+                    "reason": {"type": "string"},
+                },
+                "required": ["piece", "square", "reason"],
+            },
+        },
+        "coach_lines": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 3,
+            "items": {"type": "string"},
+        },
+    },
+    "required": ["side_to_move", "top_3_workers", "top_3_traitors", "coach_lines"],
+}
 
 
 def _extract_json_object(raw_text: str) -> str:
@@ -460,6 +515,19 @@ def parse_gemini_coach_response(raw_text: str) -> GeminiCoachResponse:
     return response
 
 
+def extract_generate_content_text(body: dict[str, Any]) -> str:
+    candidates = body.get("candidates") or []
+    if not candidates:
+        raise ValueError("Gemini coach response contained no candidates.")
+
+    parts = ((candidates[0].get("content") or {}).get("parts") or [])
+    text_parts = [part.get("text", "") for part in parts if isinstance(part, dict)]
+    raw_text = "".join(text_parts).strip()
+    if not raw_text:
+        raise ValueError("Gemini coach response contained no text.")
+    return raw_text
+
+
 def validate_gemini_coach_configuration() -> None:
     api_key = (os.getenv("GEMINI_API_KEY") or "").strip()
     if not api_key:
@@ -472,68 +540,91 @@ def validate_gemini_coach_configuration() -> None:
 async def fetch_gemini_coach_commentary(payload: GeminiCoachRequest) -> GeminiCoachResponse:
     validate_gemini_coach_configuration()
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_COACH_MODEL}:generateContent"
-    request_payload = {
-        "systemInstruction": {
-            "parts": [{"text": GEMINI_COACH_SYSTEM_PROMPT}],
-        },
-        "contents": [
-            {
-                "role": "user",
-                "parts": [
-                    {
-                        "text": (
-                            f"{build_gemini_coach_query()} "
-                            f"Current FEN: {payload.fen}. "
-                            "Return only one JSON object."
-                        )
-                    }
-                ],
-            }
-        ],
-        "generationConfig": {
-            "temperature": env_float("GEMINI_COACH_TEMPERATURE", 0.3),
-            "topP": env_float("GEMINI_COACH_TOP_P", 0.9),
-            "topK": env_int("GEMINI_COACH_TOP_K", 32),
-            "maxOutputTokens": env_int("GEMINI_COACH_MAX_OUTPUT_TOKENS", 480),
-            "responseMimeType": "application/json",
-            "responseJsonSchema": GEMINI_COACH_RESPONSE_SCHEMA,
-        },
-    }
-
-    async with httpx.AsyncClient(timeout=GEMINI_COACH_TIMEOUT_SECONDS) as client:
-        response = await client.post(
-            url,
-            headers={
-                "Content-Type": "application/json",
-                "x-goog-api-key": os.getenv("GEMINI_API_KEY", "").strip(),
+    async def request_structured_text(
+        *,
+        prompt_text: str,
+        schema_field: str,
+        schema_value: dict[str, Any],
+        temperature: float,
+    ) -> str:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_COACH_MODEL}:generateContent"
+        request_payload = {
+            "systemInstruction": {
+                "parts": [{"text": GEMINI_COACH_SYSTEM_PROMPT}],
             },
-            json=request_payload,
-        )
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [{"text": prompt_text}],
+                }
+            ],
+            "generationConfig": {
+                "temperature": temperature,
+                "topP": env_float("GEMINI_COACH_TOP_P", 0.9),
+                "topK": env_int("GEMINI_COACH_TOP_K", 32),
+                "maxOutputTokens": env_int("GEMINI_COACH_MAX_OUTPUT_TOKENS", 480),
+                "responseMimeType": "application/json",
+                schema_field: schema_value,
+            },
+        }
 
-    if response.status_code == 429:
-        raise GeminiLiveBusyError("Gemini coach request is rate limited. Try again in a moment.")
+        async with httpx.AsyncClient(timeout=GEMINI_COACH_TIMEOUT_SECONDS) as client:
+            response = await client.post(
+                url,
+                headers={
+                    "Content-Type": "application/json",
+                    "x-goog-api-key": os.getenv("GEMINI_API_KEY", "").strip(),
+                },
+                json=request_payload,
+            )
 
-    if response.status_code in {400, 401, 403}:
-        raise GeminiLiveConfigurationError(response.text)
+        if response.status_code == 429:
+            raise GeminiLiveBusyError("Gemini coach request is rate limited. Try again in a moment.")
 
-    if response.status_code >= 500:
-        raise GeminiLiveConnectionError(response.text)
+        if response.status_code in {400, 401, 403}:
+            raise GeminiLiveConfigurationError(response.text)
 
-    response.raise_for_status()
+        if response.status_code >= 500:
+            raise GeminiLiveConnectionError(response.text)
 
-    body = response.json()
-    candidates = body.get("candidates") or []
-    if not candidates:
-        raise ValueError("Gemini coach response contained no candidates.")
+        response.raise_for_status()
+        return extract_generate_content_text(response.json())
 
-    parts = ((candidates[0].get("content") or {}).get("parts") or [])
-    text_parts = [part.get("text", "") for part in parts if isinstance(part, dict)]
-    raw_text = "".join(text_parts).strip()
-    if not raw_text:
-        raise ValueError("Gemini coach response contained no text.")
+    initial_prompt = (
+        f"{build_gemini_coach_query()} "
+        f"Current FEN: {payload.fen}. "
+        "Return only one JSON object."
+    )
 
-    return parse_gemini_coach_response(raw_text)
+    raw_text = await request_structured_text(
+        prompt_text=initial_prompt,
+        schema_field="responseJsonSchema",
+        schema_value=GEMINI_COACH_RESPONSE_SCHEMA,
+        temperature=env_float("GEMINI_COACH_TEMPERATURE", 0.3),
+    )
+    with suppress(ValueError):
+        return parse_gemini_coach_response(raw_text)
+
+    logger.warning("Gemini coach JSON parse failed on responseJsonSchema path: %s", raw_text[:240])
+
+    raw_text = await request_structured_text(
+        prompt_text=initial_prompt,
+        schema_field="responseSchema",
+        schema_value=GEMINI_COACH_RESPONSE_OPENAPI_SCHEMA,
+        temperature=0.2,
+    )
+    with suppress(ValueError):
+        return parse_gemini_coach_response(raw_text)
+
+    logger.warning("Gemini coach JSON parse failed on responseSchema path: %s", raw_text[:240])
+
+    repaired_text = await request_structured_text(
+        prompt_text=build_gemini_coach_repair_query(payload, raw_text),
+        schema_field="responseSchema",
+        schema_value=GEMINI_COACH_RESPONSE_OPENAPI_SCHEMA,
+        temperature=0.1,
+    )
+    return parse_gemini_coach_response(repaired_text)
 
 
 GEMINI_LIVE_CLIENT = GeminiLiveClient(

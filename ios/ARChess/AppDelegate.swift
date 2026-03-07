@@ -1359,6 +1359,8 @@ private struct StockfishAnalysis {
   }
 
   var normalizedScore: Int {
+    // Mate scores need a stable numeric ordering so review checkpoints can compare
+    // and sort eval drops without special-casing every mate transition.
     if let mateIn {
       let magnitude = max(1, 100_000 - (abs(mateIn) * 1_000))
       return mateIn >= 0 ? magnitude : -magnitude
@@ -1373,6 +1375,10 @@ private struct StockfishAnalysis {
 
   var blackPerspectiveScore: Int {
     -whitePerspectiveScore
+  }
+
+  func perspectiveScore(for color: ChessColor) -> Int {
+    color == .white ? whitePerspectiveScore : blackPerspectiveScore
   }
 
   func formattedEval(for color: ChessColor) -> String {
@@ -1721,6 +1727,134 @@ private enum MoveClassification: String {
 
   var label: String {
     rawValue.capitalized
+  }
+}
+
+private struct MoveEvaluationDelta {
+  let evalBefore: Int
+  let evalAfter: Int
+
+  var deltaW: Int {
+    evalAfter - evalBefore
+  }
+}
+
+private enum GameReviewPhase: Equatable {
+  case idle
+  case loading
+  case active
+}
+
+private struct GameReviewCheckpoint: Identifiable, Equatable {
+  let id = UUID()
+  let fenBeforeMistake: String
+  let moveIndex: Int
+  let blunderMove: String
+  // Evals are always normalized to the mover's perspective. Mate scores are stored as
+  // large centipawn-like sentinels so sorting keeps the same direction as raw Stockfish.
+  let evalBefore: Int
+  let evalAfter: Int
+  let deltaW: Int
+  let playerColor: ChessColor
+}
+
+@MainActor
+private final class GameReviewStore: ObservableObject {
+  private static let maximumCheckpointCount = 3
+  private static let loadingDelayNs: UInt64 = 350_000_000
+
+  @Published private(set) var phase: GameReviewPhase = .idle
+  @Published private(set) var reviewCheckpoints: [GameReviewCheckpoint] = []
+  @Published private(set) var currentReviewIndex = 0
+  @Published private(set) var checkpointReloadVersion = 0
+
+  private var recordedDrops: [GameReviewCheckpoint] = []
+
+  var currentCheckpoint: GameReviewCheckpoint? {
+    guard reviewCheckpoints.indices.contains(currentReviewIndex) else {
+      return nil
+    }
+
+    return reviewCheckpoints[currentReviewIndex]
+  }
+
+  var isLoading: Bool {
+    phase == .loading
+  }
+
+  var isReviewMode: Bool {
+    phase == .active
+  }
+
+  func recordNegativeDrop(_ checkpoint: GameReviewCheckpoint) {
+    guard phase == .idle, checkpoint.deltaW < 0 else {
+      return
+    }
+
+    recordedDrops.append(checkpoint)
+  }
+
+  func prepareReviewSequence() async -> Bool {
+    phase = .loading
+    reviewCheckpoints = []
+    currentReviewIndex = 0
+    checkpointReloadVersion += 1
+
+    let selected = Array(
+      recordedDrops
+        .sorted(by: { $0.deltaW < $1.deltaW })
+        .prefix(Self.maximumCheckpointCount)
+    )
+
+    try? await Task.sleep(nanoseconds: Self.loadingDelayNs)
+
+    guard !Task.isCancelled else {
+      resetSession()
+      return false
+    }
+
+    guard !selected.isEmpty else {
+      resetSession()
+      return false
+    }
+
+    reviewCheckpoints = selected
+    currentReviewIndex = 0
+    checkpointReloadVersion += 1
+    phase = .active
+    return true
+  }
+
+  func restartCurrentCheckpoint() {
+    guard phase == .active, currentCheckpoint != nil else {
+      return
+    }
+
+    checkpointReloadVersion += 1
+  }
+
+  func advanceToNextCheckpoint() -> Bool {
+    guard phase == .active else {
+      return true
+    }
+
+    let nextIndex = currentReviewIndex + 1
+    guard reviewCheckpoints.indices.contains(nextIndex) else {
+      resetSession()
+      return true
+    }
+
+    currentReviewIndex = nextIndex
+    checkpointReloadVersion += 1
+    return false
+  }
+
+  func resetSession() {
+    phase = .idle
+    reviewCheckpoints = []
+    currentReviewIndex = 0
+    checkpointReloadVersion = 0
+    recordedDrops = []
   }
 }
 
@@ -3632,6 +3766,23 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     return analysis.topUniqueMoves.contains { $0.move == move.uciString }
   }
 
+  func reviewReplyMove(for state: ChessGameState) async -> ChessMove? {
+    do {
+      let analysis = try await analyzer.analyze(
+        fen: state.fenString,
+        options: .realtime(
+          movetimeMs: Self.preferredMovetimeMs,
+          hardTimeoutMs: Self.preferredHardTimeoutMs,
+          multiPV: StockfishAnalysisDefaults.multiPV
+        )
+      )
+      let preferredMove = preferredReviewCandidateMove(from: analysis)
+      return preferredMove.flatMap { state.move(forUCI: $0) }
+    } catch {
+      return nil
+    }
+  }
+
   func setStockfishDebugVisible(_ isVisible: Bool) {
     stockfishDebugVisible = isVisible
     guard isVisible else {
@@ -3708,22 +3859,22 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     move: ChessMove,
     before beforeState: ChessGameState,
     after afterState: ChessGameState
-  ) async {
+  ) async -> MoveEvaluationDelta? {
     completedPlyCount += 1
     let beforeAnalysis = await analysisForCurrentTurn(state: beforeState)
     let afterAnalysis = await analysisForCurrentTurn(state: afterState)
+    let evaluationDelta = moveEvaluationDelta(
+      before: beforeAnalysis,
+      after: afterAnalysis,
+      moverColor: beforeState.turn
+    )
 
     if let afterAnalysis {
       cachedAnalysis = CachedAnalysis(fen: afterState.fenString, analysis: afterAnalysis)
       updateAnalysisPresentation(afterAnalysis)
       analysisStatus = "Stockfish movetime \(Self.preferredMovetimeMs)ms live."
       await refreshStockfishDebugMoves(for: afterState, currentAnalysis: afterAnalysis)
-      let shouldNarrateHintOnDrop: Bool
-      if let swing = evalSwing(before: beforeAnalysis, after: afterAnalysis, moverColor: beforeState.turn) {
-        shouldNarrateHintOnDrop = swing >= Self.substantialGainThreshold
-      } else {
-        shouldNarrateHintOnDrop = false
-      }
+      let shouldNarrateHintOnDrop = (evaluationDelta?.deltaW ?? 0) >= Self.substantialGainThreshold
       prefetchHint(for: afterState, analysis: afterAnalysis, narrateWhenReady: shouldNarrateHintOnDrop)
       scheduleCoachCommentary(for: afterState)
     } else if analyzer.lastError != nil {
@@ -3762,10 +3913,10 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       if speakRandomLine(from: checkmateLines(), priority: .urgent) {
         scheduleNextCommentaryWindow()
       }
-      return
+      return evaluationDelta
     }
 
-    if let swing = evalSwing(before: beforeAnalysis, after: afterAnalysis, moverColor: beforeState.turn) {
+    if let swing = evaluationDelta?.deltaW {
       if swing >= Self.substantialGainThreshold {
         reactionHandler?(ReactionCue(kind: .enemyKingPrays(color: beforeState.turn.opponent)))
       } else if swing <= Self.substantialDropThreshold {
@@ -3785,7 +3936,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
            ) {
           noteKingCookedSpoken(for: beforeState.turn)
           scheduleNextCommentaryWindow()
-          return
+          return evaluationDelta
         }
       }
     }
@@ -3796,7 +3947,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     }
 
     guard completedPlyCount >= nextCommentaryPly else {
-      return
+      return evaluationDelta
     }
 
     let dialogueLines: [SpokenLine]
@@ -3816,6 +3967,8 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     if speakRandomLine(from: dialogueLines, priority: priority) {
       scheduleNextCommentaryWindow()
     }
+
+    return evaluationDelta
   }
 
   func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didStart utterance: AVSpeechUtterance) {
@@ -4018,23 +4171,32 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     after: StockfishAnalysis?,
     moverColor: ChessColor
   ) -> Int? {
+    moveEvaluationDelta(before: before, after: after, moverColor: moverColor)?.deltaW
+  }
+
+  private func moveEvaluationDelta(
+    before: StockfishAnalysis?,
+    after: StockfishAnalysis?,
+    moverColor: ChessColor
+  ) -> MoveEvaluationDelta? {
     guard let before, let after else {
       return nil
     }
 
-    let beforeScore = scoreForMoverPerspective(before, moverColor: moverColor, isPostMove: false)
-    let afterScore = scoreForMoverPerspective(after, moverColor: moverColor, isPostMove: true)
-    return afterScore - beforeScore
+    return MoveEvaluationDelta(
+      evalBefore: before.perspectiveScore(for: moverColor),
+      evalAfter: after.perspectiveScore(for: moverColor)
+    )
   }
 
-  private func scoreForMoverPerspective(_ analysis: StockfishAnalysis, moverColor: ChessColor, isPostMove: Bool) -> Int {
-    let sideToMoveScore = analysis.normalizedScore
-    _ = moverColor
-    if isPostMove {
-      return -sideToMoveScore
-    }
-
-    return sideToMoveScore
+  private func preferredReviewCandidateMove(from analysis: StockfishAnalysis) -> String? {
+    // Review mode deliberately chooses a softer engine reply so the player can
+    // continue the position instead of getting crushed by the top line every time.
+    let rankedMoves = analysis.topUniqueMoves.compactMap(\.move)
+    return rankedMoves.dropFirst(2).first
+      ?? rankedMoves.dropFirst().first
+      ?? rankedMoves.first
+      ?? analysis.bestMove
   }
 
   private func describe(analysis: StockfishAnalysis, moverColor: ChessColor) -> String {
@@ -4962,21 +5124,35 @@ private struct ARChessRootView: View {
           }
         )
       case .experience(let mode):
-        NativeARExperienceView(mode: mode, queueMatch: queueMatch) {
-          switch mode {
-          case .passAndPlay(let playerMode):
-            withAnimation(.spring(response: 0.42, dampingFraction: 0.88)) {
-              screen = .lobby(playerMode)
+        NativeARExperienceView(
+          mode: mode,
+          queueMatch: queueMatch,
+          closeExperience: {
+            switch mode {
+            case .passAndPlay(let playerMode):
+              withAnimation(.spring(response: 0.42, dampingFraction: 0.88)) {
+                screen = .lobby(playerMode)
+              }
+            case .queueMatch:
+              Task {
+                await queueMatch.exitQueueFlow()
+              }
+              withAnimation(.spring(response: 0.42, dampingFraction: 0.88)) {
+                screen = .queueMatch
+              }
             }
-          case .queueMatch:
-            Task {
-              await queueMatch.exitQueueFlow()
+          },
+          returnHome: {
+            if case .queueMatch = mode {
+              Task {
+                await queueMatch.exitQueueFlow()
+              }
             }
             withAnimation(.spring(response: 0.42, dampingFraction: 0.88)) {
-              screen = .queueMatch
+              screen = .modeSelection
             }
           }
-        }
+        )
       }
     }
   }
@@ -5300,8 +5476,10 @@ private struct NativeARExperienceView: View {
   let mode: ExperienceMode
   @ObservedObject var queueMatch: QueueMatchStore
   let closeExperience: () -> Void
+  let returnHome: () -> Void
   @StateObject private var matchLog = MatchLogStore()
   @StateObject private var commentary = PiecePersonalityDirector()
+  @StateObject private var gameReview = GameReviewStore()
   @State private var isModePanelVisible = false
   @State private var isMatchLogVisible = false
   @State private var isGeminiDebugVisible = false
@@ -5309,7 +5487,14 @@ private struct NativeARExperienceView: View {
 
   var body: some View {
     ZStack {
-      NativeARView(matchLog: matchLog, queueMatch: queueMatch, mode: mode, commentary: commentary)
+      NativeARView(
+        matchLog: matchLog,
+        queueMatch: queueMatch,
+        mode: mode,
+        commentary: commentary,
+        gameReview: gameReview,
+        onReviewFinished: returnHome
+      )
         .ignoresSafeArea()
 
       LinearGradient(
@@ -5324,238 +5509,248 @@ private struct NativeARExperienceView: View {
       .ignoresSafeArea()
       .allowsHitTesting(false)
 
-      VStack(spacing: 16) {
-        if isModePanelVisible {
-          ScrollView(showsIndicators: true) {
-            VStack(alignment: .leading, spacing: 10) {
-              Text(modeTitle)
-                .font(.system(size: 12, weight: .bold, design: .rounded))
-                .tracking(2.0)
-                .foregroundStyle(Color(red: 0.87, green: 0.79, blue: 0.64))
+      if gameReview.phase == .idle {
+        VStack(spacing: 16) {
+          if isModePanelVisible {
+            ScrollView(showsIndicators: true) {
+              VStack(alignment: .leading, spacing: 10) {
+                Text(modeTitle)
+                  .font(.system(size: 12, weight: .bold, design: .rounded))
+                  .tracking(2.0)
+                  .foregroundStyle(Color(red: 0.87, green: 0.79, blue: 0.64))
 
-              Text("Native AR Sandbox")
-                .font(.system(size: 30, weight: .heavy, design: .rounded))
-                .foregroundStyle(.white)
+                Text("Native AR Sandbox")
+                  .font(.system(size: 30, weight: .heavy, design: .rounded))
+                  .foregroundStyle(.white)
 
-              Text("RealityKit and ARKit are running inside the iOS app. Tap a piece, then tap a highlighted square to move it. Legal moves log in UCI and sync to Railway when ARChessAPIBaseURL is configured.")
-                .font(.system(size: 15, weight: .medium, design: .rounded))
-                .foregroundStyle(Color.white.opacity(0.86))
-                .lineSpacing(3)
-
-              Text(commentary.analysisStatus)
-                .font(.system(size: 12, weight: .semibold, design: .rounded))
-                .foregroundStyle(Color(red: 0.88, green: 0.82, blue: 0.70))
-
-              Text(commentary.hintStatusText)
-                .font(.system(size: 13, weight: .bold, design: .rounded))
-                .foregroundStyle(Color.white.opacity(0.92))
-
-              if commentary.isHintLoading {
-                HStack(spacing: 10) {
-                  ProgressView()
-                    .tint(Color.white.opacity(0.92))
-
-                  Text("Loading hint...")
-                    .font(.system(size: 12, weight: .semibold, design: .rounded))
-                    .foregroundStyle(Color.white.opacity(0.78))
-                }
-              }
-
-              if let visibleHintText = commentary.visibleHintText {
-                Text(visibleHintText)
-                  .font(.system(size: 15, weight: .semibold, design: .rounded))
-                  .foregroundStyle(Color(red: 0.96, green: 0.92, blue: 0.82))
+                Text("RealityKit and ARKit are running inside the iOS app. Tap a piece, then tap a highlighted square to move it. Legal moves log in UCI and sync to Railway when ARChessAPIBaseURL is configured.")
+                  .font(.system(size: 15, weight: .medium, design: .rounded))
+                  .foregroundStyle(Color.white.opacity(0.86))
                   .lineSpacing(3)
-              }
 
-              HStack(spacing: 10) {
-                VStack(alignment: .leading, spacing: 4) {
-                  Text(commentary.whiteEvalText)
-                    .font(.system(size: 12, weight: .bold, design: .rounded))
-                    .foregroundStyle(Color.white.opacity(0.94))
+                Text(commentary.analysisStatus)
+                  .font(.system(size: 12, weight: .semibold, design: .rounded))
+                  .foregroundStyle(Color(red: 0.88, green: 0.82, blue: 0.70))
 
-                  Text(commentary.blackEvalText)
-                    .font(.system(size: 12, weight: .bold, design: .rounded))
-                    .foregroundStyle(Color.white.opacity(0.88))
+                Text(commentary.hintStatusText)
+                  .font(.system(size: 13, weight: .bold, design: .rounded))
+                  .foregroundStyle(Color.white.opacity(0.92))
 
-                  Text(commentary.analysisTimingText)
-                    .font(.system(size: 11, weight: .semibold, design: .rounded))
-                    .foregroundStyle(Color.white.opacity(0.66))
+                if commentary.isHintLoading {
+                  HStack(spacing: 10) {
+                    ProgressView()
+                      .tint(Color.white.opacity(0.92))
+
+                    Text("Loading hint...")
+                      .font(.system(size: 12, weight: .semibold, design: .rounded))
+                      .foregroundStyle(Color.white.opacity(0.78))
+                  }
                 }
 
-                Spacer(minLength: 12)
+                if let visibleHintText = commentary.visibleHintText {
+                  Text(visibleHintText)
+                    .font(.system(size: 15, weight: .semibold, design: .rounded))
+                    .foregroundStyle(Color(red: 0.96, green: 0.92, blue: 0.82))
+                    .lineSpacing(3)
+                }
 
-                VStack(spacing: 8) {
-                  NativeActionButton(title: "Hint", style: .outline) {
-                    commentary.revealHint()
+                HStack(spacing: 10) {
+                  VStack(alignment: .leading, spacing: 4) {
+                    Text(commentary.whiteEvalText)
+                      .font(.system(size: 12, weight: .bold, design: .rounded))
+                      .foregroundStyle(Color.white.opacity(0.94))
+
+                    Text(commentary.blackEvalText)
+                      .font(.system(size: 12, weight: .bold, design: .rounded))
+                      .foregroundStyle(Color.white.opacity(0.88))
+
+                    Text(commentary.analysisTimingText)
+                      .font(.system(size: 11, weight: .semibold, design: .rounded))
+                      .foregroundStyle(Color.white.opacity(0.66))
                   }
 
-                  NativeActionButton(title: "Analyze current position", style: .outline) {
-                    Task {
-                      await commentary.analyzeCurrentPosition()
+                  Spacer(minLength: 12)
+
+                  VStack(spacing: 8) {
+                    NativeActionButton(title: "Hint", style: .outline) {
+                      commentary.revealHint()
+                    }
+
+                    NativeActionButton(title: "Analyze current position", style: .outline) {
+                      Task {
+                        await commentary.analyzeCurrentPosition()
+                      }
                     }
                   }
                 }
               }
+              .frame(maxWidth: .infinity, alignment: .leading)
+              .padding(18)
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(18)
+            .frame(maxWidth: .infinity, maxHeight: overlayPanelMaxHeight(ratio: 0.36), alignment: .top)
+            .background(
+              RoundedRectangle(cornerRadius: 26, style: .continuous)
+                .fill(.ultraThinMaterial)
+            )
+            .transition(.move(edge: .top).combined(with: .opacity))
           }
-          .frame(maxWidth: .infinity, maxHeight: overlayPanelMaxHeight(ratio: 0.36), alignment: .top)
-          .background(
-            RoundedRectangle(cornerRadius: 26, style: .continuous)
-              .fill(.ultraThinMaterial)
-          )
-          .transition(.move(edge: .top).combined(with: .opacity))
-        }
 
-        Spacer()
+          Spacer()
 
-        if let caption = commentary.caption {
-          PieceSpeechBubble(caption: caption)
-          .allowsHitTesting(false)
-          .transition(.move(edge: .bottom).combined(with: .opacity))
-        }
-
-        if isGeminiDebugVisible {
-          geminiDebugPanel
+          if let caption = commentary.caption {
+            PieceSpeechBubble(caption: caption)
+            .allowsHitTesting(false)
             .transition(.move(edge: .bottom).combined(with: .opacity))
-        }
+          }
 
-        if isStockfishDebugVisible {
-          stockfishDebugPanel
-            .transition(.move(edge: .bottom).combined(with: .opacity))
-        }
+          if isGeminiDebugVisible {
+            geminiDebugPanel
+              .transition(.move(edge: .bottom).combined(with: .opacity))
+          }
 
-        if isMatchLogVisible {
-          ScrollView(showsIndicators: true) {
-            VStack(alignment: .leading, spacing: 10) {
-              Text("Match log")
-                .font(.system(size: 12, weight: .bold, design: .rounded))
-                .tracking(1.8)
-                .foregroundStyle(Color(red: 0.88, green: 0.82, blue: 0.70))
+          if isStockfishDebugVisible {
+            stockfishDebugPanel
+              .transition(.move(edge: .bottom).combined(with: .opacity))
+          }
 
-              Text(activeSyncStatus)
-                .font(.system(size: 15, weight: .medium, design: .rounded))
-                .foregroundStyle(Color.white.opacity(0.86))
+          if isMatchLogVisible {
+            ScrollView(showsIndicators: true) {
+              VStack(alignment: .leading, spacing: 10) {
+                Text("Match log")
+                  .font(.system(size: 12, weight: .bold, design: .rounded))
+                  .tracking(1.8)
+                  .foregroundStyle(Color(red: 0.88, green: 0.82, blue: 0.70))
 
-              Text(commentary.latestAssessment)
-                .font(.system(size: 13, weight: .semibold, design: .rounded))
-                .foregroundStyle(Color.white.opacity(0.70))
+                Text(activeSyncStatus)
+                  .font(.system(size: 15, weight: .medium, design: .rounded))
+                  .foregroundStyle(Color.white.opacity(0.86))
 
-              if let remoteGameID = activeRemoteGameID {
-                Text("Game ID: \(remoteGameID)")
-                  .font(.system(size: 12, weight: .semibold, design: .rounded))
-                  .foregroundStyle(Color.white.opacity(0.62))
-                  .textSelection(.enabled)
-              }
+                Text(commentary.latestAssessment)
+                  .font(.system(size: 13, weight: .semibold, design: .rounded))
+                  .foregroundStyle(Color.white.opacity(0.70))
 
-              if activeEntries.isEmpty {
-                Text("Make a legal move to start the UCI move log.")
-                  .font(.system(size: 14, weight: .medium, design: .rounded))
-                  .foregroundStyle(Color.white.opacity(0.72))
-              } else {
-                ForEach(Array(activeEntries.suffix(6))) { entry in
-                  HStack(alignment: .firstTextBaseline, spacing: 12) {
-                    Text(entry.label)
-                      .font(.system(size: 14, weight: .bold, design: .monospaced))
-                      .foregroundStyle(.white)
+                if let remoteGameID = activeRemoteGameID {
+                  Text("Game ID: \(remoteGameID)")
+                    .font(.system(size: 12, weight: .semibold, design: .rounded))
+                    .foregroundStyle(Color.white.opacity(0.62))
+                    .textSelection(.enabled)
+                }
 
-                    Spacer(minLength: 0)
+                if activeEntries.isEmpty {
+                  Text("Make a legal move to start the UCI move log.")
+                    .font(.system(size: 14, weight: .medium, design: .rounded))
+                    .foregroundStyle(Color.white.opacity(0.72))
+                } else {
+                  ForEach(Array(activeEntries.suffix(6))) { entry in
+                    HStack(alignment: .firstTextBaseline, spacing: 12) {
+                      Text(entry.label)
+                        .font(.system(size: 14, weight: .bold, design: .monospaced))
+                        .foregroundStyle(.white)
 
-                    Text(entry.statusLabel)
-                      .font(.system(size: 11, weight: .bold, design: .rounded))
-                      .tracking(1.1)
-                      .foregroundStyle(
-                        entry.isSynced
-                          ? Color(red: 0.57, green: 0.90, blue: 0.68)
-                          : Color(red: 0.93, green: 0.78, blue: 0.54)
-                      )
+                      Spacer(minLength: 0)
+
+                      Text(entry.statusLabel)
+                        .font(.system(size: 11, weight: .bold, design: .rounded))
+                        .tracking(1.1)
+                        .foregroundStyle(
+                          entry.isSynced
+                            ? Color(red: 0.57, green: 0.90, blue: 0.68)
+                            : Color(red: 0.93, green: 0.78, blue: 0.54)
+                        )
+                    }
                   }
                 }
               }
+              .frame(maxWidth: .infinity, alignment: .leading)
+              .padding(18)
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(18)
-          }
-          .frame(maxWidth: .infinity, maxHeight: overlayPanelMaxHeight(ratio: 0.42), alignment: .top)
-          .background(
-            RoundedRectangle(cornerRadius: 24, style: .continuous)
-              .fill(Color(red: 0.05, green: 0.07, blue: 0.10).opacity(0.82))
-              .overlay(
-                RoundedRectangle(cornerRadius: 24, style: .continuous)
-                  .stroke(Color.white.opacity(0.14), lineWidth: 1)
-              )
-          )
-          .transition(.move(edge: .bottom).combined(with: .opacity))
-        }
-      }
-      .padding(.horizontal, 18)
-      .padding(.vertical, 24)
-
-      VStack {
-        HStack(alignment: .top) {
-          HStack(spacing: 10) {
-            overlayToggleButton(
-              title: isModePanelVisible ? "Hide Mode" : "Show Mode",
-              systemImage: "rectangle.topthird.inset.filled"
-            ) {
-              withAnimation(.spring(response: 0.30, dampingFraction: 0.86)) {
-                isModePanelVisible.toggle()
-              }
-            }
-
-            overlayToggleButton(
-              title: isMatchLogVisible ? "Hide Log" : "Show Log",
-              systemImage: "text.append"
-            ) {
-              withAnimation(.spring(response: 0.30, dampingFraction: 0.86)) {
-                isMatchLogVisible.toggle()
-              }
-            }
-
-            overlayToggleButton(
-              title: isGeminiDebugVisible ? "Hide Gemini Debug" : "Show Gemini Debug",
-              systemImage: "sparkles.rectangle.stack"
-            ) {
-              let nextVisible = !isGeminiDebugVisible
-              withAnimation(.spring(response: 0.30, dampingFraction: 0.86)) {
-                isGeminiDebugVisible = nextVisible
-                if nextVisible {
-                  isStockfishDebugVisible = false
-                }
-              }
-              syncStockfishDebugVisibility()
-            }
-
-            overlayToggleButton(
-              title: isStockfishDebugVisible ? "Hide Stockfish Debug" : "Show Stockfish Debug",
-              systemImage: "list.number"
-            ) {
-              let nextVisible = !isStockfishDebugVisible
-              withAnimation(.spring(response: 0.30, dampingFraction: 0.86)) {
-                isStockfishDebugVisible = nextVisible
-                if nextVisible {
-                  isGeminiDebugVisible = false
-                }
-              }
-              syncStockfishDebugVisibility()
-            }
-          }
-
-          Spacer(minLength: 16)
-
-          overlayToggleButton(
-            title: "Exit AR",
-            systemImage: "xmark"
-          ) {
-            closeExperience()
+            .frame(maxWidth: .infinity, maxHeight: overlayPanelMaxHeight(ratio: 0.42), alignment: .top)
+            .background(
+              RoundedRectangle(cornerRadius: 24, style: .continuous)
+                .fill(Color(red: 0.05, green: 0.07, blue: 0.10).opacity(0.82))
+                .overlay(
+                  RoundedRectangle(cornerRadius: 24, style: .continuous)
+                    .stroke(Color.white.opacity(0.14), lineWidth: 1)
+                )
+            )
+            .transition(.move(edge: .bottom).combined(with: .opacity))
           }
         }
         .padding(.horizontal, 18)
-        .padding(.top, 24)
+        .padding(.vertical, 24)
+      }
 
-        Spacer()
+      if gameReview.phase == .idle {
+        VStack {
+          HStack(alignment: .top) {
+            HStack(spacing: 10) {
+              overlayToggleButton(
+                title: isModePanelVisible ? "Hide Mode" : "Show Mode",
+                systemImage: "rectangle.topthird.inset.filled"
+              ) {
+                withAnimation(.spring(response: 0.30, dampingFraction: 0.86)) {
+                  isModePanelVisible.toggle()
+                }
+              }
+
+              overlayToggleButton(
+                title: isMatchLogVisible ? "Hide Log" : "Show Log",
+                systemImage: "text.append"
+              ) {
+                withAnimation(.spring(response: 0.30, dampingFraction: 0.86)) {
+                  isMatchLogVisible.toggle()
+                }
+              }
+
+              overlayToggleButton(
+                title: isGeminiDebugVisible ? "Hide Gemini Debug" : "Show Gemini Debug",
+                systemImage: "sparkles.rectangle.stack"
+              ) {
+                let nextVisible = !isGeminiDebugVisible
+                withAnimation(.spring(response: 0.30, dampingFraction: 0.86)) {
+                  isGeminiDebugVisible = nextVisible
+                  if nextVisible {
+                    isStockfishDebugVisible = false
+                  }
+                }
+                syncStockfishDebugVisibility()
+              }
+
+              overlayToggleButton(
+                title: isStockfishDebugVisible ? "Hide Stockfish Debug" : "Show Stockfish Debug",
+                systemImage: "list.number"
+              ) {
+                let nextVisible = !isStockfishDebugVisible
+                withAnimation(.spring(response: 0.30, dampingFraction: 0.86)) {
+                  isStockfishDebugVisible = nextVisible
+                  if nextVisible {
+                    isGeminiDebugVisible = false
+                  }
+                }
+                syncStockfishDebugVisibility()
+              }
+            }
+
+            Spacer(minLength: 16)
+
+            overlayToggleButton(
+              title: "Exit AR",
+              systemImage: "xmark"
+            ) {
+              closeExperience()
+            }
+          }
+          .padding(.horizontal, 18)
+          .padding(.top, 24)
+
+          Spacer()
+        }
+      }
+
+      if gameReview.isLoading {
+        reviewLoadingOverlay
+      } else if gameReview.isReviewMode {
+        reviewCheckpointOverlay
       }
     }
     .task {
@@ -5565,7 +5760,19 @@ private struct NativeARExperienceView: View {
         await queueMatch.activateMatchSync()
       }
     }
+    .onChange(of: gameReview.phase) { phase in
+      guard phase != .idle else {
+        return
+      }
+
+      isModePanelVisible = false
+      isMatchLogVisible = false
+      isGeminiDebugVisible = false
+      isStockfishDebugVisible = false
+      syncStockfishDebugVisibility()
+    }
     .onDisappear {
+      gameReview.resetSession()
       commentary.resetSession()
       commentary.unbindStateProvider()
       commentary.unbindHintAvailabilityProvider()
@@ -5602,6 +5809,103 @@ private struct NativeARExperienceView: View {
         )
     }
     .accessibilityLabel(title)
+  }
+
+  private var reviewLoadingOverlay: some View {
+    ZStack {
+      Color.black.opacity(0.72)
+        .ignoresSafeArea()
+
+      VStack(spacing: 18) {
+        Text("Game Review")
+          .font(.system(size: 34, weight: .heavy, design: .rounded))
+          .foregroundStyle(.white)
+
+        ProgressView()
+          .scaleEffect(1.15)
+          .tint(Color(red: 0.95, green: 0.88, blue: 0.73))
+
+        Text("Preparing your biggest evaluation drops...")
+          .font(.system(size: 15, weight: .semibold, design: .rounded))
+          .foregroundStyle(Color.white.opacity(0.82))
+      }
+      .padding(.horizontal, 28)
+      .padding(.vertical, 30)
+      .background(
+        RoundedRectangle(cornerRadius: 30, style: .continuous)
+          .fill(Color(red: 0.07, green: 0.10, blue: 0.14).opacity(0.92))
+          .overlay(
+            RoundedRectangle(cornerRadius: 30, style: .continuous)
+              .stroke(Color.white.opacity(0.12), lineWidth: 1)
+          )
+      )
+      .padding(.horizontal, 24)
+    }
+  }
+
+  private var reviewCheckpointOverlay: some View {
+    VStack {
+      if let checkpoint = gameReview.currentCheckpoint {
+        HStack(alignment: .top, spacing: 16) {
+          VStack(alignment: .leading, spacing: 8) {
+            Text("Game Review")
+              .font(.system(size: 12, weight: .bold, design: .rounded))
+              .tracking(2.0)
+              .foregroundStyle(Color(red: 0.88, green: 0.82, blue: 0.70))
+
+            Text("Checkpoint \(gameReview.currentReviewIndex + 1) of \(gameReview.reviewCheckpoints.count)")
+              .font(.system(size: 24, weight: .heavy, design: .rounded))
+              .foregroundStyle(.white)
+
+            Text("Replay \(commentaryHumanMove(checkpoint.blunderMove)) from ply \(checkpoint.moveIndex).")
+              .font(.system(size: 14, weight: .semibold, design: .rounded))
+              .foregroundStyle(Color.white.opacity(0.88))
+              .lineSpacing(2)
+
+            Text("Eval drop: \(formattedReviewDelta(checkpoint.deltaW))")
+              .font(.system(size: 12, weight: .bold, design: .rounded))
+              .foregroundStyle(Color(red: 0.95, green: 0.88, blue: 0.73))
+          }
+          .padding(18)
+          .background(
+            RoundedRectangle(cornerRadius: 24, style: .continuous)
+              .fill(Color(red: 0.07, green: 0.10, blue: 0.14).opacity(0.88))
+              .overlay(
+                RoundedRectangle(cornerRadius: 24, style: .continuous)
+                  .stroke(Color.white.opacity(0.12), lineWidth: 1)
+              )
+          )
+
+          Spacer(minLength: 0)
+
+          VStack(spacing: 10) {
+            NativeActionButton(title: "Try again", style: .outline) {
+              gameReview.restartCurrentCheckpoint()
+            }
+            .frame(width: 170)
+
+            NativeActionButton(title: "I give up", style: .solid) {
+              if gameReview.advanceToNextCheckpoint() {
+                returnHome()
+              }
+            }
+            .frame(width: 170)
+          }
+        }
+        .padding(.horizontal, 18)
+        .padding(.top, 24)
+      }
+
+      Spacer()
+    }
+  }
+
+  private func formattedReviewDelta(_ delta: Int) -> String {
+    if abs(delta) >= 90_000 {
+      return delta < 0 ? "mate collapse" : "mate gain"
+    }
+
+    return String(format: "%+.2f pawns", Double(delta) / 100.0)
   }
 
   private var geminiDebugPanel: some View {
@@ -6117,6 +6421,25 @@ private enum ChessPieceKind {
       return 1
     }
   }
+
+  init?(fenSymbol: Character) {
+    switch String(fenSymbol).lowercased() {
+    case "p":
+      self = .pawn
+    case "r":
+      self = .rook
+    case "n":
+      self = .knight
+    case "b":
+      self = .bishop
+    case "q":
+      self = .queen
+    case "k":
+      self = .king
+    default:
+      return nil
+    }
+  }
 }
 
 private struct BoardSquare: Hashable {
@@ -6210,12 +6533,33 @@ private struct ChessMove {
 }
 
 private struct ChessGameState {
+  enum GameOutcome: Equatable {
+    case checkmate(winner: ChessColor)
+    case stalemate
+  }
+
   var board: [BoardSquare: ChessPieceState]
   var turn: ChessColor
   var castlingRights: CastlingRights
   var enPassantTarget: BoardSquare?
   var halfmoveClock: Int
   var fullmoveNumber: Int
+
+  init(
+    board: [BoardSquare: ChessPieceState],
+    turn: ChessColor,
+    castlingRights: CastlingRights,
+    enPassantTarget: BoardSquare?,
+    halfmoveClock: Int,
+    fullmoveNumber: Int
+  ) {
+    self.board = board
+    self.turn = turn
+    self.castlingRights = castlingRights
+    self.enPassantTarget = enPassantTarget
+    self.halfmoveClock = halfmoveClock
+    self.fullmoveNumber = fullmoveNumber
+  }
 
   static func initial() -> ChessGameState {
     let backRank: [ChessPieceKind] = [.rook, .knight, .bishop, .queen, .king, .bishop, .knight, .rook]
@@ -6236,6 +6580,58 @@ private struct ChessGameState {
       halfmoveClock: 0,
       fullmoveNumber: 1
     )
+  }
+
+  init(fen: String) throws {
+    let validatedFEN = try StockfishFENValidator.validate(fen)
+    let fields = validatedFEN.fen.split(separator: " ", omittingEmptySubsequences: false).map(String.init)
+    let placement = fields[0]
+    let castling = fields[2]
+    let enPassant = fields[3]
+
+    var parsedBoard: [BoardSquare: ChessPieceState] = [:]
+    let ranks = placement.split(separator: "/", omittingEmptySubsequences: false)
+
+    for (rankOffset, rankText) in ranks.enumerated() {
+      let rank = 7 - rankOffset
+      var file = 0
+
+      for character in rankText {
+        if let emptySquares = character.wholeNumberValue {
+          file += emptySquares
+          continue
+        }
+
+        guard let kind = ChessPieceKind(fenSymbol: character) else {
+          throw StockfishFENValidationError.invalidPieceCharacter(character)
+        }
+
+        let color: ChessColor = character.isUppercase ? .white : .black
+        let square = BoardSquare(file: file, rank: rank)
+        parsedBoard[square] = ChessPieceState(color: color, kind: kind)
+        file += 1
+      }
+    }
+
+    var rights = CastlingRights(
+      whiteKingside: false,
+      whiteQueenside: false,
+      blackKingside: false,
+      blackQueenside: false
+    )
+    if castling != "-" {
+      rights.whiteKingside = castling.contains("K")
+      rights.whiteQueenside = castling.contains("Q")
+      rights.blackKingside = castling.contains("k")
+      rights.blackQueenside = castling.contains("q")
+    }
+
+    board = parsedBoard
+    turn = validatedFEN.sideToMove
+    castlingRights = rights
+    enPassantTarget = enPassant == "-" ? nil : BoardSquare(algebraic: enPassant)
+    halfmoveClock = Int(fields[4]) ?? 0
+    fullmoveNumber = Int(fields[5]) ?? 1
   }
 
   var fenString: String {
@@ -6352,6 +6748,20 @@ private struct ChessGameState {
 
   func isCheckmate(for color: ChessColor) -> Bool {
     isInCheck(for: color) && !hasLegalMoves(for: color)
+  }
+
+  func isStalemate(for color: ChessColor) -> Bool {
+    !isInCheck(for: color) && !hasLegalMoves(for: color)
+  }
+
+  var outcome: GameOutcome? {
+    if isCheckmate(for: turn) {
+      return .checkmate(winner: turn.opponent)
+    }
+    if isStalemate(for: turn) {
+      return .stalemate
+    }
+    return nil
   }
 
   func applying(_ move: ChessMove) -> ChessGameState {
@@ -6825,9 +7235,18 @@ private struct NativeARView: UIViewRepresentable {
   @ObservedObject var queueMatch: QueueMatchStore
   let mode: ExperienceMode
   @ObservedObject var commentary: PiecePersonalityDirector
+  @ObservedObject var gameReview: GameReviewStore
+  let onReviewFinished: () -> Void
 
   func makeCoordinator() -> Coordinator {
-    Coordinator(matchLog: matchLog, queueMatch: queueMatch, mode: mode, commentary: commentary)
+    Coordinator(
+      matchLog: matchLog,
+      queueMatch: queueMatch,
+      mode: mode,
+      commentary: commentary,
+      gameReview: gameReview,
+      onReviewFinished: onReviewFinished
+    )
   }
 
   func makeUIView(context: Context) -> ARView {
@@ -6836,8 +7255,11 @@ private struct NativeARView: UIViewRepresentable {
     return arView
   }
 
-  func updateUIView(_ uiView: ARView, context: Context) {}
+  func updateUIView(_ uiView: ARView, context: Context) {
+    context.coordinator.syncRuntimeState(queueAssignedColor: queueMatch.assignedColor)
+  }
 
+  @MainActor
   final class Coordinator: NSObject, ARSessionDelegate {
     private struct NarrativeMove {
       let ply: Int
@@ -6865,6 +7287,8 @@ private struct NativeARView: UIViewRepresentable {
     private let queueMatch: QueueMatchStore
     private let mode: ExperienceMode
     private let commentary: PiecePersonalityDirector
+    private let gameReview: GameReviewStore
+    private let onReviewFinished: () -> Void
     private weak var arView: ARView?
     private var boardAnchor: AnchorEntity?
     private var boardWorldTransform: simd_float4x4?
@@ -6893,22 +7317,31 @@ private struct NativeARView: UIViewRepresentable {
     private var brilliantMarkerPieceName: String?
     private var brilliantMarkerDisplayLink: CADisplayLink?
     private var brilliantMarkerHideWorkItem: DispatchWorkItem?
+    private var reviewEngineTask: Task<Void, Never>?
+    private var hasTriggeredPostGameFlow = false
+    private var loadedReviewCheckpointID: UUID?
+    private var loadedReviewReloadVersion = 0
 
     init(
       matchLog: MatchLogStore,
       queueMatch: QueueMatchStore,
       mode: ExperienceMode,
-      commentary: PiecePersonalityDirector
+      commentary: PiecePersonalityDirector,
+      gameReview: GameReviewStore,
+      onReviewFinished: @escaping () -> Void
     ) {
       self.matchLog = matchLog
       self.queueMatch = queueMatch
       self.mode = mode
       self.commentary = commentary
+      self.gameReview = gameReview
+      self.onReviewFinished = onReviewFinished
     }
 
     deinit {
       initialAnalysisTask?.cancel()
       moveAnimationTask?.cancel()
+      reviewEngineTask?.cancel()
       brilliantMarkerDisplayLink?.invalidate()
       brilliantMarkerHideWorkItem?.cancel()
       AmbientMusicController.shared.stop()
@@ -7033,20 +7466,35 @@ private struct NativeARView: UIViewRepresentable {
       }
     }
 
-    func session(_ session: ARSession, didAdd anchors: [ARAnchor]) {
-      updateBoardPlacement(session: session, anchors: anchors)
+    func syncRuntimeState(queueAssignedColor: ChessColor?) {
+      self.queueAssignedColor = queueAssignedColor
+      syncReviewStateIfNeeded()
     }
 
-    func session(_ session: ARSession, didUpdate anchors: [ARAnchor]) {
-      updateBoardPlacement(session: session, anchors: anchors)
+    nonisolated func session(_ session: ARSession, didAdd anchors: [ARAnchor]) {
+      Task { @MainActor [weak self] in
+        self?.updateBoardPlacement(session: session, anchors: anchors)
+      }
     }
 
-    func session(_ session: ARSession, didUpdate frame: ARFrame) {
-      updateTrackingReadiness(frame)
+    nonisolated func session(_ session: ARSession, didUpdate anchors: [ARAnchor]) {
+      Task { @MainActor [weak self] in
+        self?.updateBoardPlacement(session: session, anchors: anchors)
+      }
+    }
+
+    nonisolated func session(_ session: ARSession, didUpdate frame: ARFrame) {
+      Task { @MainActor [weak self] in
+        self?.updateTrackingReadiness(frame)
+      }
     }
 
     @objc
     private func handleTap(_ recognizer: UITapGestureRecognizer) {
+      guard !gameReview.isLoading else {
+        return
+      }
+
       guard moveAnimationTask == nil, pendingAnimatedMoves.isEmpty else {
         return
       }
@@ -7200,6 +7648,11 @@ private struct NativeARView: UIViewRepresentable {
     }
 
     private func apply(_ move: ChessMove) {
+      if gameReview.isReviewMode {
+        applyReviewPlayerMove(move)
+        return
+      }
+
       if case .queueMatch = mode {
         let targetPly = syncedQueueMoves.count + 1
         Task { @MainActor in
@@ -7232,13 +7685,22 @@ private struct NativeARView: UIViewRepresentable {
             if await self.commentary.isTopFiveStockfishMove(move, before: beforeState) {
               self.showBrilliantMoveMarker(at: move.to)
             }
-            await self.commentary.handleMove(move: move, before: beforeState, after: afterState)
+            let evaluationDelta = await self.commentary.handleMove(move: move, before: beforeState, after: afterState)
+            self.recordReviewCheckpointIfNeeded(
+              for: move,
+              before: beforeState,
+              evaluationDelta: evaluationDelta
+            )
           }
         )
       )
     }
 
     private func applyServerMoveSet(_ moves: [QueueMatchMovePayload]) {
+      guard gameReview.phase == .idle else {
+        return
+      }
+
       let orderedMoves = moves.sorted(by: { $0.ply < $1.ply })
       guard orderedMoves != syncedQueueMoves else {
         return
@@ -7299,9 +7761,185 @@ private struct NativeARView: UIViewRepresentable {
             if await self.commentary.isTopFiveStockfishMove(item.move, before: item.before) {
               self.showBrilliantMoveMarker(at: item.move.to)
             }
-            await self.commentary.handleMove(move: item.move, before: item.before, after: item.after)
+            let evaluationDelta = await self.commentary.handleMove(move: item.move, before: item.before, after: item.after)
+            self.recordReviewCheckpointIfNeeded(
+              for: item.move,
+              before: item.before,
+              evaluationDelta: evaluationDelta
+            )
           }
         )
+        )
+      }
+    }
+
+    private func applyReviewPlayerMove(_ move: ChessMove) {
+      reviewEngineTask?.cancel()
+      reviewEngineTask = nil
+
+      let beforeState = gameState
+      let afterState = gameState.applying(move)
+      enqueueMoveAnimation(
+        AnimatedMoveContext(
+          move: move,
+          beforeState: beforeState,
+          afterState: afterState,
+          postApply: { [weak self] in
+            await self?.scheduleReviewEngineReplyIfNeeded(after: afterState)
+          }
+        )
+      )
+    }
+
+    private func recordReviewCheckpointIfNeeded(
+      for move: ChessMove,
+      before state: ChessGameState,
+      evaluationDelta: MoveEvaluationDelta?
+    ) {
+      guard let evaluationDelta,
+            evaluationDelta.deltaW < 0,
+            shouldTrackMoveForReview(moverColor: state.turn) else {
+        return
+      }
+
+      gameReview.recordNegativeDrop(
+        GameReviewCheckpoint(
+          fenBeforeMistake: state.fenString,
+          moveIndex: ply(for: state),
+          blunderMove: move.uciString,
+          evalBefore: evaluationDelta.evalBefore,
+          evalAfter: evaluationDelta.evalAfter,
+          deltaW: evaluationDelta.deltaW,
+          playerColor: state.turn
+        )
+      )
+    }
+
+    private func shouldTrackMoveForReview(moverColor: ChessColor) -> Bool {
+      switch mode {
+      case .passAndPlay(_):
+        return true
+      case .queueMatch:
+        return queueAssignedColor == moverColor
+      }
+    }
+
+    @MainActor
+    private func maybeBeginPostGameFlowIfNeeded(after state: ChessGameState) async {
+      guard gameReview.phase == .idle,
+            !hasTriggeredPostGameFlow,
+            state.outcome != nil else {
+        return
+      }
+
+      hasTriggeredPostGameFlow = true
+      initialAnalysisTask?.cancel()
+      initialAnalysisTask = nil
+      reviewEngineTask?.cancel()
+      reviewEngineTask = nil
+      clearSelection()
+
+      let hasCheckpoints = await gameReview.prepareReviewSequence()
+      if hasCheckpoints {
+        syncReviewStateIfNeeded(force: true)
+      } else {
+        onReviewFinished()
+      }
+    }
+
+    private func syncReviewStateIfNeeded(force: Bool = false) {
+      guard gameReview.isReviewMode,
+            let checkpoint = gameReview.currentCheckpoint else {
+        loadedReviewCheckpointID = nil
+        loadedReviewReloadVersion = 0
+        return
+      }
+
+      guard force
+        || loadedReviewCheckpointID != checkpoint.id
+        || loadedReviewReloadVersion != gameReview.checkpointReloadVersion else {
+        return
+      }
+
+      loadReviewCheckpoint(checkpoint)
+    }
+
+    private func loadReviewCheckpoint(_ checkpoint: GameReviewCheckpoint) {
+      reviewEngineTask?.cancel()
+      reviewEngineTask = nil
+      initialAnalysisTask?.cancel()
+      initialAnalysisTask = nil
+      moveAnimationTask?.cancel()
+      moveAnimationTask = nil
+      pendingAnimatedMoves.removeAll()
+      activeKnightForkBinding = nil
+      narrativeHistory.removeAll()
+      selectedSquare = nil
+      selectedMoves = []
+
+      do {
+        gameState = try ChessGameState(fen: checkpoint.fenBeforeMistake)
+        loadedReviewCheckpointID = checkpoint.id
+        loadedReviewReloadVersion = gameReview.checkpointReloadVersion
+        refreshBoardPresentation()
+        commentary.noteExternalStatus("Game Review checkpoint \(gameReview.currentReviewIndex + 1) ready.")
+      } catch {
+        commentary.noteExternalStatus("Game Review skipped an invalid checkpoint.")
+        if gameReview.advanceToNextCheckpoint() {
+          onReviewFinished()
+        } else {
+          syncReviewStateIfNeeded(force: true)
+        }
+      }
+    }
+
+    @MainActor
+    private func scheduleReviewEngineReplyIfNeeded(after state: ChessGameState) async {
+      guard gameReview.isReviewMode,
+            let checkpoint = gameReview.currentCheckpoint,
+            state.outcome == nil,
+            state.turn != checkpoint.playerColor else {
+        return
+      }
+
+      requestReviewEngineMove(for: state, checkpoint: checkpoint)
+    }
+
+    private func requestReviewEngineMove(
+      for state: ChessGameState,
+      checkpoint: GameReviewCheckpoint
+    ) {
+      let requestedFEN = state.fenString
+      reviewEngineTask?.cancel()
+      reviewEngineTask = Task { @MainActor [weak self] in
+        guard let self else {
+          return
+        }
+
+        guard self.gameReview.isReviewMode,
+              self.gameReview.currentCheckpoint?.id == checkpoint.id else {
+          return
+        }
+
+        guard let replyMove = await self.commentary.reviewReplyMove(for: state) else {
+          return
+        }
+
+        guard !Task.isCancelled,
+              self.gameReview.isReviewMode,
+              self.gameReview.currentCheckpoint?.id == checkpoint.id,
+              self.gameState.fenString == requestedFEN else {
+          return
+        }
+
+        let afterState = state.applying(replyMove)
+        self.enqueueMoveAnimation(
+          AnimatedMoveContext(
+            move: replyMove,
+            beforeState: state,
+            afterState: afterState,
+            postApply: nil
+          )
         )
       }
     }
@@ -7374,6 +8012,7 @@ private struct NativeARView: UIViewRepresentable {
       gameState = context.afterState
       refreshBoardPresentation()
       await context.postApply?()
+      await maybeBeginPostGameFlowIfNeeded(after: context.afterState)
     }
 
     @MainActor
@@ -7822,8 +8461,17 @@ private struct NativeARView: UIViewRepresentable {
     }
 
     private func canControlPiece(_ piece: ChessPieceState, at square: BoardSquare) -> Bool {
+      if gameReview.isLoading {
+        return false
+      }
+
       guard piece.color == gameState.turn else {
         return false
+      }
+
+      if let checkpoint = gameReview.currentCheckpoint, gameReview.isReviewMode {
+        _ = square
+        return piece.color == checkpoint.playerColor && gameState.turn == checkpoint.playerColor
       }
 
       switch mode {
