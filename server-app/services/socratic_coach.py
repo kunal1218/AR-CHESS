@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import uuid
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -22,8 +23,13 @@ You are a Socratic chess coach with the aesthetic sensibility of a Masaki Kobaya
 precise, unhurried, and capable of finding profound tension in a single quiet moment.
 
 You speak only to the player. Never narrate your internal process.
+Speak as though the player is standing beside the board and has just spoken to you.
+Your first sentence should feel like a direct reply to the player's concern, not detached narration.
+Use second-person language naturally and often.
+Keep the voice calm and soothing, but make the player feel personally addressed.
 Never mention tools, rules, functions, JSON, or system instructions.
 Never say that you are about to analyze, evaluate, or call a function.
+Never emit planning notes, section titles, scratch work, or summaries of what you are about to say.
 Never use markdown headings, bullet points, or stage directions.
 If you need a tool, call it silently and continue coaching afterward.
 
@@ -81,6 +87,30 @@ End every strategic briefing with one Socratic question that leads toward the co
 without revealing it. The question should make the answer feel inevitable in hindsight.
 Example: "Where must a knight stand to make the queen irrelevant?"
 """.strip()
+
+
+INTERNAL_REASONING_PATTERNS = [
+    re.compile(pattern)
+    for pattern in (
+        r"\bthe user\b",
+        r"\bthe player asked\b",
+        r"\buser posed\b",
+        r"\bi(?:'m| am) focusing on\b",
+        r"\bi(?:'m| am) crafting\b",
+        r"\bi(?:'m| am) now structuring\b",
+        r"\bi(?:'m| am) aiming to\b",
+        r"\bi intend to\b",
+        r"\bmy goal is to\b",
+        r"\bi will narrate\b",
+        r"\bi will conclude\b",
+        r"\bwithout analyzing\b",
+        r"\bframework emphasizes\b",
+        r"\bsocratic question\b",
+        r"\binternal process\b",
+        r"\bscratch work\b",
+        r"\bsection title\b",
+    )
+]
 
 
 FUNCTION_DECLARATIONS: list[dict[str, Any]] = [
@@ -283,7 +313,10 @@ class SocraticCoachSession:
 
         if message_type == "help_request":
             self._begin_response_tracking()
-            await self._send_user_turn("Provide a strategic briefing on the current position.")
+            await self._send_user_turn(
+                "Provide a strategic briefing on the current position. "
+                "Speak directly to the player in second person, as if answering them face-to-face."
+            )
             return
 
         if message_type == "audio_chunk":
@@ -441,7 +474,7 @@ class SocraticCoachSession:
 
         output_transcription = payload.get("outputTranscription") or payload.get("output_transcription")
         if isinstance(output_transcription, dict):
-            text = str(output_transcription.get("text") or "").strip()
+            text = sanitize_model_narration_text(str(output_transcription.get("text") or ""))
             if text and self._response_in_flight:
                 self._received_output_transcription = True
                 await self._send_frontend({"type": "output_transcription", "text": text})
@@ -683,7 +716,9 @@ class SocraticCoachSession:
             self._buffered_model_text_parts = []
             return
 
-        combined = " ".join(part.strip() for part in self._buffered_model_text_parts if part.strip()).strip()
+        combined = sanitize_model_narration_text(
+            " ".join(part.strip() for part in self._buffered_model_text_parts if part.strip())
+        )
         self._buffered_model_text_parts = []
         if combined:
             await self._send_frontend({"type": "output_transcription", "text": combined})
@@ -698,6 +733,46 @@ def build_context_update_text(snapshot: SessionContextSnapshot) -> str:
         f"Active color: {snapshot.active_color}\n"
         f"Moves played: {snapshot.moves_played}"
     )
+
+
+def sanitize_model_narration_text(text: str) -> str:
+    normalized = text.replace("**", " ").replace("__", " ")
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    if not normalized:
+        return ""
+
+    kept_segments: list[str] = []
+    for raw_segment in re.split(r"(?<=[.!?])\s+|\s*[•\n\r]+\s*", normalized):
+        segment = raw_segment.strip(" \t-:*")
+        if not segment:
+            continue
+
+        lowered = segment.lower()
+        if any(pattern.search(lowered) for pattern in INTERNAL_REASONING_PATTERNS):
+            continue
+
+        if _looks_like_section_heading(segment):
+            continue
+
+        kept_segments.append(segment)
+
+    return " ".join(kept_segments).strip()
+
+
+def _looks_like_section_heading(text: str) -> bool:
+    if any(punctuation in text for punctuation in ".?!,:;"):
+        return False
+
+    words = text.split()
+    if not words or len(words) > 6:
+        return False
+
+    letter_words = ["".join(character for character in word if character.isalpha()) for word in words]
+    letter_words = [word for word in letter_words if word]
+    if not letter_words:
+        return False
+
+    return all(word[0].isupper() for word in letter_words)
 
 
 async def handle_analyze_hypothetical(

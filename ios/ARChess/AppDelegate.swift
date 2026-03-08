@@ -909,6 +909,29 @@ private final class SocraticCoachMicCaptureManager {
 @MainActor
 private final class SocraticCoachStore: ObservableObject {
   private static let logger = Logger(subsystem: "ARChess", category: "SocraticCoach")
+  private static let blockedTranscriptMarkers = [
+    "the user",
+    "the player asked",
+    "user posed",
+    "i'm focusing on",
+    "i am focusing on",
+    "i'm crafting",
+    "i am crafting",
+    "i'm now structuring",
+    "i am now structuring",
+    "i'm aiming to",
+    "i am aiming to",
+    "i intend to",
+    "my goal is to",
+    "i will narrate",
+    "i will conclude",
+    "without analyzing",
+    "framework emphasizes",
+    "socratic question",
+    "internal process",
+    "scratch work",
+    "section title",
+  ]
 
   @Published private(set) var connectionState: SocraticCoachConnectionState = .disconnected
   @Published private(set) var micState: SocraticCoachMicState = .inactive
@@ -1197,9 +1220,11 @@ private final class SocraticCoachStore: ObservableObject {
       isStreamingResponse = false
       statusText = "Socratic Coach is ready."
     case "output_transcription":
-      let text = (payload["text"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
-      if let text, !text.isEmpty {
+      let text = (payload["text"] as? String).flatMap(Self.sanitizedTranscript)
+      if let text {
         transcriptText = text
+      } else {
+        transcriptText = nil
       }
     case "audio_chunk":
       guard let base64PCM = payload["data"] as? String else {
@@ -1271,6 +1296,54 @@ private final class SocraticCoachStore: ObservableObject {
     } catch {
       lastError = error.localizedDescription
       statusText = "Socratic Coach failed to encode a websocket message."
+    }
+  }
+
+  private static func sanitizedTranscript(_ text: String) -> String? {
+    let normalized = text
+      .replacingOccurrences(of: "**", with: " ")
+      .replacingOccurrences(of: "__", with: " ")
+      .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !normalized.isEmpty else {
+      return nil
+    }
+
+    let lowered = normalized.lowercased()
+    guard !blockedTranscriptMarkers.contains(where: { lowered.contains($0) }) else {
+      return nil
+    }
+
+    guard !looksLikeSectionHeading(normalized) else {
+      return nil
+    }
+
+    return normalized
+  }
+
+  private static func looksLikeSectionHeading(_ text: String) -> Bool {
+    guard text.rangeOfCharacter(from: CharacterSet(charactersIn: ".?!,:;")) == nil else {
+      return false
+    }
+
+    let words = text.split(separator: " ")
+    guard !words.isEmpty, words.count <= 6 else {
+      return false
+    }
+
+    let letterWords = words.compactMap { word -> String? in
+      let letters = word.filter { $0.isLetter }
+      return letters.isEmpty ? nil : String(letters)
+    }
+    guard !letterWords.isEmpty else {
+      return false
+    }
+
+    return letterWords.allSatisfy { word in
+      guard let first = word.first else {
+        return false
+      }
+      return first.isUppercase
     }
   }
 

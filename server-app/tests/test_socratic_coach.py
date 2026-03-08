@@ -12,6 +12,7 @@ from services.socratic_coach import (  # noqa: E402
     GameStateStore,
     build_context_update_text,
     handle_analyze_hypothetical,
+    sanitize_model_narration_text,
 )
 from services.stockfish_engine import AnalysisResult  # noqa: E402
 
@@ -57,6 +58,34 @@ def test_context_update_text_uses_authoritative_store_snapshot() -> None:
     assert "Move history: e4" in packet
     assert "Active color: b" in packet
     assert "Moves played: 1" in packet
+
+
+def test_sanitize_model_narration_text_drops_internal_reasoning() -> None:
+    raw_text = """
+    **Defining Central Control**
+    I'm focusing on defining central control as the key strategic element here.
+    The user posed a broad strategic question, so I am crafting a response.
+    I intend to conclude with a Socratic question.
+    """
+
+    assert sanitize_model_narration_text(raw_text) == ""
+
+
+def test_sanitize_model_narration_text_preserves_player_facing_reply() -> None:
+    raw_text = "You have more influence at the board's heart than your opponent right now. Which piece can support that pressure without drifting from your king?"
+
+    assert sanitize_model_narration_text(raw_text) == raw_text
+
+
+def test_sanitize_model_narration_text_strips_meta_segments_from_mixed_response() -> None:
+    raw_text = (
+        "I'm now structuring the response around central tension. "
+        "You already have a foothold in the center, so now ask which piece can deepen it."
+    )
+
+    assert sanitize_model_narration_text(raw_text) == (
+        "You already have a foothold in the center, so now ask which piece can deepen it."
+    )
 
 
 class FakeStockfishEngine:
