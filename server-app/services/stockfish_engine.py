@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
 import shlex
+import shutil
 from dataclasses import dataclass
+from pathlib import Path
 
 
 _BESTMOVE_PATTERN = re.compile(r"^bestmove\s+(\S+)")
@@ -32,6 +35,10 @@ class StockfishEngine:
         logger: logging.Logger | None = None,
     ) -> None:
         self._executable_path = (executable_path or os.getenv("STOCKFISH_PATH") or "stockfish").strip()
+        self._node_binary = (os.getenv("NODE_BINARY") or shutil.which("node") or "node").strip()
+        self._bundled_script_path = (
+            Path(__file__).resolve().parents[1] / "scripts" / "stockfish_query.mjs"
+        )
         self._max_depth = max(1, max_depth)
         self._logger = logger or logging.getLogger("archess.stockfish")
         self._process: asyncio.subprocess.Process | None = None
@@ -41,6 +48,9 @@ class StockfishEngine:
         clamped_depth = max(1, min(depth, self._max_depth))
 
         async with self._lock:
+            if self._should_use_bundled_engine():
+                return await self._analyze_with_bundled_engine(fen, clamped_depth)
+
             await self._ensure_process()
             assert self._process is not None
 
@@ -89,6 +99,64 @@ class StockfishEngine:
         await self._wait_for_line("uciok", timeout_seconds=4.0)
         await self._send_line("isready")
         await self._wait_for_line("readyok", timeout_seconds=4.0)
+
+    def _should_use_bundled_engine(self) -> bool:
+        if os.getenv("ARCHESS_FORCE_BUNDLED_STOCKFISH") == "1":
+            return True
+
+        command = shlex.split(self._executable_path)
+        if not command:
+            return True
+
+        binary = command[0]
+        if os.path.isabs(binary):
+            return not os.path.exists(binary)
+
+        return shutil.which(binary) is None
+
+    async def _analyze_with_bundled_engine(self, fen: str, depth: int) -> AnalysisResult:
+        if not self._bundled_script_path.exists():
+            raise RuntimeError(
+                f"Bundled Stockfish fallback script is missing at {self._bundled_script_path}."
+            )
+
+        process = await asyncio.create_subprocess_exec(
+            self._node_binary,
+            str(self._bundled_script_path),
+            "--fen",
+            fen,
+            "--depth",
+            str(depth),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        try:
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=12.0)
+        except asyncio.TimeoutError as exc:
+            process.kill()
+            await process.wait()
+            raise StockfishTimeoutError(
+                "Bundled Stockfish analysis timed out after 12 seconds."
+            ) from exc
+
+        if process.returncode != 0:
+            message = stderr.decode("utf-8", errors="ignore").strip() or stdout.decode(
+                "utf-8", errors="ignore"
+            ).strip()
+            raise RuntimeError(message or "Bundled Stockfish analysis failed.")
+
+        payload = json.loads(stdout.decode("utf-8"))
+        bestmove = str(payload.get("bestmove") or "").strip()
+        if not bestmove:
+            raise RuntimeError("Bundled Stockfish analysis returned no bestmove.")
+
+        mate_in_raw = payload.get("mate_in")
+        return AnalysisResult(
+            bestmove=bestmove,
+            evaluation=int(payload.get("evaluation") or 0),
+            mate_in=int(mate_in_raw) if mate_in_raw is not None else None,
+        )
 
     async def _collect_result(self) -> AnalysisResult:
         last_evaluation = 0

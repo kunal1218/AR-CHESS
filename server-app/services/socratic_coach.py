@@ -21,27 +21,35 @@ SOCRATIC_SYSTEM_PROMPT = """
 You are a Socratic chess coach with the aesthetic sensibility of a Masaki Kobayashi film —
 precise, unhurried, and capable of finding profound tension in a single quiet moment.
 
+You speak only to the player. Never narrate your internal process.
+Never mention tools, rules, functions, JSON, or system instructions.
+Never say that you are about to analyze, evaluate, or call a function.
+Never use markdown headings, bullet points, or stage directions.
+If you need a tool, call it silently and continue coaching afterward.
+
 ━━━ TOOL USAGE — MANDATORY ━━━
 
 You receive a continuous context stream that keeps you informed of the current board position
 at all times. You always know the FEN. You do not need to ask for it.
 
 RULE 1 — THE CARDINAL RULE:
-Whenever a player describes, proposes, or questions ANY move — however casually phrased —
+Whenever a player describes, proposes, or questions a SPECIFIC move — however casually phrased —
 you MUST call analyze_hypothetical_move before speaking a single word of analysis.
 This includes: "what if I...", "should I take...", "can I go...", "what about my knight...",
 "I'm thinking of...", "is it good to...", or any sentence where a piece is described moving
 to a location.
-There are NO exceptions. You do not speculate. You do not use intuition. You call the tool
-and wait for the engine's verdict.
+If the user asks a broad question like "what should I play?" without naming a candidate move,
+do not call analyze_hypothetical_move. Give a strategic briefing from the current position instead.
+There are NO exceptions for specific move questions. You do not speculate. You do not use intuition.
+You call the tool and wait for the engine's verdict.
 
 RULE 2 — PARSE ERROR RECOVERY:
-If analyze_hypothetical_move returns { "parse_error": true }, respond:
+If the analyze_hypothetical_move result indicates parse_error, respond:
 "The pieces blur in the mist — could you name the warrior and its destination once more?"
 Then wait. Do not attempt to guess the move.
 
 RULE 3 — ILLEGAL MOVE:
-If the result contains { "illegal_move": true }, acknowledge it through your coaching
+If the analyze_hypothetical_move result indicates illegal_move, acknowledge it through your coaching
 persona without revealing the reason technically. Ask what they intended.
 
 RULE 4 — THREAT OVERLAY:
@@ -109,6 +117,7 @@ FUNCTION_DECLARATIONS: list[dict[str, Any]] = [
             "a hanging piece, or a key strategic square. Do not announce to the user that "
             "you are highlighting squares."
         ),
+        "behavior": "NON_BLOCKING",
         "parameters": {
             "type": "object",
             "properties": {
@@ -212,6 +221,9 @@ class SocraticCoachSession:
         self._reconnect_task: asyncio.Task[None] | None = None
         self._context_push_task: asyncio.Task[None] | None = None
         self._gemini_ready = asyncio.Event()
+        self._response_in_flight = False
+        self._received_output_transcription = False
+        self._buffered_model_text_parts: list[str] = []
 
         self._game_store = GameStateStore()
         self._game_store.subscribe(self._schedule_context_push)
@@ -270,6 +282,7 @@ class SocraticCoachSession:
             return
 
         if message_type == "help_request":
+            self._begin_response_tracking()
             await self._send_user_turn("Provide a strategic briefing on the current position.")
             return
 
@@ -292,6 +305,7 @@ class SocraticCoachSession:
 
         if message_type == "audio_stream_end":
             await self._wait_until_gemini_ready()
+            self._begin_response_tracking()
             await self._send_gemini_json({"realtimeInput": {"audioStreamEnd": True}})
             return
 
@@ -428,7 +442,8 @@ class SocraticCoachSession:
         output_transcription = payload.get("outputTranscription") or payload.get("output_transcription")
         if isinstance(output_transcription, dict):
             text = str(output_transcription.get("text") or "").strip()
-            if text:
+            if text and self._response_in_flight:
+                self._received_output_transcription = True
                 await self._send_frontend({"type": "output_transcription", "text": text})
 
         input_transcription = payload.get("inputTranscription") or payload.get("input_transcription")
@@ -438,7 +453,7 @@ class SocraticCoachSession:
                 await self._send_frontend({"type": "input_transcription", "text": text})
 
         direct_audio = payload.get("data")
-        if isinstance(direct_audio, str) and direct_audio:
+        if self._response_in_flight and isinstance(direct_audio, str) and direct_audio:
             await self._send_frontend(
                 {
                     "type": "audio_chunk",
@@ -460,7 +475,7 @@ class SocraticCoachSession:
                 inline_data = part.get("inlineData") or part.get("inline_data")
                 if isinstance(inline_data, dict):
                     raw_data = str(inline_data.get("data") or "").strip()
-                    if raw_data:
+                    if raw_data and self._response_in_flight:
                         await self._send_frontend(
                             {
                                 "type": "audio_chunk",
@@ -470,14 +485,16 @@ class SocraticCoachSession:
                         )
                 text = str(part.get("text") or "").strip()
                 if text:
-                    await self._send_frontend({"type": "output_transcription", "text": text})
+                    self._buffer_model_text(text)
 
         turn_complete = server_content.get("turnComplete")
         if turn_complete is None:
             turn_complete = server_content.get("turn_complete")
         if bool(turn_complete):
+            await self._flush_buffered_text_if_needed()
             await self._send_frontend({"type": "turn_complete", "turn_complete": True})
             await self._send_frontend({"type": "streaming", "active": False})
+            self._end_response_tracking()
 
     async def _handle_tool_call(self, tool_call: Any) -> None:
         if not isinstance(tool_call, dict):
@@ -494,23 +511,40 @@ class SocraticCoachSession:
             name = str(function_call.get("name") or "")
             args = self._normalize_tool_args(function_call.get("args"))
 
-            if name == "analyze_hypothetical_move":
-                response = await handle_analyze_hypothetical(
-                    args=args,
-                    game_store=self._game_store,
-                    stockfish_engine=self._stockfish_engine,
-                )
-            elif name == "show_threat_zone":
-                await self._send_frontend(
-                    {
-                        "type": "tool_call",
-                        "name": name,
-                        "args": args,
+            try:
+                if name == "analyze_hypothetical_move":
+                    result = await handle_analyze_hypothetical(
+                        args=args,
+                        game_store=self._game_store,
+                        stockfish_engine=self._stockfish_engine,
+                    )
+                    response = {"result": result}
+                elif name == "show_threat_zone":
+                    await self._send_frontend(
+                        {
+                            "type": "tool_call",
+                            "name": name,
+                            "args": args,
+                        }
+                    )
+                    response = {
+                        "result": {"acknowledged": True},
+                        "scheduling": "SILENT",
                     }
-                )
-                response = {"acknowledged": True}
-            else:
-                response = {"error": f"Unsupported tool: {name}"}
+                else:
+                    response = {"result": {"error": f"Unsupported tool: {name}"}}
+            except Exception as exc:
+                self._logger.exception("Socratic tool call failed name=%s", name)
+                response = {
+                    "result": {
+                        "tool_runtime_error": True,
+                        "message": str(exc),
+                        "instruction": (
+                            "Briefly tell the user the deeper engine line is unavailable right now. "
+                            "Then continue with high-level chess principles only, without mentioning tools."
+                        ),
+                    }
+                }
 
             responses.append(
                 {
@@ -626,6 +660,33 @@ class SocraticCoachSession:
             raise RuntimeError("Gemini socket is not connected.")
         async with self._gemini_send_lock:
             await self._gemini_ws.send(json.dumps(payload))
+
+    def _begin_response_tracking(self) -> None:
+        self._response_in_flight = True
+        self._received_output_transcription = False
+        self._buffered_model_text_parts = []
+
+    def _end_response_tracking(self) -> None:
+        self._response_in_flight = False
+        self._received_output_transcription = False
+        self._buffered_model_text_parts = []
+
+    def _buffer_model_text(self, text: str) -> None:
+        if not self._response_in_flight:
+            return
+        self._buffered_model_text_parts.append(text)
+        if len(self._buffered_model_text_parts) > 12:
+            self._buffered_model_text_parts = self._buffered_model_text_parts[-12:]
+
+    async def _flush_buffered_text_if_needed(self) -> None:
+        if not self._response_in_flight or self._received_output_transcription:
+            self._buffered_model_text_parts = []
+            return
+
+        combined = " ".join(part.strip() for part in self._buffered_model_text_parts if part.strip()).strip()
+        self._buffered_model_text_parts = []
+        if combined:
+            await self._send_frontend({"type": "output_transcription", "text": combined})
 
 
 def build_context_update_text(snapshot: SessionContextSnapshot) -> str:

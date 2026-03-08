@@ -1006,6 +1006,8 @@ private final class SocraticCoachStore: ObservableObject {
       }
     case .active:
       micCapture.toggleMute()
+      transcriptText = nil
+      audioPlayer.stop()
       isStreamingResponse = true
       send(payload: SocraticCoachSimplePayload(type: "audio_stream_end"))
       statusText = "Question sent. Socratic Coach is listening for the reply."
@@ -1084,6 +1086,7 @@ private final class SocraticCoachStore: ObservableObject {
   private func handleReceiveFailure(_ error: Error) {
     webSocketTask = nil
     connectionState = .connecting
+    isStreamingResponse = false
     lastError = error.localizedDescription
     statusText = "Socratic Coach reconnecting..."
 
@@ -1136,6 +1139,7 @@ private final class SocraticCoachStore: ObservableObject {
         statusText = payload["message"] as? String ?? "Socratic Coach connecting..."
       case "error":
         connectionState = .error
+        isStreamingResponse = false
         let message = payload["message"] as? String ?? "Socratic Coach failed."
         lastError = message
         statusText = message
