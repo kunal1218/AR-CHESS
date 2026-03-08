@@ -869,6 +869,8 @@ private final class SocraticCoachPCMPlayer {
 
 private final class SocraticCoachMicCaptureManager {
   private static let logger = Logger(subsystem: "ARChess", category: "SocraticCoachMic")
+  private static let prewarmLock = NSLock()
+  private static var hasProcessPrewarmedCapturePath = false
 
   private let audioEngine = AVAudioEngine()
   private let targetFormat = AVAudioFormat(standardFormatWithSampleRate: 16_000, channels: 1)!
@@ -894,23 +896,32 @@ private final class SocraticCoachMicCaptureManager {
     }
 
     do {
-      try AudioSessionCoordinator.shared.beginRecordingSession()
-      let inputNode = audioEngine.inputNode
-      let inputFormat = inputNode.inputFormat(forBus: 0)
-      audioConverter = AVAudioConverter(from: inputFormat, to: targetFormat)
-      inputNode.removeTap(onBus: 0)
-      inputNode.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self] buffer, _ in
+      try prepareCaptureGraph { [weak self] buffer in
         self?.handleInputBuffer(buffer)
       }
-
-      audioEngine.prepare()
-      try audioEngine.start()
       state = unmuted ? .active : .muted
     } catch {
-      audioEngine.inputNode.removeTap(onBus: 0)
-      audioEngine.stop()
-      audioConverter = nil
-      AudioSessionCoordinator.shared.endRecordingSession()
+      teardownCaptureGraph(resetRecordingSession: true)
+      throw error
+    }
+  }
+
+  func prewarmIfNeeded() throws {
+    Self.prewarmLock.lock()
+    let shouldPrewarm = !Self.hasProcessPrewarmedCapturePath
+    Self.prewarmLock.unlock()
+    guard shouldPrewarm, state == .inactive else {
+      return
+    }
+
+    do {
+      try prepareCaptureGraph { _ in }
+      teardownCaptureGraph(resetRecordingSession: true)
+      Self.prewarmLock.lock()
+      Self.hasProcessPrewarmedCapturePath = true
+      Self.prewarmLock.unlock()
+    } catch {
+      teardownCaptureGraph(resetRecordingSession: true)
       throw error
     }
   }
@@ -949,13 +960,33 @@ private final class SocraticCoachMicCaptureManager {
     }
 
     let finalChunk = flushPendingSamplesForManualSend()
+    teardownCaptureGraph(resetRecordingSession: true)
+    pendingSamples.removeAll(keepingCapacity: false)
+    state = .inactive
+    return finalChunk
+  }
+
+  private func prepareCaptureGraph(onBuffer: @escaping (AVAudioPCMBuffer) -> Void) throws {
+    try AudioSessionCoordinator.shared.beginRecordingSession()
+    let inputNode = audioEngine.inputNode
+    let inputFormat = inputNode.inputFormat(forBus: 0)
+    audioConverter = AVAudioConverter(from: inputFormat, to: targetFormat)
+    inputNode.removeTap(onBus: 0)
+    inputNode.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { buffer, _ in
+      onBuffer(buffer)
+    }
+
+    audioEngine.prepare()
+    try audioEngine.start()
+  }
+
+  private func teardownCaptureGraph(resetRecordingSession: Bool) {
     audioEngine.inputNode.removeTap(onBus: 0)
     audioEngine.stop()
     audioConverter = nil
-    pendingSamples.removeAll(keepingCapacity: false)
-    state = .inactive
-    AudioSessionCoordinator.shared.endRecordingSession()
-    return finalChunk
+    if resetRecordingSession {
+      AudioSessionCoordinator.shared.endRecordingSession()
+    }
   }
 
   private func handleInputBuffer(_ buffer: AVAudioPCMBuffer) {
@@ -1048,6 +1079,7 @@ private final class SocraticCoachMicCaptureManager {
 private final class SocraticCoachStore: ObservableObject {
   private static let logger = Logger(subsystem: "ARChess", category: "SocraticCoach")
   private static let startupConnectDelay: TimeInterval = 1.1
+  private static let microphonePrewarmDelay: TimeInterval = 0.45
   private static let blockedTranscriptMarkers = [
     "the user",
     "the player asked",
@@ -1090,6 +1122,7 @@ private final class SocraticCoachStore: ObservableObject {
   private var lastSentContext: SocraticCoachContext?
   private var reconnectWorkItem: DispatchWorkItem?
   private var delayedConnectWorkItem: DispatchWorkItem?
+  private var microphonePrewarmWorkItem: DispatchWorkItem?
   private var threatZoneHandler: (([String], String?) -> Void)?
 
   init(
@@ -1150,6 +1183,7 @@ private final class SocraticCoachStore: ObservableObject {
         ? "Socratic Coach standing by."
         : "Set ARChessAPIBaseURL to enable Socratic Coach."
       scheduleDelayedConnect()
+      scheduleMicrophonePrewarmIfNeeded()
       if let currentContext, webSocketTask != nil {
         sendContextIfNeeded(force: true, context: currentContext)
       }
@@ -1239,6 +1273,8 @@ private final class SocraticCoachStore: ObservableObject {
     reconnectWorkItem = nil
     delayedConnectWorkItem?.cancel()
     delayedConnectWorkItem = nil
+    microphonePrewarmWorkItem?.cancel()
+    microphonePrewarmWorkItem = nil
     webSocketTask?.cancel(with: .goingAway, reason: nil)
     webSocketTask = nil
     micCapture.stop()
@@ -1291,6 +1327,38 @@ private final class SocraticCoachStore: ObservableObject {
     }
     delayedConnectWorkItem = workItem
     DispatchQueue.main.asyncAfter(deadline: .now() + Self.startupConnectDelay, execute: workItem)
+  }
+
+  private func scheduleMicrophonePrewarmIfNeeded() {
+    guard isEnabled, isConfigured, micState == .inactive else {
+      return
+    }
+
+    let permission = AVAudioSession.sharedInstance().recordPermission
+    guard permission == .granted else {
+      return
+    }
+
+    microphonePrewarmWorkItem?.cancel()
+    let workItem = DispatchWorkItem { [weak self] in
+      guard let self else {
+        return
+      }
+      guard self.isEnabled, self.micState == .inactive else {
+        return
+      }
+
+      let micCapture = self.micCapture
+      DispatchQueue.global(qos: .utility).async {
+        do {
+          try micCapture.prewarmIfNeeded()
+        } catch {
+          Self.logger.debug("Mic prewarm skipped: \(error.localizedDescription, privacy: .public)")
+        }
+      }
+    }
+    microphonePrewarmWorkItem = workItem
+    DispatchQueue.main.asyncAfter(deadline: .now() + Self.microphonePrewarmDelay, execute: workItem)
   }
 
   private func receiveNextMessage() {
@@ -3802,6 +3870,7 @@ private enum PieceMoveSound: CaseIterable {
 
 private final class CaptureSoundEffectEngine {
   private static let logger = Logger(subsystem: "ARChess", category: "CaptureSFX")
+  private static let releasePadding: TimeInterval = 0.08
 
   private let queue = DispatchQueue(label: "ARChess.CaptureSFX")
   private let engine = AVAudioEngine()
@@ -3810,6 +3879,7 @@ private final class CaptureSoundEffectEngine {
   private lazy var buffers: [CaptureImpactSound: AVAudioPCMBuffer] = Self.buildBuffers(format: format)
   private lazy var moveBuffers: [PieceMoveSound: AVAudioPCMBuffer] = Self.buildMoveBuffers(format: format)
   private var activeFilePlayers: [AVAudioPlayer] = []
+  private var busyUntil: CFTimeInterval = 0
 
   init() {
     engine.attach(mixer)
@@ -3861,6 +3931,12 @@ private final class CaptureSoundEffectEngine {
     playBuffer(moveBuffers[effect])
   }
 
+  func remainingPlaybackTime() -> TimeInterval {
+    queue.sync {
+      max(0, busyUntil - CACurrentMediaTime())
+    }
+  }
+
   private func playBuffer(_ buffer: AVAudioPCMBuffer?) {
     queue.async { [weak self] in
       guard let self else {
@@ -3877,6 +3953,8 @@ private final class CaptureSoundEffectEngine {
       guard let buffer else {
         return
       }
+
+      self.noteBusy(duration: Double(buffer.frameLength) / buffer.format.sampleRate)
 
       let player = AVAudioPlayerNode()
       self.engine.attach(player)
@@ -3912,6 +3990,7 @@ private final class CaptureSoundEffectEngine {
         let player = try AVAudioPlayer(contentsOf: url)
         player.volume = volume
         player.prepareToPlay()
+        self.noteBusy(duration: player.duration)
         self.activeFilePlayers.append(player)
         player.play()
 
@@ -3937,6 +4016,11 @@ private final class CaptureSoundEffectEngine {
     }
 
     try engine.start()
+  }
+
+  private func noteBusy(duration: TimeInterval) {
+    let totalDuration = max(duration, 0.0) + Self.releasePadding
+    busyUntil = max(busyUntil, CACurrentMediaTime() + totalDuration)
   }
 
   private static func buildBuffers(format: AVAudioFormat) -> [CaptureImpactSound: AVAudioPCMBuffer] {
@@ -5395,6 +5479,11 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     }
   }
 
+  private struct PendingGeminiNarration {
+    let text: String
+    let title: String
+  }
+
   @Published private(set) var caption: Caption?
   @Published private(set) var analysisStatus = "Waiting for AR tracking to settle before warming Stockfish..."
   @Published private(set) var latestAssessment = "Waiting for initial analysis."
@@ -5422,6 +5511,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   private let narrator: NarratorType
   private var utteranceCaptions: [ObjectIdentifier: Caption] = [:]
   private var narrationHighlightHandler: (([String], String?) -> Void)?
+  private var pieceAudioBusyDurationProvider: (() -> TimeInterval)?
   private var cachedAnalysis: CachedAnalysis?
   private var stockfishDebugAnalysisCache: [String: StockfishAnalysis] = [:]
   private var completedPlyCount = 0
@@ -5437,6 +5527,8 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   private var pendingHintReveal = false
   private var pendingHintNarration = false
   private var narratedHintKeys: Set<String> = []
+  private var pendingGeminiNarration: PendingGeminiNarration?
+  private var geminiNarrationRetryWorkItem: DispatchWorkItem?
   private var nextKingCookedAllowedPly: [ChessColor: Int] = [:]
   private var lastGeminiStatusSnapshot: GeminiLiveStatusPayload?
   private var nextGeminiBackgroundRetryAt: Date?
@@ -5504,6 +5596,9 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   func resetSession() {
     synthesizer.stopSpeaking(at: .immediate)
     utteranceCaptions.removeAll()
+    geminiNarrationRetryWorkItem?.cancel()
+    geminiNarrationRetryWorkItem = nil
+    pendingGeminiNarration = nil
     caption = nil
     cachedAnalysis = nil
     stockfishDebugAnalysisCache.removeAll()
@@ -5587,6 +5682,17 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
 
   func unbindRecentHistoryProvider() {
     recentHistoryProvider = nil
+  }
+
+  func bindPieceAudioBusyDurationProvider(_ provider: @escaping () -> TimeInterval) {
+    pieceAudioBusyDurationProvider = provider
+  }
+
+  func unbindPieceAudioBusyDurationProvider() {
+    pieceAudioBusyDurationProvider = nil
+    geminiNarrationRetryWorkItem?.cancel()
+    geminiNarrationRetryWorkItem = nil
+    pendingGeminiNarration = nil
   }
 
   func analyzeCurrentPosition() async {
@@ -5896,6 +6002,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     if !synthesizer.isSpeaking {
       AmbientMusicController.shared.setSpeechActive(false)
       caption = nil
+      flushPendingGeminiNarrationIfPossible()
     }
   }
 
@@ -5904,6 +6011,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     if !synthesizer.isSpeaking {
       AmbientMusicController.shared.setSpeechActive(false)
       caption = nil
+      flushPendingGeminiNarrationIfPossible()
     }
   }
 
@@ -6211,7 +6319,9 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       return
     }
 
-    if !revealWhenReady {
+    let shouldFetchImmediately = revealWhenReady || narrateWhenReady || pendingHintNarration
+
+    if !shouldFetchImmediately {
       if let retryAt = nextGeminiBackgroundRetryAt, retryAt > Date() {
         isHintLoading = false
         hintStatusText = geminiConnectionState == .connected
@@ -6232,7 +6342,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     }
 
     isHintLoading = true
-    hintStatusText = pendingHintReveal ? "Loading hint..." : "Preparing a playful hint..."
+    hintStatusText = shouldFetchImmediately ? "Loading hint..." : "Preparing a playful hint..."
     appendGeminiDebug("Prefetching Gemini hint in background for move \(context.bestMove).")
 
     hintTask?.cancel()
@@ -6879,19 +6989,23 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   }
 
   private func speakGeminiNarration(text: String, title: String, priority: SpeechPriority) -> Bool {
-    if priority == .urgent {
-      _ = synthesizer.stopSpeaking(at: .immediate)
-      utteranceCaptions.removeAll()
-    } else if synthesizer.isSpeaking {
-      return false
-    }
-
     let capped = cappedNarrationText(text)
     guard !capped.text.isEmpty else {
       return false
     }
 
-    let utterance = AVSpeechUtterance(string: capped.text)
+    let pieceAudioBusyDuration = pieceAudioBusyDurationProvider?() ?? 0
+    if synthesizer.isSpeaking || pieceAudioBusyDuration > 0.05 {
+      let retryDelay = max(pieceAudioBusyDuration, priority == .urgent ? 0.14 : 0.08)
+      queuePendingGeminiNarration(text: capped.text, title: title, retryAfter: retryDelay)
+      return true
+    }
+
+    return startGeminiNarrationNow(text: capped.text, title: title)
+  }
+
+  private func startGeminiNarrationNow(text: String, title: String) -> Bool {
+    let utterance = AVSpeechUtterance(string: text)
     utterance.voice = AVSpeechSynthesisVoice(language: "en-US")
     utterance.pitchMultiplier = 1.02
     utterance.rate = 0.47
@@ -6899,12 +7013,44 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     utterance.preUtteranceDelay = 0.02
     utteranceCaptions[ObjectIdentifier(utterance)] = Caption(
       title: title,
-      line: capped.text,
+      line: text,
       imageAssetName: "GeminiNarratorPortrait"
     )
-    maybeHighlightNarrationFocus(capped.text)
+    maybeHighlightNarrationFocus(text)
     synthesizer.speak(utterance)
     return true
+  }
+
+  private func queuePendingGeminiNarration(text: String, title: String, retryAfter delay: TimeInterval) {
+    pendingGeminiNarration = PendingGeminiNarration(text: text, title: title)
+    geminiNarrationRetryWorkItem?.cancel()
+
+    let workItem = DispatchWorkItem { [weak self] in
+      self?.flushPendingGeminiNarrationIfPossible()
+    }
+    geminiNarrationRetryWorkItem = workItem
+    DispatchQueue.main.asyncAfter(deadline: .now() + max(delay, 0.05), execute: workItem)
+  }
+
+  private func flushPendingGeminiNarrationIfPossible() {
+    guard let pendingGeminiNarration else {
+      return
+    }
+
+    let pieceAudioBusyDuration = pieceAudioBusyDurationProvider?() ?? 0
+    guard !synthesizer.isSpeaking, pieceAudioBusyDuration <= 0.05 else {
+      queuePendingGeminiNarration(
+        text: pendingGeminiNarration.text,
+        title: pendingGeminiNarration.title,
+        retryAfter: max(pieceAudioBusyDuration, 0.08)
+      )
+      return
+    }
+
+    self.pendingGeminiNarration = nil
+    geminiNarrationRetryWorkItem?.cancel()
+    geminiNarrationRetryWorkItem = nil
+    _ = startGeminiNarrationNow(text: pendingGeminiNarration.text, title: pendingGeminiNarration.title)
   }
 
   private func maybeHighlightNarrationFocus(_ text: String) {
@@ -8466,6 +8612,7 @@ private struct NativeARExperienceView: View {
       commentary.unbindRecentHistoryProvider()
       commentary.unbindReactionHandler()
       commentary.unbindNarrationHighlightHandler()
+      commentary.unbindPieceAudioBusyDurationProvider()
       socraticCoach.unbindThreatZoneHandler()
       socraticCoach.disconnect()
       switch mode {
@@ -10407,6 +10554,9 @@ private struct NativeARView: UIViewRepresentable {
           }
           self.commentary.bindNarrationHighlightHandler { [weak self] squares, _ in
             self?.showThreatOverlay(algebraicSquares: squares)
+          }
+          self.commentary.bindPieceAudioBusyDurationProvider { [weak self] in
+            self?.captureSoundEffects.remainingPlaybackTime() ?? 0
           }
           self.commentary.bindStateProvider { [weak self] in
             self?.gameState
