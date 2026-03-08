@@ -986,6 +986,7 @@ private final class SocraticCoachMicCaptureManager {
 @MainActor
 private final class SocraticCoachStore: ObservableObject {
   private static let logger = Logger(subsystem: "ARChess", category: "SocraticCoach")
+  private static let startupConnectDelay: TimeInterval = 1.1
   private static let blockedTranscriptMarkers = [
     "the user",
     "the player asked",
@@ -1027,6 +1028,7 @@ private final class SocraticCoachStore: ObservableObject {
   private var currentContext: SocraticCoachContext?
   private var lastSentContext: SocraticCoachContext?
   private var reconnectWorkItem: DispatchWorkItem?
+  private var delayedConnectWorkItem: DispatchWorkItem?
   private var threatZoneHandler: (([String], String?) -> Void)?
 
   init(
@@ -1083,8 +1085,11 @@ private final class SocraticCoachStore: ObservableObject {
 
     isEnabled = enabled
     if enabled {
-      ensureConnectedIfNeeded()
-      if let currentContext {
+      statusText = isConfigured
+        ? "Socratic Coach standing by."
+        : "Set ARChessAPIBaseURL to enable Socratic Coach."
+      scheduleDelayedConnect()
+      if let currentContext, webSocketTask != nil {
         sendContextIfNeeded(force: true, context: currentContext)
       }
     } else {
@@ -1106,8 +1111,11 @@ private final class SocraticCoachStore: ObservableObject {
       return
     }
 
-    ensureConnectedIfNeeded()
-    sendContextIfNeeded(force: false, context: context)
+    if webSocketTask != nil {
+      sendContextIfNeeded(force: false, context: context)
+    } else {
+      scheduleDelayedConnect()
+    }
   }
 
   func requestStrategicBriefing() {
@@ -1115,6 +1123,7 @@ private final class SocraticCoachStore: ObservableObject {
       return
     }
 
+    delayedConnectWorkItem?.cancel()
     ensureConnectedIfNeeded()
     transcriptText = nil
     audioPlayer.stop()
@@ -1128,6 +1137,7 @@ private final class SocraticCoachStore: ObservableObject {
       return
     }
 
+    delayedConnectWorkItem?.cancel()
     ensureConnectedIfNeeded()
 
     switch micState {
@@ -1140,7 +1150,7 @@ private final class SocraticCoachStore: ObservableObject {
       }
 
       do {
-        try micCapture.start(unmuted: true)
+        try await startMicCapture(unmuted: true)
         statusText = "Mic live. Tap again to send your question."
       } catch {
         lastError = error.localizedDescription
@@ -1166,6 +1176,8 @@ private final class SocraticCoachStore: ObservableObject {
   func disconnect() {
     reconnectWorkItem?.cancel()
     reconnectWorkItem = nil
+    delayedConnectWorkItem?.cancel()
+    delayedConnectWorkItem = nil
     webSocketTask?.cancel(with: .goingAway, reason: nil)
     webSocketTask = nil
     micCapture.stop()
@@ -1200,6 +1212,24 @@ private final class SocraticCoachStore: ObservableObject {
     webSocketTask = task
     task.resume()
     receiveNextMessage()
+  }
+
+  private func scheduleDelayedConnect() {
+    guard isEnabled, isConfigured, webSocketTask == nil else {
+      return
+    }
+
+    delayedConnectWorkItem?.cancel()
+    let workItem = DispatchWorkItem { [weak self] in
+      Task { @MainActor [weak self] in
+        self?.ensureConnectedIfNeeded()
+        if let context = self?.currentContext {
+          self?.sendContextIfNeeded(force: true, context: context)
+        }
+      }
+    }
+    delayedConnectWorkItem = workItem
+    DispatchQueue.main.asyncAfter(deadline: .now() + Self.startupConnectDelay, execute: workItem)
   }
 
   private func receiveNextMessage() {
@@ -1374,6 +1404,20 @@ private final class SocraticCoachStore: ObservableObject {
     } catch {
       lastError = error.localizedDescription
       statusText = "Socratic Coach failed to encode a websocket message."
+    }
+  }
+
+  private func startMicCapture(unmuted: Bool) async throws {
+    let micCapture = self.micCapture
+    try await withCheckedThrowingContinuation { continuation in
+      DispatchQueue.global(qos: .userInitiated).async {
+        do {
+          try micCapture.start(unmuted: unmuted)
+          continuation.resume()
+        } catch {
+          continuation.resume(throwing: error)
+        }
+      }
     }
   }
 
@@ -6740,7 +6784,6 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       return false
     }
 
-    try? AudioSessionCoordinator.shared.activatePlaybackSession()
     let utterance = AVSpeechUtterance(string: line.text)
     utterance.voice = AVSpeechSynthesisVoice(language: "en-US")
     utterance.pitchMultiplier = min(max(resolvedPitch(for: line), 0.5), 2.0)
@@ -6769,7 +6812,6 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       return false
     }
 
-    try? AudioSessionCoordinator.shared.activatePlaybackSession()
     let utterance = AVSpeechUtterance(string: capped.text)
     utterance.voice = AVSpeechSynthesisVoice(language: "en-US")
     utterance.pitchMultiplier = 1.02
