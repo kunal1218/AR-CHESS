@@ -3817,6 +3817,7 @@ private final class AmbientMusicController {
   static let shared = AmbientMusicController()
 
   private static let logger = Logger(subsystem: "ARChess", category: "AmbientMusic")
+  private static let muteDefaultsKey = "AmbientMusicController.isMuted"
 
   private let queue = DispatchQueue(label: "ARChess.AmbientMusic")
   private var player: AVAudioPlayer?
@@ -3825,8 +3826,28 @@ private final class AmbientMusicController {
   private let speechDuckedVolume: Float = 0.0
   private var isSpeechActive = false
   private var isPlayingRequested = false
+  private var isMutedInternal = UserDefaults.standard.bool(forKey: muteDefaultsKey)
 
   private init() {}
+
+  var isMuted: Bool {
+    queue.sync { isMutedInternal }
+  }
+
+  func setMuted(_ muted: Bool) {
+    queue.async { [weak self] in
+      self?.applyMutedState(muted)
+    }
+  }
+
+  func toggleMuted() {
+    queue.async { [weak self] in
+      guard let self else {
+        return
+      }
+      self.applyMutedState(!self.isMutedInternal)
+    }
+  }
 
   func playLoopIfNeeded() {
     queue.async { [weak self] in
@@ -3838,6 +3859,10 @@ private final class AmbientMusicController {
       do {
         try self.preparePlayerIfNeeded()
         self.player?.volume = self.isSpeechActive ? self.speechDuckedVolume : self.idleVolume
+        guard !self.isMutedInternal else {
+          self.player?.pause()
+          return
+        }
         if self.player?.isPlaying != true {
           self.player?.play()
         }
@@ -3867,6 +3892,34 @@ private final class AmbientMusicController {
 
       self.isSpeechActive = active
       self.player?.setVolume(active ? self.speechDuckedVolume : self.idleVolume, fadeDuration: 0.18)
+    }
+  }
+
+  private func applyMutedState(_ muted: Bool) {
+    guard isMutedInternal != muted else {
+      return
+    }
+
+    isMutedInternal = muted
+    UserDefaults.standard.set(muted, forKey: Self.muteDefaultsKey)
+
+    if muted {
+      player?.pause()
+      return
+    }
+
+    guard isPlayingRequested else {
+      return
+    }
+
+    do {
+      try preparePlayerIfNeeded()
+      player?.volume = isSpeechActive ? speechDuckedVolume : idleVolume
+      if player?.isPlaying != true {
+        player?.play()
+      }
+    } catch {
+      Self.logger.error("Ambient music failed to resume: \(error.localizedDescription, privacy: .public)")
     }
   }
 
@@ -7480,6 +7533,7 @@ private struct NativeARExperienceView: View {
   @State private var isMatchLogVisible = false
   @State private var isGeminiDebugVisible = false
   @State private var isStockfishDebugVisible = false
+  @State private var isMusicMuted = AmbientMusicController.shared.isMuted
   @State private var notifiedCompletedLessonID: String?
 
   var body: some View {
@@ -7750,6 +7804,8 @@ private struct NativeARExperienceView: View {
                   syncStockfishDebugVisibility()
                 }
 
+                musicToggleButton
+
                 if socraticCoach.isVisibleInCurrentMode {
                   overlayToggleButton(
                     title: socraticCoach.micState.label,
@@ -7782,6 +7838,8 @@ private struct NativeARExperienceView: View {
               Spacer(minLength: 12)
 
               HStack(spacing: 8) {
+                musicToggleButton
+
                 ForEach(0..<3, id: \.self) { index in
                   lessonStrikeBadge(isUsed: index < lessonUsedStrikeCount)
                 }
@@ -7874,6 +7932,9 @@ private struct NativeARExperienceView: View {
       notifiedCompletedLessonID = lessonID
       markLessonComplete(lessonID)
     }
+    .onAppear {
+      isMusicMuted = AmbientMusicController.shared.isMuted
+    }
     .onDisappear {
       gameReview.resetSession()
       lessonStore.resetSession()
@@ -7922,35 +7983,63 @@ private struct NativeARExperienceView: View {
     .accessibilityLabel(title)
   }
 
+  private var musicToggleButton: some View {
+    overlayToggleButton(
+      title: isMusicMuted ? "Unmute Music" : "Mute Music",
+      systemImage: isMusicMuted ? "speaker.slash.fill" : "speaker.wave.2.fill",
+      foregroundColor: .white,
+      backgroundColor: isMusicMuted
+        ? Color(red: 0.38, green: 0.18, blue: 0.18).opacity(0.88)
+        : Color.black.opacity(0.54)
+    ) {
+      let nextMuted = !isMusicMuted
+      AmbientMusicController.shared.setMuted(nextMuted)
+      isMusicMuted = nextMuted
+    }
+  }
+
   private var reviewLoadingOverlay: some View {
     ZStack {
       Color.black.opacity(0.72)
         .ignoresSafeArea()
 
-      VStack(spacing: 18) {
-        Text("Game Review")
-          .font(.system(size: 34, weight: .heavy, design: .rounded))
-          .foregroundStyle(.white)
+      VStack {
+        HStack {
+          Spacer()
+          musicToggleButton
+        }
+        .padding(.horizontal, 18)
+        .padding(.top, 24)
 
-        ProgressView()
-          .scaleEffect(1.15)
-          .tint(Color(red: 0.95, green: 0.88, blue: 0.73))
+        Spacer()
 
-        Text("Preparing your biggest evaluation drops...")
-          .font(.system(size: 15, weight: .semibold, design: .rounded))
-          .foregroundStyle(Color.white.opacity(0.82))
+        VStack(spacing: 18) {
+          Text("Game Review")
+            .font(.system(size: 34, weight: .heavy, design: .rounded))
+            .foregroundStyle(.white)
+
+          ProgressView()
+            .scaleEffect(1.15)
+            .tint(Color(red: 0.95, green: 0.88, blue: 0.73))
+
+          Text("Preparing your biggest evaluation drops...")
+            .font(.system(size: 15, weight: .semibold, design: .rounded))
+            .foregroundStyle(Color.white.opacity(0.82))
+        }
+        .padding(.horizontal, 28)
+        .padding(.vertical, 30)
+        .background(
+          RoundedRectangle(cornerRadius: 30, style: .continuous)
+            .fill(Color(red: 0.07, green: 0.10, blue: 0.14).opacity(0.92))
+            .overlay(
+              RoundedRectangle(cornerRadius: 30, style: .continuous)
+                .stroke(Color.white.opacity(0.12), lineWidth: 1)
+            )
+        )
+        .padding(.horizontal, 24)
+
+        Spacer()
       }
-      .padding(.horizontal, 28)
-      .padding(.vertical, 30)
-      .background(
-        RoundedRectangle(cornerRadius: 30, style: .continuous)
-          .fill(Color(red: 0.07, green: 0.10, blue: 0.14).opacity(0.92))
-          .overlay(
-            RoundedRectangle(cornerRadius: 30, style: .continuous)
-              .stroke(Color.white.opacity(0.12), lineWidth: 1)
-          )
-      )
-      .padding(.horizontal, 24)
     }
   }
 
@@ -7959,42 +8048,55 @@ private struct NativeARExperienceView: View {
       Color.black.opacity(0.72)
         .ignoresSafeArea()
 
-      VStack(alignment: .leading, spacing: 16) {
-        Text("Game Review")
-          .font(.system(size: 34, weight: .heavy, design: .rounded))
-          .foregroundStyle(.white)
+      VStack {
+        HStack {
+          Spacer()
+          musicToggleButton
+        }
+        .padding(.horizontal, 18)
+        .padding(.top, 24)
 
-        Text("Review your \(gameReview.stagedCheckpointCount) biggest evaluation drops, or leave the match now.")
-          .font(.system(size: 16, weight: .semibold, design: .rounded))
-          .foregroundStyle(Color.white.opacity(0.84))
-          .lineSpacing(3)
+        Spacer()
 
-        HStack(spacing: 12) {
-          NativeActionButton(title: "Leave", style: .outline) {
-            gameReview.resetSession()
-            returnHome()
-          }
+        VStack(alignment: .leading, spacing: 16) {
+          Text("Game Review")
+            .font(.system(size: 34, weight: .heavy, design: .rounded))
+            .foregroundStyle(.white)
 
-          NativeActionButton(title: "Game Review", style: .solid) {
-            Task {
-              if !(await gameReview.startStagedReviewSequence()) {
-                returnHome()
+          Text("Review your \(gameReview.stagedCheckpointCount) biggest evaluation drops, or leave the match now.")
+            .font(.system(size: 16, weight: .semibold, design: .rounded))
+            .foregroundStyle(Color.white.opacity(0.84))
+            .lineSpacing(3)
+
+          HStack(spacing: 12) {
+            NativeActionButton(title: "Leave", style: .outline) {
+              gameReview.resetSession()
+              returnHome()
+            }
+
+            NativeActionButton(title: "Game Review", style: .solid) {
+              Task {
+                if !(await gameReview.startStagedReviewSequence()) {
+                  returnHome()
+                }
               }
             }
           }
         }
+        .padding(.horizontal, 28)
+        .padding(.vertical, 30)
+        .background(
+          RoundedRectangle(cornerRadius: 30, style: .continuous)
+            .fill(Color(red: 0.07, green: 0.10, blue: 0.14).opacity(0.92))
+            .overlay(
+              RoundedRectangle(cornerRadius: 30, style: .continuous)
+                .stroke(Color.white.opacity(0.12), lineWidth: 1)
+            )
+        )
+        .padding(.horizontal, 24)
+
+        Spacer()
       }
-      .padding(.horizontal, 28)
-      .padding(.vertical, 30)
-      .background(
-        RoundedRectangle(cornerRadius: 30, style: .continuous)
-          .fill(Color(red: 0.07, green: 0.10, blue: 0.14).opacity(0.92))
-          .overlay(
-            RoundedRectangle(cornerRadius: 30, style: .continuous)
-              .stroke(Color.white.opacity(0.12), lineWidth: 1)
-          )
-      )
-      .padding(.horizontal, 24)
     }
   }
 
@@ -8034,6 +8136,9 @@ private struct NativeARExperienceView: View {
           Spacer(minLength: 0)
 
           VStack(spacing: 10) {
+            musicToggleButton
+              .frame(width: 170)
+
             NativeActionButton(title: "Try again", style: .outline) {
               gameReview.restartCurrentCheckpoint()
             }
