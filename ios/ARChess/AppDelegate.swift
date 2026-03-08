@@ -150,6 +150,8 @@ private enum NarratorType: String, CaseIterable, Identifiable {
 
 private let geminiNarrationSentenceLimit = 5
 private let geminiNarrationCharacterLimit = 320
+private let experienceLaunchDelayNanoseconds: UInt64 = 650_000_000
+private let experienceStartupRemoteWorkDelayNanoseconds: UInt64 = 850_000_000
 
 private func cappedNarrationText(
   _ text: String,
@@ -192,6 +194,36 @@ private func cappedNarrationText(
   }
 
   return (capped, truncated)
+}
+
+private let centerFocusHighlightSquares = ["d4", "e4", "d5", "e5"]
+
+private func narrationHighlightSquares(for text: String) -> [String]? {
+  let normalized = text
+    .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+    .trimmingCharacters(in: .whitespacesAndNewlines)
+    .lowercased()
+  guard !normalized.isEmpty else {
+    return nil
+  }
+
+  if normalized.contains("board's heart")
+    || normalized.contains("crossroads at the board's heart")
+    || normalized.contains("the center")
+    || normalized.contains("center control")
+    || normalized.contains("central tension")
+    || normalized.contains("central control")
+    || normalized.contains("central space")
+    || normalized.contains("central squares")
+    || normalized.contains("control the center")
+    || normalized.contains("fight for the center")
+    || normalized.contains("contest the center")
+    || normalized.contains("in the center")
+    || normalized.contains("central") {
+    return centerFocusHighlightSquares
+  }
+
+  return nil
 }
 
 private enum StockfishMatchLaunchKind: Hashable {
@@ -252,6 +284,34 @@ private enum ExperienceMode: Hashable {
   case passAndPlay(PlayerMode)
   case queueMatch
   case playVsStockfish(StockfishMatchConfiguration)
+
+  var loadingTitle: String {
+    switch self {
+    case .lesson(let lesson):
+      return "Loading \(lesson.title)"
+    case .passAndPlay(let mode):
+      return mode == .create ? "Creating AR Board" : "Joining AR Board"
+    case .queueMatch:
+      return "Opening Match Arena"
+    case .playVsStockfish:
+      return "Preparing Stockfish Match"
+    }
+  }
+
+  var loadingSummary: String {
+    switch self {
+    case .lesson:
+      return "Starting camera, staging the lesson position, and keeping the board load off the first visible frame."
+    case .passAndPlay(let mode):
+      return mode == .create
+        ? "Starting camera, building the board, and giving the scene a moment to settle before you enter."
+        : "Starting camera, aligning the scene, and preparing the shared board without dropping the first frame."
+    case .queueMatch:
+      return "Starting camera, preparing the synchronized board, and deferring network sync until the scene is visible."
+    case .playVsStockfish:
+      return "Starting camera, building the board, and holding engine startup until the AR scene is stable."
+    }
+  }
 
   var supportsPostGameReview: Bool {
     switch self {
@@ -353,6 +413,7 @@ private enum NativeScreen {
   case landing
   case lobby(PlayerMode)
   case queueMatch
+  case experienceLoading(ExperienceMode)
   case experience(ExperienceMode)
 }
 
@@ -1331,6 +1392,7 @@ private final class SocraticCoachStore: ObservableObject {
       let capped = (payload["text"] as? String).flatMap(Self.sanitizedTranscript)
       if let capped {
         transcriptText = capped.text
+        maybeHighlightNarrationFocus(capped.text)
       } else {
         transcriptText = nil
       }
@@ -1419,6 +1481,13 @@ private final class SocraticCoachStore: ObservableObject {
         }
       }
     }
+  }
+
+  private func maybeHighlightNarrationFocus(_ text: String) {
+    guard let squares = narrationHighlightSquares(for: text) else {
+      return
+    }
+    threatZoneHandler?(squares, "Central focus")
   }
 
   private static func sanitizedTranscript(_ text: String) -> (text: String, truncated: Bool)? {
@@ -5352,6 +5421,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   private let synthesizer = AVSpeechSynthesizer()
   private let narrator: NarratorType
   private var utteranceCaptions: [ObjectIdentifier: Caption] = [:]
+  private var narrationHighlightHandler: (([String], String?) -> Void)?
   private var cachedAnalysis: CachedAnalysis?
   private var stockfishDebugAnalysisCache: [String: StockfishAnalysis] = [:]
   private var completedPlyCount = 0
@@ -5679,6 +5749,14 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
 
   func unbindReactionHandler() {
     reactionHandler = nil
+  }
+
+  func bindNarrationHighlightHandler(_ handler: @escaping ([String], String?) -> Void) {
+    narrationHighlightHandler = handler
+  }
+
+  func unbindNarrationHighlightHandler() {
+    narrationHighlightHandler = nil
   }
 
   func handleMove(
@@ -6791,6 +6869,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     utterance.volume = min(max(line.volume ?? line.speaker.defaultVolume, 0.0), 1.0)
     utterance.preUtteranceDelay = 0.02
     utteranceCaptions[ObjectIdentifier(utterance)] = Caption(speaker: line.speaker, line: line.text)
+    maybeHighlightNarrationFocus(line.text)
     synthesizer.speak(utterance)
     return true
   }
@@ -6823,8 +6902,16 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       line: capped.text,
       imageAssetName: "GeminiNarratorPortrait"
     )
+    maybeHighlightNarrationFocus(capped.text)
     synthesizer.speak(utterance)
     return true
+  }
+
+  private func maybeHighlightNarrationFocus(_ text: String) {
+    guard let squares = narrationHighlightSquares(for: text) else {
+      return
+    }
+    narrationHighlightHandler?(squares, "Central focus")
   }
 
   private func resolvedPitch(for line: SpokenLine) -> Float {
@@ -6958,9 +7045,7 @@ private struct ARChessRootView: View {
         CourseLibraryView(
           completedLessonIDs: completedLessonIDs,
           openLesson: { lesson in
-            withAnimation(.spring(response: 0.42, dampingFraction: 0.88)) {
-              screen = .experience(.lesson(lesson))
-            }
+            beginExperienceLaunch(.lesson(lesson))
           },
           goBack: {
             withAnimation(.spring(response: 0.42, dampingFraction: 0.88)) {
@@ -6971,9 +7056,7 @@ private struct ARChessRootView: View {
       case .stockfishSetup:
         StockfishSetupView(
           openExperience: { configuration in
-            withAnimation(.spring(response: 0.42, dampingFraction: 0.88)) {
-              screen = .experience(.playVsStockfish(configuration))
-            }
+            beginExperienceLaunch(.playVsStockfish(configuration))
           },
           goBack: {
             withAnimation(.spring(response: 0.42, dampingFraction: 0.88)) {
@@ -6991,9 +7074,7 @@ private struct ARChessRootView: View {
         LobbyView(
           mode: mode,
           openExperience: {
-            withAnimation(.spring(response: 0.42, dampingFraction: 0.88)) {
-              screen = .experience(.passAndPlay(mode))
-            }
+            beginExperienceLaunch(.passAndPlay(mode))
           },
           goBack: {
             withAnimation(.spring(response: 0.42, dampingFraction: 0.88)) {
@@ -7005,9 +7086,7 @@ private struct ARChessRootView: View {
         QueueMatchView(
           queueMatch: queueMatch,
           openExperience: {
-            withAnimation(.spring(response: 0.42, dampingFraction: 0.88)) {
-              screen = .experience(.queueMatch)
-            }
+            beginExperienceLaunch(.queueMatch)
           },
           goBack: {
             Task {
@@ -7016,6 +7095,17 @@ private struct ARChessRootView: View {
             withAnimation(.spring(response: 0.42, dampingFraction: 0.88)) {
               screen = .modeSelection
             }
+          }
+        )
+      case .experienceLoading(let mode):
+        ExperienceLoadingView(
+          mode: mode,
+          narrator: selectedNarrator,
+          openExperience: {
+            finishExperienceLaunch(mode)
+          },
+          cancel: {
+            cancelExperienceLaunch(mode)
           }
         )
       case .experience(let mode):
@@ -7068,6 +7158,131 @@ private struct ARChessRootView: View {
           }
         )
       }
+    }
+  }
+
+  private func beginExperienceLaunch(_ mode: ExperienceMode) {
+    withAnimation(.spring(response: 0.42, dampingFraction: 0.88)) {
+      screen = .experienceLoading(mode)
+    }
+  }
+
+  private func finishExperienceLaunch(_ mode: ExperienceMode) {
+    var transaction = Transaction()
+    transaction.disablesAnimations = true
+    withTransaction(transaction) {
+      screen = .experience(mode)
+    }
+  }
+
+  private func cancelExperienceLaunch(_ mode: ExperienceMode) {
+    withAnimation(.spring(response: 0.38, dampingFraction: 0.90)) {
+      switch mode {
+      case .lesson:
+        screen = .course
+      case .passAndPlay(let playerMode):
+        screen = .lobby(playerMode)
+      case .queueMatch:
+        screen = .queueMatch
+      case .playVsStockfish:
+        screen = .stockfishSetup
+      }
+    }
+  }
+}
+
+private struct ExperienceLoadingView: View {
+  let mode: ExperienceMode
+  let narrator: NarratorType
+  let openExperience: () -> Void
+  let cancel: () -> Void
+
+  var body: some View {
+    ZStack {
+      ChessboardBackdrop()
+      LinearGradient(
+        colors: [
+          Color.black.opacity(0.36),
+          Color(red: 0.04, green: 0.07, blue: 0.10).opacity(0.90),
+          Color.black.opacity(0.86),
+        ],
+        startPoint: .top,
+        endPoint: .bottom
+      )
+      .ignoresSafeArea()
+
+      VStack(spacing: 22) {
+        Spacer()
+
+        VStack(alignment: .leading, spacing: 16) {
+          Text("AR Boot")
+            .font(.system(size: 12, weight: .bold, design: .rounded))
+            .tracking(2.0)
+            .foregroundStyle(Color(red: 0.84, green: 0.78, blue: 0.66))
+
+          Text(mode.loadingTitle)
+            .font(.system(size: 34, weight: .heavy, design: .rounded))
+            .foregroundStyle(.white)
+
+          Text(mode.loadingSummary)
+            .font(.system(size: 17, weight: .medium, design: .rounded))
+            .foregroundStyle(Color.white.opacity(0.82))
+            .lineSpacing(4)
+
+          HStack(spacing: 12) {
+            ProgressView()
+              .tint(Color.white.opacity(0.94))
+
+            Text("Narrator: \(narrator.displayName)")
+              .font(.system(size: 14, weight: .bold, design: .rounded))
+              .foregroundStyle(Color.white.opacity(0.92))
+          }
+
+          VStack(alignment: .leading, spacing: 10) {
+            loadingStep("Starting camera pipeline")
+            loadingStep("Staging board assets")
+            loadingStep("Holding heavy sync until after entry")
+          }
+          .padding(.top, 2)
+
+          NativeActionButton(title: "Back", style: .outline) {
+            cancel()
+          }
+          .padding(.top, 6)
+        }
+        .padding(24)
+        .background(
+          RoundedRectangle(cornerRadius: 30, style: .continuous)
+            .fill(Color(red: 0.07, green: 0.10, blue: 0.14).opacity(0.90))
+            .overlay(
+              RoundedRectangle(cornerRadius: 30, style: .continuous)
+                .stroke(Color.white.opacity(0.12), lineWidth: 1)
+            )
+        )
+
+        Spacer()
+      }
+      .padding(.horizontal, 24)
+      .padding(.vertical, 30)
+    }
+    .task(id: mode) {
+      try? await Task.sleep(nanoseconds: experienceLaunchDelayNanoseconds)
+      guard !Task.isCancelled else {
+        return
+      }
+      openExperience()
+    }
+  }
+
+  private func loadingStep(_ text: String) -> some View {
+    HStack(spacing: 10) {
+      Circle()
+        .fill(Color(red: 0.93, green: 0.84, blue: 0.62))
+        .frame(width: 8, height: 8)
+
+      Text(text)
+        .font(.system(size: 14, weight: .semibold, design: .rounded))
+        .foregroundStyle(Color.white.opacity(0.78))
     }
   }
 }
@@ -8184,7 +8399,6 @@ private struct NativeARExperienceView: View {
       }
     }
     .task {
-      socraticCoach.setEnabled(mode.supportsSocraticCoach && gameReview.phase == .idle)
       lessonStore.configure(for: mode)
       if mode.usesLocalMatchLog {
         // Remote move logs assume a standard game start, so custom-FEN devCheck
@@ -8193,9 +8407,26 @@ private struct NativeARExperienceView: View {
           enabled: mode.allowsRemoteMatchLogSync,
           disabledReason: mode.matchLogStatusSummary
         )
-        if mode.allowsRemoteMatchLogSync {
-          await matchLog.prepareRemoteGameIfNeeded()
+      }
+
+      socraticCoach.setEnabled(mode.supportsSocraticCoach && gameReview.phase == .idle)
+
+      let shouldDelayRemoteStartup: Bool
+      if case .queueMatch = mode {
+        shouldDelayRemoteStartup = true
+      } else {
+        shouldDelayRemoteStartup = mode.allowsRemoteMatchLogSync
+      }
+
+      if shouldDelayRemoteStartup {
+        try? await Task.sleep(nanoseconds: experienceStartupRemoteWorkDelayNanoseconds)
+        guard !Task.isCancelled else {
+          return
         }
+      }
+
+      if mode.usesLocalMatchLog, mode.allowsRemoteMatchLogSync {
+        await matchLog.prepareRemoteGameIfNeeded()
       } else if case .queueMatch = mode {
         await queueMatch.activateMatchSync()
       }
@@ -8234,6 +8465,7 @@ private struct NativeARExperienceView: View {
       commentary.unbindHintAvailabilityProvider()
       commentary.unbindRecentHistoryProvider()
       commentary.unbindReactionHandler()
+      commentary.unbindNarrationHighlightHandler()
       socraticCoach.unbindThreatZoneHandler()
       socraticCoach.disconnect()
       switch mode {
@@ -9954,6 +10186,12 @@ private struct NativeARView: UIViewRepresentable {
       let san: String
     }
 
+    private struct PiecePrototypeKey: Hashable {
+      let kind: ChessPieceKind
+      let color: ChessColor
+      let isGhost: Bool
+    }
+
     private struct AnimatedMoveContext {
       let move: ChessMove
       let beforeState: ChessGameState
@@ -9965,6 +10203,44 @@ private struct NativeARView: UIViewRepresentable {
       let targetSquares: [BoardSquare]
       let clearsOnMoveBy: ChessColor
     }
+
+    private static let boardTemplateSize: Float = 0.40
+    private static let boardSquareSize: Float = boardTemplateSize / 8.0
+    private static let boardBaseMesh = MeshResource.generateBox(
+      size: SIMD3<Float>(boardTemplateSize + 0.03, 0.012, boardTemplateSize + 0.03)
+    )
+    private static let boardBaseMaterial = SimpleMaterial(
+      color: UIColor(red: 0.18, green: 0.12, blue: 0.08, alpha: 1),
+      roughness: 0.65,
+      isMetallic: false
+    )
+    private static let boardSquareMesh = MeshResource.generateBox(
+      size: SIMD3<Float>(boardSquareSize, 0.004, boardSquareSize)
+    )
+    private static let darkSquareMaterial = SimpleMaterial(
+      color: UIColor(red: 0.22, green: 0.18, blue: 0.15, alpha: 1),
+      roughness: 0.35,
+      isMetallic: false
+    )
+    private static let lightSquareMaterial = SimpleMaterial(
+      color: UIColor(red: 0.93, green: 0.88, blue: 0.79, alpha: 1),
+      roughness: 0.35,
+      isMetallic: false
+    )
+    private static let boardBasePrototype: ModelEntity = {
+      ModelEntity(mesh: boardBaseMesh, materials: [boardBaseMaterial])
+    }()
+    private static let darkSquarePrototype: ModelEntity = {
+      let entity = ModelEntity(mesh: boardSquareMesh, materials: [darkSquareMaterial])
+      entity.generateCollisionShapes(recursive: false)
+      return entity
+    }()
+    private static let lightSquarePrototype: ModelEntity = {
+      let entity = ModelEntity(mesh: boardSquareMesh, materials: [lightSquareMaterial])
+      entity.generateCollisionShapes(recursive: false)
+      return entity
+    }()
+    private static var piecePrototypeCache: [PiecePrototypeKey: Entity] = [:]
 
     private let boardSize: Float = 0.40
     private let boardInset: Float = 0.035
@@ -9983,6 +10259,7 @@ private struct NativeARView: UIViewRepresentable {
     private var boardAnchor: AnchorEntity?
     private var boardWorldTransform: simd_float4x4?
     private var boardRoot = Entity()
+    private var hasPreparedBoardScene = false
     private var boardScale: Float = 1.0
     private var boardViewerColor: ChessColor = .black
     private var pinchStartScale: Float = 1.0
@@ -10114,6 +10391,10 @@ private struct NativeARView: UIViewRepresentable {
       arView.session.delegate = self
       arView.session.run(configuration, options: [.resetTracking, .removeExistingAnchors])
 
+      DispatchQueue.main.async { [weak self] in
+        self?.prepareBoardSceneIfNeeded()
+      }
+
       if !hasBoundReactionHandler {
         hasBoundReactionHandler = true
         Task { @MainActor [weak self] in
@@ -10123,6 +10404,9 @@ private struct NativeARView: UIViewRepresentable {
 
           self.commentary.bindReactionHandler { [weak self] cue in
             self?.handleReactionCue(cue)
+          }
+          self.commentary.bindNarrationHighlightHandler { [weak self] squares, _ in
+            self?.showThreatOverlay(algebraicSquares: squares)
           }
           self.commentary.bindStateProvider { [weak self] in
             self?.gameState
@@ -10212,6 +10496,9 @@ private struct NativeARView: UIViewRepresentable {
       syncReviewStateIfNeeded()
       syncAutomatedOpponentTurnIfNeeded()
       syncSocraticCoachContext()
+      if boardAnchor == nil {
+        prepareBoardSceneIfNeeded()
+      }
     }
 
     nonisolated func session(_ session: ARSession, didAdd anchors: [ARAnchor]) {
@@ -10363,6 +10650,11 @@ private struct NativeARView: UIViewRepresentable {
         return
       }
 
+      guard boardAnchor != nil else {
+        prepareBoardSceneIfNeeded(force: true)
+        return
+      }
+
       boardViewerColor = viewerColor
       rebuildBoardEntityForPerspective()
     }
@@ -10376,6 +10668,19 @@ private struct NativeARView: UIViewRepresentable {
       let refreshedBoardRoot = makeBoardEntity()
       boardAnchor.addChild(refreshedBoardRoot)
       refreshBoardPresentation()
+      hasPreparedBoardScene = true
+    }
+
+    private func prepareBoardSceneIfNeeded(force: Bool = false) {
+      let viewerColor = desiredBoardViewerColor()
+      guard force || !hasPreparedBoardScene || boardViewerColor != viewerColor else {
+        return
+      }
+
+      boardViewerColor = viewerColor
+      _ = makeBoardEntity()
+      refreshBoardPresentation()
+      hasPreparedBoardScene = true
     }
 
     private func syncSocraticCoachContext(force: Bool = false) {
@@ -11993,16 +12298,18 @@ private struct NativeARView: UIViewRepresentable {
 
       boardScale = preferredInitialBoardScale(for: selectedPlane)
       let transform = boardTransform(for: selectedPlane, frame: frame)
+      prepareBoardSceneIfNeeded(force: !hasPreparedBoardScene)
 
       if let arView {
         let boardAnchor = AnchorEntity(world: transform)
-        boardViewerColor = desiredBoardViewerColor()
-        boardAnchor.addChild(makeBoardEntity())
+        applyBoardScale()
+        boardAnchor.addChild(boardRoot)
         arView.scene.addAnchor(boardAnchor)
         self.boardAnchor = boardAnchor
         boardWorldTransform = transform
-        refreshBoardPresentation()
-        AmbientMusicController.shared.playLoopIfNeeded()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+          AmbientMusicController.shared.playLoopIfNeeded()
+        }
       }
 
       trackedPlaneID = selectedPlane.identifier
@@ -12229,29 +12536,19 @@ private struct NativeARView: UIViewRepresentable {
       activeThreatEntities = []
 
       let squareSize = boardSize / 8.0
-      let baseMesh = MeshResource.generateBox(size: SIMD3<Float>(boardSize + 0.03, 0.012, boardSize + 0.03))
-      let baseMaterial = SimpleMaterial(
-        color: UIColor(red: 0.18, green: 0.12, blue: 0.08, alpha: 1),
-        roughness: 0.65,
-        isMetallic: false
-      )
-      let baseEntity = ModelEntity(mesh: baseMesh, materials: [baseMaterial])
+      let baseEntity = Self.boardBasePrototype.clone(recursive: false)
       baseEntity.position = SIMD3<Float>(0, -0.010, 0)
       boardRoot.addChild(baseEntity)
 
       for rank in 0..<8 {
         for file in 0..<8 {
-          let squareMesh = MeshResource.generateBox(size: SIMD3<Float>(squareSize, 0.004, squareSize))
-          let squareColor: UIColor = (rank + file).isMultiple(of: 2)
-            ? UIColor(red: 0.22, green: 0.18, blue: 0.15, alpha: 1)
-            : UIColor(red: 0.93, green: 0.88, blue: 0.79, alpha: 1)
-
-          let squareMaterial = SimpleMaterial(color: squareColor, roughness: 0.35, isMetallic: false)
-          let squareEntity = ModelEntity(mesh: squareMesh, materials: [squareMaterial])
+          let squareEntity = ((rank + file).isMultiple(of: 2)
+            ? Self.darkSquarePrototype
+            : Self.lightSquarePrototype
+          ).clone(recursive: false)
           let square = BoardSquare(file: file, rank: rank)
           squareEntity.position = boardPosition(square, squareSize: squareSize)
           squareEntity.name = squareName(square)
-          squareEntity.generateCollisionShapes(recursive: false)
           boardRoot.addChild(squareEntity)
         }
       }
@@ -12284,7 +12581,7 @@ private struct NativeARView: UIViewRepresentable {
           continue
         }
 
-        let pieceEntity = makePieceEntity(kind: piece.kind, material: pieceMaterial(for: piece.color))
+        let pieceEntity = piecePrototype(for: piece.kind, color: piece.color).clone(recursive: true)
         pieceEntity.name = pieceName(square)
         pieceEntity.position = boardPosition(square, squareSize: squareSize)
         pieceEntity.orientation = pieceFacingOrientation(for: piece.color)
@@ -12303,7 +12600,6 @@ private struct NativeARView: UIViewRepresentable {
           )
         }
 
-        pieceEntity.generateCollisionShapes(recursive: true)
         piecesContainer.addChild(pieceEntity)
       }
     }
@@ -12344,10 +12640,11 @@ private struct NativeARView: UIViewRepresentable {
         revealHighlight.position = boardPosition(revealSquare, squareSize: squareSize) + SIMD3<Float>(0, 0.0036, 0)
         highlightsContainer.addChild(revealHighlight)
 
-        let ghost = makePieceEntity(
-          kind: expectedMove.piece.kind,
-          material: ghostPieceMaterial(for: expectedMove.piece.color)
-        )
+        let ghost = piecePrototype(
+          for: expectedMove.piece.kind,
+          color: expectedMove.piece.color,
+          isGhost: true
+        ).clone(recursive: true)
         ghost.name = "lesson_ghost_piece"
         ghost.position = boardPosition(revealSquare, squareSize: squareSize) + SIMD3<Float>(0, 0.0015, 0)
         ghost.scale = SIMD3<Float>(repeating: 0.96)
@@ -12400,6 +12697,25 @@ private struct NativeARView: UIViewRepresentable {
 
     private func pieceName(_ square: BoardSquare) -> String {
       "piece_\(square.file)_\(square.rank)"
+    }
+
+    private func piecePrototype(
+      for kind: ChessPieceKind,
+      color: ChessColor,
+      isGhost: Bool = false
+    ) -> Entity {
+      let key = PiecePrototypeKey(kind: kind, color: color, isGhost: isGhost)
+      if let cached = Self.piecePrototypeCache[key] {
+        return cached
+      }
+
+      let material = isGhost ? ghostPieceMaterial(for: color) : pieceMaterial(for: color)
+      let prototype = makePieceEntity(kind: kind, material: material)
+      if !isGhost {
+        prototype.generateCollisionShapes(recursive: true)
+      }
+      Self.piecePrototypeCache[key] = prototype
+      return prototype
     }
 
     private func square(for entity: Entity, prefix: String) -> BoardSquare? {
