@@ -2434,9 +2434,7 @@ private final class OpeningLessonStore: ObservableObject {
 
     isMoveRevealed = true
     isLoadingFeedback = false
-    if feedbackText == nil {
-      feedbackText = "The move is revealed. Now play the highlighted move yourself to continue."
-    }
+    feedbackText = nil
   }
 
   func noteRevealedMoveReminder() {
@@ -2444,7 +2442,7 @@ private final class OpeningLessonStore: ObservableObject {
       return
     }
 
-    feedbackText = "Follow the highlighted destination square and move the real piece there to continue."
+    feedbackText = nil
   }
 
   func registerIncorrectAttempt() -> Int? {
@@ -2465,13 +2463,15 @@ private final class OpeningLessonStore: ObservableObject {
     return requestID
   }
 
-  func applyFeedback(_ text: String, for requestID: Int) {
+  @discardableResult
+  func applyFeedback(_ text: String, for requestID: Int) -> Bool {
     guard phase == .active, requestID == feedbackRequestID else {
-      return
+      return false
     }
 
     isLoadingFeedback = false
     feedbackText = text
+    return true
   }
 
   func advanceAfterCorrectMove() -> String? {
@@ -4564,6 +4564,11 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     }
   }
 
+  func narrateLessonFeedback(_ text: String) {
+    appendGeminiDebug("Narrating Gemini lesson feedback.")
+    _ = speakGeminiNarration(text: text, title: "Gemini", priority: .urgent)
+  }
+
   func bindReactionHandler(_ handler: @escaping (ReactionCue) -> Void) {
     reactionHandler = handler
   }
@@ -5672,6 +5677,10 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   }
 
   private func speakHintNarration(text: String, priority: SpeechPriority) -> Bool {
+    speakGeminiNarration(text: text, title: "Gemini Hint", priority: priority)
+  }
+
+  private func speakGeminiNarration(text: String, title: String, priority: SpeechPriority) -> Bool {
     if priority == .urgent {
       _ = synthesizer.stopSpeaking(at: .immediate)
       utteranceCaptions.removeAll()
@@ -5686,7 +5695,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     utterance.volume = 0.92
     utterance.preUtteranceDelay = 0.02
     utteranceCaptions[ObjectIdentifier(utterance)] = Caption(
-      title: "Gemini Hint",
+      title: title,
       line: text,
       imageAssetName: "GeminiNarratorPortrait"
     )
@@ -6881,15 +6890,36 @@ private struct NativeARExperienceView: View {
               }
 
               Spacer(minLength: 16)
+            } else if let lesson = lessonStore.activeLesson {
+              Text(lesson.title)
+                .font(.system(size: 22, weight: .heavy, design: .rounded))
+                .foregroundStyle(.white)
+                .lineLimit(2)
+                .multilineTextAlignment(.leading)
+
+              Spacer(minLength: 12)
+
+              HStack(spacing: 8) {
+                ForEach(0..<3, id: \.self) { index in
+                  lessonStrikeBadge(isUsed: index < lessonUsedStrikeCount)
+                }
+              }
+
+              overlayToggleButton(
+                title: "Exit AR",
+                systemImage: "xmark"
+              ) {
+                closeExperience()
+              }
             } else {
               Spacer(minLength: 0)
-            }
 
-            overlayToggleButton(
-              title: "Exit AR",
-              systemImage: "xmark"
-            ) {
-              closeExperience()
+              overlayToggleButton(
+                title: "Exit AR",
+                systemImage: "xmark"
+              ) {
+                closeExperience()
+              }
             }
           }
           .padding(.horizontal, 18)
@@ -6897,6 +6927,18 @@ private struct NativeARExperienceView: View {
 
           Spacer()
         }
+      }
+
+      if gameReview.phase == .idle, isLessonMode, let caption = lessonNarrationCaption {
+        VStack {
+          Spacer()
+
+          PieceSpeechBubble(caption: caption)
+            .allowsHitTesting(false)
+            .transition(.move(edge: .bottom).combined(with: .opacity))
+        }
+        .padding(.horizontal, 18)
+        .padding(.bottom, 24)
       }
 
       if gameReview.isAwaitingEntryDecision {
@@ -7164,142 +7206,75 @@ private struct NativeARExperienceView: View {
           )
           .padding(.horizontal, 24)
         }
-      } else if let lesson = lessonStore.activeLesson, let step = lessonStore.currentStep, lessonStore.isAwaitingPlayerMove {
-        VStack(spacing: 14) {
-          HStack(alignment: .top, spacing: 16) {
-            VStack(alignment: .leading, spacing: 8) {
-              Text("Lesson")
-                .font(.system(size: 12, weight: .bold, design: .rounded))
-                .tracking(2.0)
-                .foregroundStyle(Color(red: 0.88, green: 0.82, blue: 0.70))
+      } else {
+        Spacer()
 
-              Text(lesson.title)
-                .font(.system(size: 25, weight: .heavy, design: .rounded))
-                .foregroundStyle(.white)
+        if lessonStore.isAwaitingPlayerMove {
+          HStack {
+            Spacer()
 
-              Text("Step \(lessonStore.currentPlayableStepNumber) of \(lessonStore.totalPlayableStepCount)")
-                .font(.system(size: 14, weight: .semibold, design: .rounded))
-                .foregroundStyle(Color.white.opacity(0.88))
-
-              Text("Remaining tries: \(lessonStore.remainingTries)")
-                .font(.system(size: 13, weight: .bold, design: .rounded))
-                .foregroundStyle(Color(red: 0.95, green: 0.88, blue: 0.73))
-
-              Text("You play \(lesson.studentColor.displayName). \(lesson.studentColor.opponent.displayName) replies automatically.")
-                .font(.system(size: 12, weight: .semibold, design: .rounded))
-                .foregroundStyle(Color.white.opacity(0.76))
-                .lineSpacing(2)
-
-              Text(step.prompt)
-                .font(.system(size: 14, weight: .semibold, design: .rounded))
-                .foregroundStyle(Color.white.opacity(0.88))
-                .lineSpacing(2)
-
-              if lessonStore.isMoveRevealed {
-                Text("Move revealed. Follow the highlighted destination square and ghost piece, then make the move yourself.")
-                  .font(.system(size: 12, weight: .bold, design: .rounded))
-                  .foregroundStyle(Color(red: 0.57, green: 0.90, blue: 0.68))
-                  .lineSpacing(2)
-              }
+            NativeActionButton(title: "See Move", style: .solid) {
+              lessonStore.revealCurrentMove()
             }
-            .padding(18)
-            .background(
-              RoundedRectangle(cornerRadius: 24, style: .continuous)
-                .fill(Color(red: 0.07, green: 0.10, blue: 0.14).opacity(0.88))
-                .overlay(
-                  RoundedRectangle(cornerRadius: 24, style: .continuous)
-                    .stroke(Color.white.opacity(0.12), lineWidth: 1)
-                )
-            )
-
-            Spacer(minLength: 0)
-
-            VStack(spacing: 10) {
-              NativeActionButton(title: "See Move", style: .solid) {
-                lessonStore.revealCurrentMove()
-              }
-              .frame(width: 170)
-            }
+            .frame(width: 170)
           }
-
-          if lessonStore.isLoadingFeedback {
-            HStack(spacing: 10) {
-              ProgressView()
-                .tint(Color(red: 0.95, green: 0.88, blue: 0.73))
-
-              Text("Gemini is explaining the opening idea...")
-                .font(.system(size: 13, weight: .semibold, design: .rounded))
-                .foregroundStyle(Color.white.opacity(0.82))
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, 18)
-            .padding(.vertical, 14)
-            .background(
-              RoundedRectangle(cornerRadius: 20, style: .continuous)
-                .fill(Color(red: 0.07, green: 0.10, blue: 0.14).opacity(0.88))
-                .overlay(
-                  RoundedRectangle(cornerRadius: 20, style: .continuous)
-                    .stroke(Color.white.opacity(0.12), lineWidth: 1)
-                )
-            )
-          } else if let feedback = lessonStore.feedbackText {
-            VStack(alignment: .leading, spacing: 8) {
-              Text("Feedback")
-                .font(.system(size: 12, weight: .bold, design: .rounded))
-                .tracking(1.6)
-                .foregroundStyle(Color(red: 0.88, green: 0.82, blue: 0.70))
-
-              Text(feedback)
-                .font(.system(size: 14, weight: .semibold, design: .rounded))
-                .foregroundStyle(Color.white.opacity(0.88))
-                .lineSpacing(2)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, 18)
-            .padding(.vertical, 14)
-            .background(
-              RoundedRectangle(cornerRadius: 20, style: .continuous)
-                .fill(Color(red: 0.07, green: 0.10, blue: 0.14).opacity(0.88))
-                .overlay(
-                  RoundedRectangle(cornerRadius: 20, style: .continuous)
-                    .stroke(Color.white.opacity(0.12), lineWidth: 1)
-                )
-            )
-          }
+          .padding(.horizontal, 18)
+          .padding(.bottom, lessonActionBottomInset)
         }
-        .padding(.horizontal, 18)
-        .padding(.top, 78)
-      } else if let lesson = lessonStore.activeLesson, lessonStore.isAutoPlayingOpponentMove {
-        VStack(alignment: .leading, spacing: 10) {
-          Text(lesson.title)
-            .font(.system(size: 18, weight: .heavy, design: .rounded))
-            .foregroundStyle(.white)
+      }
+    }
+  }
 
-          Text("\(lesson.studentColor.opponent.displayName) replies automatically in this lesson.")
-            .font(.system(size: 14, weight: .semibold, design: .rounded))
-            .foregroundStyle(Color.white.opacity(0.84))
+  private var lessonUsedStrikeCount: Int {
+    let used = 3 - lessonStore.remainingTries
+    return max(0, min(3, used))
+  }
 
-          Text("Watch the move play out, then make your next prediction.")
-            .font(.system(size: 13, weight: .medium, design: .rounded))
-            .foregroundStyle(Color.white.opacity(0.74))
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.horizontal, 18)
-        .padding(.vertical, 16)
-        .background(
-          RoundedRectangle(cornerRadius: 20, style: .continuous)
-            .fill(Color(red: 0.07, green: 0.10, blue: 0.14).opacity(0.88))
-            .overlay(
-              RoundedRectangle(cornerRadius: 20, style: .continuous)
-                .stroke(Color.white.opacity(0.12), lineWidth: 1)
+  private var lessonNarrationCaption: PiecePersonalityDirector.Caption? {
+    if let caption = commentary.caption {
+      return caption
+    }
+
+    guard isLessonMode,
+          let feedback = lessonStore.feedbackText?.trimmingCharacters(in: .whitespacesAndNewlines),
+          !feedback.isEmpty else {
+      return nil
+    }
+
+    return PiecePersonalityDirector.Caption(
+      title: "Gemini",
+      line: feedback,
+      imageAssetName: "GeminiNarratorPortrait"
+    )
+  }
+
+  private var lessonActionBottomInset: CGFloat {
+    lessonNarrationCaption == nil ? 30 : 138
+  }
+
+  private func lessonStrikeBadge(isUsed: Bool) -> some View {
+    ZStack {
+      Circle()
+        .fill(
+          isUsed
+            ? Color(red: 0.91, green: 0.31, blue: 0.33).opacity(0.94)
+            : Color.white.opacity(0.10)
+        )
+        .overlay(
+          Circle()
+            .stroke(
+              isUsed
+                ? Color(red: 1.0, green: 0.74, blue: 0.72).opacity(0.80)
+                : Color.white.opacity(0.16),
+              lineWidth: 1
             )
         )
-        .padding(.horizontal, 18)
-        .padding(.top, 78)
-      }
 
-      Spacer()
+      Image(systemName: "xmark")
+        .font(.system(size: 11, weight: .black))
+        .foregroundStyle(isUsed ? Color.white : Color.white.opacity(0.46))
     }
+    .frame(width: 28, height: 28)
   }
 
   private func formattedReviewDelta(_ delta: Int) -> String {
@@ -8710,9 +8685,11 @@ private struct NativeARView: UIViewRepresentable {
     private let onReviewFinished: () -> Void
     private weak var arView: ARView?
     private var boardAnchor: AnchorEntity?
+    private var boardBaseWorldTransform: simd_float4x4?
     private var boardWorldTransform: simd_float4x4?
     private var boardRoot = Entity()
     private var boardScale: Float = 1.0
+    private var appliedBoardViewerColor: ChessColor?
     private var pinchStartScale: Float = 1.0
     private var piecesContainer = Entity()
     private var highlightsContainer = Entity()
@@ -8921,8 +8898,9 @@ private struct NativeARView: UIViewRepresentable {
     func syncRuntimeState(queueAssignedColor: ChessColor?) {
       self.queueAssignedColor = queueAssignedColor
       syncLessonStateIfNeeded()
-      syncLessonAutoplayIfNeeded()
       syncReviewStateIfNeeded()
+      syncBoardPerspectiveIfNeeded()
+      syncLessonAutoplayIfNeeded()
       syncAutomatedOpponentTurnIfNeeded()
     }
 
@@ -9048,6 +9026,52 @@ private struct NativeARView: UIViewRepresentable {
 
     private func applyBoardScale() {
       boardRoot.scale = SIMD3<Float>(repeating: boardScale)
+    }
+
+    private func desiredBoardViewerColor() -> ChessColor {
+      if let checkpoint = gameReview.currentCheckpoint, gameReview.isReviewMode {
+        return checkpoint.playerColor
+      }
+
+      switch mode {
+      case .lesson(let lesson):
+        return lessonStore.activeLesson?.studentColor ?? lesson.studentColor
+      case .passAndPlay(_):
+        return gameState.turn
+      case .queueMatch:
+        return queueAssignedColor ?? gameState.turn
+      case .playVsStockfish(let configuration):
+        return configuration.humanColor
+      }
+    }
+
+    private func orientedBoardWorldTransform(
+      from baseTransform: simd_float4x4,
+      viewerColor: ChessColor
+    ) -> simd_float4x4 {
+      guard viewerColor == .white else {
+        return baseTransform
+      }
+
+      let rotation = simd_float4x4(simd_quatf(angle: .pi, axis: SIMD3<Float>(0, 1, 0)))
+      return baseTransform * rotation
+    }
+
+    private func syncBoardPerspectiveIfNeeded() {
+      guard let boardAnchor,
+            let baseTransform = boardBaseWorldTransform else {
+        return
+      }
+
+      let viewerColor = desiredBoardViewerColor()
+      guard appliedBoardViewerColor != viewerColor || boardWorldTransform == nil else {
+        return
+      }
+
+      let nextTransformMatrix = orientedBoardWorldTransform(from: baseTransform, viewerColor: viewerColor)
+      boardAnchor.transform = Transform(matrix: nextTransformMatrix)
+      boardWorldTransform = nextTransformMatrix
+      appliedBoardViewerColor = viewerColor
     }
 
     private func handleTapOnPiece(at square: BoardSquare) {
@@ -9293,7 +9317,9 @@ private struct NativeARView: UIViewRepresentable {
             attemptedMove: move,
             correctMove: correctMove
           )
-          self.lessonStore.applyFeedback(feedback, for: requestID)
+          if self.lessonStore.applyFeedback(feedback, for: requestID) {
+            self.commentary.narrateLessonFeedback(feedback)
+          }
         }
         return
       }
@@ -9730,6 +9756,7 @@ private struct NativeARView: UIViewRepresentable {
       }
 
       gameState = context.afterState
+      syncBoardPerspectiveIfNeeded()
       refreshBoardPresentation()
       await context.postApply?()
       await maybeBeginPostGameFlowIfNeeded(after: context.afterState)
@@ -10568,7 +10595,9 @@ private struct NativeARView: UIViewRepresentable {
         boardAnchor.addChild(makeBoardEntity())
         arView.scene.addAnchor(boardAnchor)
         self.boardAnchor = boardAnchor
+        boardBaseWorldTransform = transform
         boardWorldTransform = transform
+        syncBoardPerspectiveIfNeeded()
         refreshBoardPresentation()
         AmbientMusicController.shared.playLoopIfNeeded()
       }
