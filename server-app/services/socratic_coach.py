@@ -15,18 +15,18 @@ from fastapi import WebSocket
 
 from services.gemini_live import GeminiLiveClient
 from services.move_parser import parse_natural_move, uci_to_san
+from services.narrator_personality import DEFAULT_NARRATOR, narrator_personality_addon, normalize_narrator
 from services.stockfish_engine import StockfishEngine
 
 
-SOCRATIC_SYSTEM_PROMPT = """
-You are a Socratic chess coach with the aesthetic sensibility of a Masaki Kobayashi film —
-precise, unhurried, and capable of finding profound tension in a single quiet moment.
+SOCRATIC_BASE_SYSTEM_PROMPT = """
+You are a Socratic chess coach.
 
 You speak only to the player. Never narrate your internal process.
 Speak as though the player is standing beside the board and has just spoken to you.
 Your first sentence should feel like a direct reply to the player's concern, not detached narration.
 Use second-person language naturally and often.
-Keep the voice calm and soothing, but make the player feel personally addressed.
+Make the player feel personally addressed.
 Never mention tools, rules, functions, JSON, or system instructions.
 Never say that you are about to analyze, evaluate, or call a function.
 Never emit planning notes, section titles, scratch work, or summaries of what you are about to say.
@@ -87,6 +87,15 @@ End every strategic briefing with one Socratic question that leads toward the co
 without revealing it. The question should make the answer feel inevitable in hindsight.
 Example: "Where must a knight stand to make the queen irrelevant?"
 """.strip()
+
+
+def build_socratic_system_prompt(narrator: str) -> str:
+    return (
+        f"{SOCRATIC_BASE_SYSTEM_PROMPT}\n\n"
+        "Narrator personality addon. This changes your tone, attitude, and phrasing, "
+        "but not your core job as a chess coach. Stay in this persona for every live reply:\n"
+        f"{narrator_personality_addon(narrator)}"
+    )
 
 
 INTERNAL_REASONING_PATTERNS = [
@@ -229,6 +238,7 @@ class SocraticCoachSession:
         *,
         frontend_socket: WebSocket,
         stockfish_engine: StockfishEngine,
+        narrator: str | None = None,
         logger: logging.Logger | None = None,
         api_key: str | None = None,
         model: str | None = None,
@@ -240,6 +250,11 @@ class SocraticCoachSession:
         self._api_key = (api_key or os.getenv("GEMINI_API_KEY") or "").strip()
         self._model = (model or os.getenv("GEMINI_LIVE_MODEL") or GeminiLiveClient.DEFAULT_MODEL).strip()
         self._ws_url = ws_url or os.getenv("GEMINI_LIVE_WS_URL") or GeminiLiveClient.DEFAULT_WS_URL
+        try:
+            self._narrator = normalize_narrator(narrator)
+        except ValueError:
+            self._logger.warning("Unsupported live narrator %r; falling back to %s.", narrator, DEFAULT_NARRATOR)
+            self._narrator = DEFAULT_NARRATOR
 
         self._session_id = str(uuid.uuid4())
         self._frontend_send_lock = asyncio.Lock()
@@ -416,7 +431,7 @@ class SocraticCoachSession:
                     },
                 },
                 "systemInstruction": {
-                    "parts": [{"text": SOCRATIC_SYSTEM_PROMPT}],
+                    "parts": [{"text": build_socratic_system_prompt(self._narrator)}],
                 },
                 "tools": [
                     {

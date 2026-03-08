@@ -14,6 +14,7 @@ if str(SERVER_APP_ROOT) not in sys.path:
 from main import (  # noqa: E402
     app,
     build_narrator_prompt,
+    build_narrator_turn_addon,
     get_postgres_dsn,
     is_placeholder_value,
     narrator_personality_addon,
@@ -366,9 +367,36 @@ def test_get_gemini_status_returns_live_state(monkeypatch) -> None:
     assert response.json()["since"].startswith("2026-03-01T12:00:00")
 
 
+def test_gemini_live_socket_passes_narrator_query_param(monkeypatch) -> None:
+    observed: dict[str, object] = {}
+
+    class FakeSession:
+        def __init__(self, **kwargs):
+            observed["narrator"] = kwargs.get("narrator")
+            self._frontend_socket = kwargs["frontend_socket"]
+
+        async def run(self) -> None:
+            await self._frontend_socket.accept()
+            await self._frontend_socket.send_json({"type": "status", "state": "ready"})
+
+        async def close(self) -> None:
+            observed["closed"] = True
+
+    monkeypatch.setattr("main.SocraticCoachSession", FakeSession)
+
+    client = TestClient(app)
+    with client.websocket_connect("/v1/gemini/live?narrator=fletcher") as websocket:
+        payload = websocket.receive_json()
+
+    assert payload == {"type": "status", "state": "ready"}
+    assert observed["narrator"] == "fletcher"
+    assert observed["closed"] is True
+
+
 def test_create_gemini_hint_returns_sanitized_hint(monkeypatch) -> None:
     async def fake_run_turn(prompt: str, *, metadata=None, timeout_seconds: float = 0.0) -> str:
         assert "Provide one short beginner-friendly hint" in prompt
+        assert build_narrator_turn_addon("fletcher") in prompt
         assert metadata["current_fen"].startswith("rnbqkbnr")
         assert metadata["recent_history"] == "13. Re1 b5 14. Bb3 Nf6 15. O-O"
         assert metadata["best_move"] == "e2e4"
@@ -385,6 +413,7 @@ def test_create_gemini_hint_returns_sanitized_hint(monkeypatch) -> None:
             "recent_history": "13. Re1 b5 14. Bb3 Nf6 15. O-O",
             "best_move": "e2e4",
             "side_to_move": "white",
+            "narrator": "fletcher",
             "moving_piece": "pawn",
             "is_capture": False,
             "gives_check": False,
@@ -394,7 +423,25 @@ def test_create_gemini_hint_returns_sanitized_hint(monkeypatch) -> None:
 
     assert response.status_code == 200
     # Coordinates are stripped via fallback to keep hints beginner-friendly.
-    assert response.json()["hint"] == "A brave pawn wants to claim more space."
+    assert response.json()["hint"] == "Good. Grab central space instead of drifting around doing nothing."
+
+
+def test_build_gemini_lesson_feedback_query_includes_narrator_addon() -> None:
+    from main import GeminiLessonFeedbackRequest, build_gemini_lesson_feedback_query
+
+    payload = GeminiLessonFeedbackRequest(
+        fen="rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+        lesson_title="Italian Opening",
+        attempted_move="a2a3",
+        correct_move="g1f3",
+        side_to_move="white",
+        narrator="fletcher",
+        focus="Develop pieces toward the center.",
+    )
+
+    query = build_gemini_lesson_feedback_query(payload)
+
+    assert build_narrator_turn_addon("fletcher") in query
 
 
 def test_build_narrator_prompt_appends_selected_personality() -> None:

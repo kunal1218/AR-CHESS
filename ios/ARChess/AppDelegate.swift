@@ -407,6 +407,7 @@ private struct GeminiHintRequestPayload: Encodable {
   let recent_history: String?
   let best_move: String
   let side_to_move: String
+  let narrator: String
   let moving_piece: String?
   let is_capture: Bool
   let gives_check: Bool
@@ -423,6 +424,7 @@ private struct GeminiLessonFeedbackRequestPayload: Encodable {
   let attempted_move: String
   let correct_move: String
   let side_to_move: String
+  let narrator: String
   let focus: String
 }
 
@@ -473,6 +475,7 @@ private struct GeminiHintContext {
   let recentHistory: String?
   let bestMove: String
   let sideToMove: ChessColor
+  let narrator: NarratorType
   let movingPiece: ChessPieceKind?
   let isCapture: Bool
   let givesCheck: Bool
@@ -490,6 +493,7 @@ private struct GeminiLessonFeedbackContext {
   let attemptedMove: String
   let correctMove: String
   let sideToMove: ChessColor
+  let narrator: NarratorType
   let focus: String
 }
 
@@ -980,10 +984,11 @@ private final class SocraticCoachStore: ObservableObject {
   private var threatZoneHandler: (([String], String?) -> Void)?
 
   init(
+    narrator: NarratorType,
     apiBaseURL: URL? = AppRuntimeConfig.current.apiBaseURL,
     session: URLSession = .shared
   ) {
-    self.webSocketURL = Self.makeWebSocketURL(from: apiBaseURL)
+    self.webSocketURL = Self.makeWebSocketURL(from: apiBaseURL, narrator: narrator)
     self.session = session
 
     micCapture.onStateChange = { [weak self] nextState in
@@ -1382,7 +1387,7 @@ private final class SocraticCoachStore: ObservableObject {
     }
   }
 
-  private static func makeWebSocketURL(from apiBaseURL: URL?) -> URL? {
+  private static func makeWebSocketURL(from apiBaseURL: URL?, narrator: NarratorType) -> URL? {
     guard let apiBaseURL else {
       return nil
     }
@@ -1397,6 +1402,10 @@ private final class SocraticCoachStore: ObservableObject {
     let existingPath = components?.path.trimmingCharacters(in: CharacterSet(charactersIn: "/")) ?? ""
     let suffix = "v1/gemini/live"
     components?.path = existingPath.isEmpty ? "/\(suffix)" : "/\(existingPath)/\(suffix)"
+    var queryItems = components?.queryItems ?? []
+    queryItems.removeAll { $0.name == "narrator" }
+    queryItems.append(URLQueryItem(name: "narrator", value: narrator.rawValue))
+    components?.queryItems = queryItems
     return components?.url
   }
 }
@@ -1444,6 +1453,7 @@ private final class GeminiHintService {
         recent_history: context.recentHistory,
         best_move: context.bestMove,
         side_to_move: context.sideToMove.displayName.lowercased(),
+        narrator: context.narrator.rawValue,
         moving_piece: context.movingPiece?.displayName.lowercased(),
         is_capture: context.isCapture,
         gives_check: context.givesCheck,
@@ -1513,6 +1523,7 @@ private final class GeminiHintService {
         attempted_move: context.attemptedMove,
         correct_move: context.correctMove,
         side_to_move: context.sideToMove.displayName.lowercased(),
+        narrator: context.narrator.rawValue,
         focus: context.focus
       )
     )
@@ -5549,6 +5560,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       attemptedMove: attemptedMove.uciString,
       correctMove: correctMove.uciString,
       sideToMove: state.turn,
+      narrator: narrator,
       focus: step.focus
     )
 
@@ -6390,6 +6402,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       recentHistory: recentHistoryProvider?(),
       bestMove: bestMove,
       sideToMove: state.turn,
+      narrator: narrator,
       movingPiece: move.piece.kind,
       isCapture: move.captured != nil || move.isEnPassant,
       givesCheck: afterState.isInCheck(for: afterState.turn),
@@ -7677,7 +7690,7 @@ private struct NativeARExperienceView: View {
   @StateObject private var commentary: PiecePersonalityDirector
   @StateObject private var gameReview = GameReviewStore()
   @StateObject private var lessonStore = OpeningLessonStore()
-  @StateObject private var socraticCoach = SocraticCoachStore()
+  @StateObject private var socraticCoach: SocraticCoachStore
   @State private var isModePanelVisible = false
   @State private var isMatchLogVisible = false
   @State private var isGeminiDebugVisible = false
@@ -7700,6 +7713,7 @@ private struct NativeARExperienceView: View {
     self.returnHome = returnHome
     self.markLessonComplete = markLessonComplete
     _commentary = StateObject(wrappedValue: PiecePersonalityDirector(narrator: narrator))
+    _socraticCoach = StateObject(wrappedValue: SocraticCoachStore(narrator: narrator))
   }
 
   var body: some View {

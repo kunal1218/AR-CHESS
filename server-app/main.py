@@ -21,6 +21,11 @@ from services.gemini_live import (
     GeminiLiveConfigurationError,
     GeminiLiveConnectionError,
 )
+from services.narrator_personality import (
+    build_narrator_turn_addon,
+    narrator_personality_addon,
+    normalize_narrator,
+)
 from services.socratic_coach import SocraticCoachSession
 from services.stockfish_engine import StockfishEngine
 
@@ -115,6 +120,7 @@ class GeminiHintRequest(BaseModel):
     recent_history: str | None = Field(default=None, max_length=512)
     best_move: str
     side_to_move: str
+    narrator: str = Field(default="silky", min_length=1, max_length=32)
     moving_piece: str | None = None
     is_capture: bool = False
     gives_check: bool = False
@@ -135,6 +141,14 @@ class GeminiHintRequest(BaseModel):
         if normalized not in {"white", "black"}:
             raise ValueError("side_to_move must be 'white' or 'black'.")
         return normalized
+
+    @field_validator("narrator")
+    @classmethod
+    def validate_narrator(cls, value: str) -> str:
+        try:
+            return normalize_narrator(value)
+        except ValueError as exc:
+            raise ValueError("narrator must be 'silky' or 'fletcher'.") from exc
 
     @field_validator("recent_history")
     @classmethod
@@ -165,6 +179,7 @@ class GeminiLessonFeedbackRequest(BaseModel):
     attempted_move: str
     correct_move: str
     side_to_move: str
+    narrator: str = Field(default="silky", min_length=1, max_length=32)
     focus: str = Field(..., min_length=1, max_length=280)
 
     @field_validator("fen", "lesson_title", "focus")
@@ -190,6 +205,14 @@ class GeminiLessonFeedbackRequest(BaseModel):
         if normalized not in {"white", "black"}:
             raise ValueError("side_to_move must be 'white' or 'black'.")
         return normalized
+
+    @field_validator("narrator")
+    @classmethod
+    def validate_lesson_narrator(cls, value: str) -> str:
+        try:
+            return normalize_narrator(value)
+        except ValueError as exc:
+            raise ValueError("narrator must be 'silky' or 'fletcher'.") from exc
 
 
 class GeminiLessonFeedbackResponse(BaseModel):
@@ -217,10 +240,10 @@ class GeminiCoachRequest(BaseModel):
     @field_validator("narrator")
     @classmethod
     def validate_narrator(cls, value: str) -> str:
-        normalized = value.strip().lower()
-        if normalized not in {"silky", "fletcher"}:
-            raise ValueError("narrator must be 'silky' or 'fletcher'.")
-        return normalized
+        try:
+            return normalize_narrator(value)
+        except ValueError as exc:
+            raise ValueError("narrator must be 'silky' or 'fletcher'.") from exc
 
 
 class GeminiCoachPieceRole(BaseModel):
@@ -280,11 +303,11 @@ Prioritize identifying blunders and high-level strategic objectives over deep en
 Each turn arrives as a structured text packet in this format:
 Current FEN: [FEN] | Recent Sequence: [PGN] | User Query: [request]
 If recent move history is unavailable, rely on the FEN as the authoritative board reset.
-You write one short, fun, creative, beginner-friendly chess hint.
+You write one short, beginner-friendly chess hint.
 Never mention board squares, coordinates, algebraic notation, or raw move text.
 Never output files, ranks, e2e4, d2d4, or any square names.
 Keep it to one sentence, around 6 to 14 words.
-Make it playful and helpful, like a coach whispering a vibe.
+Keep it educational, concrete, and easy to understand.
 Return plain text only.
 """.strip()
 GEMINI_HINT_MOVE_PATTERN = re.compile(r"\b[a-h][1-8][a-h][1-8][qrbn]?\b|\b[a-h][1-8]\b", re.IGNORECASE)
@@ -365,50 +388,6 @@ Required JSON format:
 If the position is unclear or multiple interpretations are possible, still choose the most positionally relevant top 3 workers and top 3 traitors for the side to move and return valid JSON.
 """.strip()
 
-GEMINI_COACH_SILKY_ADDON_PROMPT = """
-You are a smooth, poised, highly observant chess narrator with a calm, silky, confident delivery. You explain ideas elegantly and clearly. Your tone is polished, insightful, and composed. You still teach actively, but with warmth, style, and precision rather than aggression.
-""".strip()
-
-GEMINI_COACH_FLETCHER_ADDON_PROMPT = """
-You are an ultra-intense chess coach with the energy of a brutally demanding master instructor. You are easily irritated by weak, passive, lazy, or undisciplined play. When the player makes poor moves, blunders material, ignores the center, neglects development, weakens king safety, or misses tactical ideas, you react with sharp sarcasm, agitation, disbelief, and cutting insults.
-
-Your tone should be explosive, funny, ruthless, and memorable. You should sound like you cannot believe the player just made that move. However, every insult must contain real chess instruction. Do not insult in a generic way; insult the chess logic. Tie every reaction to an actual principle, tactical error, positional mistake, or missed opportunity in the position.
-
-Your commentary should feel like:
-- harsh coaching
-- furious pattern recognition
-- insults fused with useful instruction
-- intense reactions to weak moves
-- grudging praise for strong moves
-
-Style rules:
-- keep lines punchy, vivid, and quotable
-- prefer short to medium-length commentary
-- be specific about the actual chess issue
-- focus on concepts like center control, development, king safety, coordination, initiative, tactics, loose pieces, open lines, weak squares, and tempo
-- when the move is terrible, say so aggressively
-- when the move is good, praise it sparingly and with attitude
-- never become bland, corporate, or overly polite
-- never drop the educational purpose
-- never output generic encouragement unless the move truly deserves it
-
-Examples of desired style:
-- "What the hell is that move? You're falling behind in development and handing over the center like it's a charity event."
-- "Castle. Now. Your king is standing in the blast radius for absolutely no reason."
-- "You missed the pin, you missed the threat, and now your position is wheezing. Pay attention to piece coordination."
-- "That pawn push does nothing. Nothing. Fight for the center or stop pretending you're steering this game."
-- "Finally, a move with actual backbone. You improved the knight, hit the weak square, and made a real threat."
-
-Do not just roleplay anger. Teach through the anger.
-""".strip()
-
-
-def narrator_personality_addon(narrator: str) -> str:
-    if narrator == "fletcher":
-        return GEMINI_COACH_FLETCHER_ADDON_PROMPT
-    return GEMINI_COACH_SILKY_ADDON_PROMPT
-
-
 def build_narrator_prompt(narrator: str) -> str:
     return f"{GEMINI_COACH_BASE_SYSTEM_PROMPT}\n\n{narrator_personality_addon(narrator)}"
 
@@ -434,6 +413,28 @@ def env_int(name: str, default: int) -> int:
 
 
 def gemini_fallback_hint(payload: GeminiHintRequest) -> str:
+    if payload.narrator == "fletcher":
+        if payload.gives_check:
+            return "Good. Their king is finally under pressure instead of living rent-free."
+
+        if "fight for the center" in payload.themes:
+            if payload.moving_piece == "knight":
+                return "Finally, a knight aimed at the center instead of sightseeing."
+            if payload.moving_piece == "pawn":
+                return "Good. Grab central space instead of drifting around doing nothing."
+            return "Take the center seriously or stop pretending this position will fix itself."
+
+        if "develop a new piece" in payload.themes:
+            return "Wake the piece up and join the game already."
+
+        if payload.is_capture:
+            return "Take the free material before you invent a problem."
+
+        if "improve king safety" in payload.themes:
+            return "Protect your king before this turns into self-sabotage."
+
+        return "Find a move that actually improves the position."
+
     if payload.gives_check:
         return "The enemy king looks a little exposed."
 
@@ -467,6 +468,13 @@ def sanitize_hint_text(raw_text: str, fallback: str) -> str:
 
 
 def gemini_fallback_lesson_feedback(payload: GeminiLessonFeedbackRequest) -> str:
+    if payload.narrator == "fletcher":
+        return (
+            "That move is not the lesson move, and it wastes the point of the position. "
+            "Find the continuation that actually improves development, center control, or pressure in the Italian Opening. "
+            f"{payload.focus}"
+        )
+
     return (
         "That move is playable, but it is not the lesson move here. "
         "Look for a move that better supports development, center control, or pressure in the Italian Opening. "
@@ -499,7 +507,8 @@ def build_gemini_user_query(payload: GeminiHintRequest) -> str:
         f"Moving piece: {piece_name}. "
         f"Is capture: {capture_text}. "
         f"Gives check: {check_text}. "
-        f"Themes: {themes}."
+        f"Themes: {themes}. "
+        f"{build_narrator_turn_addon(payload.narrator)}"
     )
 
 
@@ -507,15 +516,16 @@ def build_gemini_lesson_feedback_query(payload: GeminiLessonFeedbackRequest) -> 
     return (
         "You are teaching a beginner-friendly chess opening lesson. "
         "Explain briefly why the student's attempted move is not the best continuation in this position. "
-        "Keep it short, helpful, and instructional. "
+        "Keep it short and instructional. "
         "Focus on opening ideas like development, center control, king safety, piece activity, and Italian Opening goals. "
-        "Do not give a long engine line or a harsh critique. "
+        "Do not give a long engine line. "
         "Use at most two short sentences. "
         f"Lesson title: {payload.lesson_title}. "
         f"Side to move: {payload.side_to_move}. "
         f"Student attempted: {payload.attempted_move}. "
         f"Correct lesson move: {payload.correct_move}. "
-        f"Teaching focus: {payload.focus}."
+        f"Teaching focus: {payload.focus}. "
+        f"{build_narrator_turn_addon(payload.narrator)}"
     )
 
 
@@ -1486,6 +1496,7 @@ async def gemini_live_socket(websocket: WebSocket) -> None:
     session = SocraticCoachSession(
         frontend_socket=websocket,
         stockfish_engine=SOCRATIC_STOCKFISH_ENGINE,
+        narrator=websocket.query_params.get("narrator"),
         logger=logging.getLogger("archess.server.socratic"),
         api_key=os.getenv("GEMINI_API_KEY"),
         model=os.getenv("GEMINI_LIVE_MODEL", GeminiLiveClient.DEFAULT_MODEL),

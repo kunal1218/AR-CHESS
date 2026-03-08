@@ -10,6 +10,7 @@ if str(SERVER_APP_ROOT) not in sys.path:
 from services.move_parser import parse_natural_move  # noqa: E402
 from services.socratic_coach import (  # noqa: E402
     GameStateStore,
+    build_socratic_system_prompt,
     build_context_update_text,
     handle_analyze_hypothetical,
     sanitize_model_narration_text,
@@ -86,6 +87,21 @@ def test_sanitize_model_narration_text_strips_meta_segments_from_mixed_response(
     assert sanitize_model_narration_text(raw_text) == (
         "You already have a foothold in the center, so now ask which piece can deepen it."
     )
+
+
+def test_build_socratic_system_prompt_appends_silky_personality() -> None:
+    prompt = build_socratic_system_prompt("silky")
+
+    assert "You are a Socratic chess coach." in prompt
+    assert "calm, silky, confident delivery" in prompt
+
+
+def test_build_socratic_system_prompt_appends_fletcher_personality_without_silky_bias() -> None:
+    prompt = build_socratic_system_prompt("fletcher")
+
+    assert "ultra-intense chess coach" in prompt
+    assert "Do not just roleplay anger. Teach through the anger." in prompt
+    assert "calm and soothing" not in prompt
 
 
 class FakeStockfishEngine:
