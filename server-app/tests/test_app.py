@@ -13,8 +13,10 @@ if str(SERVER_APP_ROOT) not in sys.path:
 
 from main import (  # noqa: E402
     app,
+    build_narrator_prompt,
     get_postgres_dsn,
     is_placeholder_value,
+    narrator_personality_addon,
     normalize_postgres_dsn,
     parse_gemini_coach_response,
 )
@@ -395,6 +397,16 @@ def test_create_gemini_hint_returns_sanitized_hint(monkeypatch) -> None:
     assert response.json()["hint"] == "A brave pawn wants to claim more space."
 
 
+def test_build_narrator_prompt_appends_selected_personality() -> None:
+    silky_prompt = build_narrator_prompt("silky")
+    fletcher_prompt = build_narrator_prompt("fletcher")
+
+    assert "Your core responsibility never changes" in silky_prompt
+    assert narrator_personality_addon("silky") in silky_prompt
+    assert narrator_personality_addon("fletcher") in fletcher_prompt
+    assert "Do not just roleplay anger. Teach through the anger." in fletcher_prompt
+
+
 def test_parse_gemini_coach_response_extracts_json_object() -> None:
     response = parse_gemini_coach_response(
         """
@@ -421,6 +433,7 @@ def test_parse_gemini_coach_response_extracts_json_object() -> None:
 def test_create_gemini_commentary_returns_structured_json(monkeypatch) -> None:
     async def fake_fetch(payload):
         assert payload.fen.startswith("rnbqkbnr")
+        assert payload.narrator == "fletcher"
         return parse_gemini_coach_response(
             """
             {
@@ -473,6 +486,7 @@ def test_create_gemini_commentary_returns_structured_json(monkeypatch) -> None:
         "/v1/gemini/commentary",
         json={
             "fen": "rnbqkbnr/pppppppp/8/8/8/5N2/PPPPPPPP/RNBQKB1R w KQkq - 0 1",
+            "narrator": "fletcher",
         },
     )
 

@@ -123,6 +123,31 @@ private enum PlayModeChoice: Hashable {
   }
 }
 
+private enum NarratorType: String, CaseIterable, Identifiable {
+  case silky
+  case fletcher
+
+  var id: String { rawValue }
+
+  var displayName: String {
+    switch self {
+    case .silky:
+      return "Silky Voice"
+    case .fletcher:
+      return "Fletcher"
+    }
+  }
+
+  var summary: String {
+    switch self {
+    case .silky:
+      return "Calm, polished, and elegant instructional commentary."
+    case .fletcher:
+      return "Explosive, brutal, and sarcastic coaching that still teaches."
+    }
+  }
+}
+
 private enum StockfishMatchLaunchKind: Hashable {
   case standard
   case devCheck
@@ -407,6 +432,7 @@ private struct GeminiLessonFeedbackResponsePayload: Decodable {
 
 private struct GeminiCoachCommentaryRequestPayload: Encodable {
   let fen: String
+  let narrator: String
 }
 
 private struct GeminiPieceRole: Decodable, Equatable, Hashable {
@@ -455,6 +481,7 @@ private struct GeminiHintContext {
 
 private struct GeminiCoachCommentaryContext: Equatable {
   let fen: String
+  let narrator: NarratorType
 }
 
 private struct GeminiLessonFeedbackContext {
@@ -1585,7 +1612,10 @@ private final class GeminiHintService {
     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
     request.setValue("application/json", forHTTPHeaderField: "Accept")
     request.httpBody = try JSONEncoder().encode(
-      GeminiCoachCommentaryRequestPayload(fen: context.fen)
+      GeminiCoachCommentaryRequestPayload(
+        fen: context.fen,
+        narrator: context.narrator.rawValue
+      )
     )
 
     let startedAt = Date()
@@ -5215,6 +5245,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   private let analyzer = StockfishWASMAnalyzer()
   private let hintService = GeminiHintService()
   private let synthesizer = AVSpeechSynthesizer()
+  private let narrator: NarratorType
   private var utteranceCaptions: [ObjectIdentifier: Caption] = [:]
   private var cachedAnalysis: CachedAnalysis?
   private var stockfishDebugAnalysisCache: [String: StockfishAnalysis] = [:]
@@ -5241,7 +5272,8 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   private var commentaryRequestTask: Task<Void, Never>?
   private var stockfishDebugVisible = false
 
-  override init() {
+  init(narrator: NarratorType = .silky) {
+    self.narrator = narrator
     super.init()
     synthesizer.delegate = self
     hintStatusText = defaultHintStatus()
@@ -6077,7 +6109,10 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       return
     }
 
-    let context = GeminiCoachCommentaryContext(fen: state.fenString)
+    let context = GeminiCoachCommentaryContext(
+      fen: state.fenString,
+      narrator: narrator
+    )
     if latestAnalyzedFEN == context.fen || pendingCommentaryFEN == context.fen {
       return
     }
@@ -6776,12 +6811,13 @@ private struct ARChessRootView: View {
   @State private var screen: NativeScreen = .modeSelection
   @StateObject private var queueMatch = QueueMatchStore()
   @State private var completedLessonIDs: Set<String> = []
+  @State private var selectedNarrator: NarratorType = .silky
 
   var body: some View {
     ZStack {
       switch screen {
       case .modeSelection:
-        ModeSelectionView { mode in
+        ModeSelectionView(selectedNarrator: $selectedNarrator) { mode in
           withAnimation(.spring(response: 0.42, dampingFraction: 0.88)) {
             switch mode {
             case .course:
@@ -6862,6 +6898,7 @@ private struct ARChessRootView: View {
       case .experience(let mode):
         NativeARExperienceView(
           mode: mode,
+          narrator: selectedNarrator,
           queueMatch: queueMatch,
           closeExperience: {
             switch mode {
@@ -6913,6 +6950,7 @@ private struct ARChessRootView: View {
 }
 
 private struct ModeSelectionView: View {
+  @Binding var selectedNarrator: NarratorType
   let onSelect: (PlayModeChoice) -> Void
 
   var body: some View {
@@ -6947,6 +6985,9 @@ private struct ModeSelectionView: View {
             .frame(maxWidth: 340)
         }
 
+        NarratorSelectionCard(selectedNarrator: $selectedNarrator)
+          .frame(maxWidth: 340)
+
         VStack(spacing: 14) {
           NativeActionButton(title: "Course", style: .solid) {
             onSelect(.course)
@@ -6977,6 +7018,40 @@ private struct ModeSelectionView: View {
       .padding(.horizontal, 24)
       .padding(.vertical, 30)
     }
+  }
+}
+
+private struct NarratorSelectionCard: View {
+  @Binding var selectedNarrator: NarratorType
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 12) {
+      Text("Narrator")
+        .font(.system(size: 12, weight: .bold, design: .rounded))
+        .tracking(1.8)
+        .foregroundStyle(Color(red: 0.95, green: 0.88, blue: 0.73))
+
+      Picker("Narrator", selection: $selectedNarrator) {
+        ForEach(NarratorType.allCases) { narrator in
+          Text(narrator.displayName).tag(narrator)
+        }
+      }
+      .pickerStyle(.segmented)
+
+      Text(selectedNarrator.summary)
+        .font(.system(size: 13, weight: .medium, design: .rounded))
+        .foregroundStyle(Color.white.opacity(0.76))
+        .lineSpacing(2)
+    }
+    .padding(16)
+    .background(
+      RoundedRectangle(cornerRadius: 22, style: .continuous)
+        .fill(Color(red: 0.08, green: 0.10, blue: 0.15).opacity(0.88))
+        .overlay(
+          RoundedRectangle(cornerRadius: 22, style: .continuous)
+            .stroke(Color.white.opacity(0.12), lineWidth: 1)
+        )
+    )
   }
 }
 
@@ -7593,12 +7668,13 @@ private struct QueueMatchView: View {
 
 private struct NativeARExperienceView: View {
   let mode: ExperienceMode
+  let narrator: NarratorType
   @ObservedObject var queueMatch: QueueMatchStore
   let closeExperience: () -> Void
   let returnHome: () -> Void
   let markLessonComplete: (String) -> Void
   @StateObject private var matchLog = MatchLogStore()
-  @StateObject private var commentary = PiecePersonalityDirector()
+  @StateObject private var commentary: PiecePersonalityDirector
   @StateObject private var gameReview = GameReviewStore()
   @StateObject private var lessonStore = OpeningLessonStore()
   @StateObject private var socraticCoach = SocraticCoachStore()
@@ -7608,6 +7684,23 @@ private struct NativeARExperienceView: View {
   @State private var isStockfishDebugVisible = false
   @State private var isMusicMuted = AmbientMusicController.shared.isMuted
   @State private var notifiedCompletedLessonID: String?
+
+  init(
+    mode: ExperienceMode,
+    narrator: NarratorType,
+    queueMatch: QueueMatchStore,
+    closeExperience: @escaping () -> Void,
+    returnHome: @escaping () -> Void,
+    markLessonComplete: @escaping (String) -> Void
+  ) {
+    self.mode = mode
+    self.narrator = narrator
+    _queueMatch = ObservedObject(wrappedValue: queueMatch)
+    self.closeExperience = closeExperience
+    self.returnHome = returnHome
+    self.markLessonComplete = markLessonComplete
+    _commentary = StateObject(wrappedValue: PiecePersonalityDirector(narrator: narrator))
+  }
 
   var body: some View {
     ZStack {
