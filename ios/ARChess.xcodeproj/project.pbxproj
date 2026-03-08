@@ -12,6 +12,7 @@
 		BB2F792D24A3F905000567C9 /* Expo.plist in Resources */ = {isa = PBXBuildFile; fileRef = BB2F792C24A3F905000567C9 /* Expo.plist */; };
 		D796B00D7140F06863837128 /* libPods-ARChess.a in Frameworks */ = {isa = PBXBuildFile; fileRef = C888F41F274DC6EAA0D0FE6F /* libPods-ARChess.a */; };
 		E2EE8B124FC651636B8420AF /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = FC383873315208CC48E623AB /* PrivacyInfo.xcprivacy */; };
+		F0A100010000000000000010 /* doom_at_dooms_gate.mp3 in Resources */ = {isa = PBXBuildFile; fileRef = F0A100010000000000000011 /* doom_at_dooms_gate.mp3 */; };
 		F0A100010000000000000004 /* queenBlast.mp3 in Resources */ = {isa = PBXBuildFile; fileRef = F0A100010000000000000005 /* queenBlast.mp3 */; };
 		F0A100010000000000000006 /* pawnSword.mp3 in Resources */ = {isa = PBXBuildFile; fileRef = F0A100010000000000000007 /* pawnSword.mp3 */; };
 		F0A100010000000000000008 /* knightHorse.mp3 in Resources */ = {isa = PBXBuildFile; fileRef = F0A100010000000000000009 /* knightHorse.mp3 */; };
@@ -34,6 +35,7 @@
 		C888F41F274DC6EAA0D0FE6F /* libPods-ARChess.a */ = {isa = PBXFileReference; explicitFileType = archive.ar; includeInIndex = 0; path = "libPods-ARChess.a"; sourceTree = BUILT_PRODUCTS_DIR; };
 		DCB083CA901FA7EFB03D796B /* Pods-ARChess.release.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-ARChess.release.xcconfig"; path = "Target Support Files/Pods-ARChess/Pods-ARChess.release.xcconfig"; sourceTree = "<group>"; };
 		ED297162215061F000B7C4FE /* JavaScriptCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = JavaScriptCore.framework; path = System/Library/Frameworks/JavaScriptCore.framework; sourceTree = SDKROOT; };
+		F0A100010000000000000011 /* doom_at_dooms_gate.mp3 */ = {isa = PBXFileReference; lastKnownFileType = audio.mp3; path = doom_at_dooms_gate.mp3; sourceTree = "<group>"; };
 		F0A100010000000000000005 /* queenBlast.mp3 */ = {isa = PBXFileReference; lastKnownFileType = audio.mp3; path = queenBlast.mp3; sourceTree = "<group>"; };
 		F0A100010000000000000007 /* pawnSword.mp3 */ = {isa = PBXFileReference; lastKnownFileType = audio.mp3; path = pawnSword.mp3; sourceTree = "<group>"; };
 		F0A100010000000000000009 /* knightHorse.mp3 */ = {isa = PBXFileReference; lastKnownFileType = audio.mp3; path = knightHorse.mp3; sourceTree = "<group>"; };
@@ -151,6 +153,7 @@
 		F0A100010000000000000003 /* Audio */ = {
 			isa = PBXGroup;
 			children = (
+				F0A100010000000000000011 /* doom_at_dooms_gate.mp3 */,
 				F0A10001000000000000000B /* bishopBell.mp3 */,
 				F0A100010000000000000007 /* pawnSword.mp3 */,
 				F0A100010000000000000009 /* knightHorse.mp3 */,
@@ -243,6 +246,7 @@
 				13B07FBF1A68108700A75B9A /* Images.xcassets in Resources */,
 				3E461D99554A48A4959DE609 /* SplashScreen.storyboard in Resources */,
 				E2EE8B124FC651636B8420AF /* PrivacyInfo.xcprivacy in Resources */,
+				F0A100010000000000000010 /* doom_at_dooms_gate.mp3 in Resources */,
 				F0A10001000000000000000A /* bishopBell.mp3 in Resources */,
 				F0A100010000000000000006 /* pawnSword.mp3 in Resources */,
 				F0A100010000000000000008 /* knightHorse.mp3 in Resources */,

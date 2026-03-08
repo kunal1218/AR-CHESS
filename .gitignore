@@ -24,3 +24,7 @@ build/
 .build/
 ios/Pods/
 ios_backup_*/
+
+# Local-only audio assets
+/Doom OST - E1M1 - At Doom's Gate.mp3
+/ios/ARChess/Audio/doom_at_dooms_gate.mp3

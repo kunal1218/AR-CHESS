@@ -11,7 +11,7 @@ from urllib.parse import urlparse
 import psycopg
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query, status
+from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
@@ -21,6 +21,8 @@ from services.gemini_live import (
     GeminiLiveConfigurationError,
     GeminiLiveConnectionError,
 )
+from services.socratic_coach import SocraticCoachSession
+from services.stockfish_engine import StockfishEngine
 
 
 load_dotenv()
@@ -716,6 +718,11 @@ GEMINI_LIVE_CLIENT = GeminiLiveClient(
 GEMINI_LIVE_TURN_TIMEOUT_SECONDS = env_float("GEMINI_LIVE_TURN_TIMEOUT_SECONDS", 12.0)
 GEMINI_COACH_MODEL = os.getenv("GEMINI_COACH_MODEL", "gemini-2.5-flash")
 GEMINI_COACH_TIMEOUT_SECONDS = env_float("GEMINI_COACH_TIMEOUT_SECONDS", 12.0)
+SOCRATIC_STOCKFISH_ENGINE = StockfishEngine(
+    executable_path=os.getenv("STOCKFISH_PATH"),
+    max_depth=env_int("MAX_STOCKFISH_DEPTH", 18),
+    logger=logging.getLogger("archess.server.stockfish"),
+)
 
 
 def utcnow() -> datetime:
@@ -1400,10 +1407,34 @@ def health_ping() -> dict[str, Any]:
     return JSONResponse(content=payload, status_code=status_code)
 
 
+@app.on_event("shutdown")
+async def shutdown_socratic_stockfish() -> None:
+    await SOCRATIC_STOCKFISH_ENGINE.close()
+
+
 @app.get("/v1/gemini/status", response_model=GeminiLiveStatusResponse)
 async def get_gemini_live_status() -> dict[str, Any]:
     GEMINI_LIVE_CLIENT.ensure_connection_background()
     return GEMINI_LIVE_CLIENT.get_status()
+
+
+@app.websocket("/v1/gemini/live")
+async def gemini_live_socket(websocket: WebSocket) -> None:
+    session = SocraticCoachSession(
+        frontend_socket=websocket,
+        stockfish_engine=SOCRATIC_STOCKFISH_ENGINE,
+        logger=logging.getLogger("archess.server.socratic"),
+        api_key=os.getenv("GEMINI_API_KEY"),
+        model=os.getenv("GEMINI_LIVE_MODEL", GeminiLiveClient.DEFAULT_MODEL),
+        ws_url=os.getenv("GEMINI_LIVE_WS_URL") or None,
+    )
+
+    try:
+        await session.run()
+    except WebSocketDisconnect:
+        logger.info("Socratic coach client disconnected")
+    finally:
+        await session.close()
 
 
 @app.post("/v1/gemini/hint", response_model=GeminiHintResponse)

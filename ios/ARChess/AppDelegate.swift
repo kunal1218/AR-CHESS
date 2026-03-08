@@ -195,6 +195,15 @@ private enum ExperienceMode: Hashable {
     }
   }
 
+  var supportsSocraticCoach: Bool {
+    switch self {
+    case .lesson:
+      return false
+    case .passAndPlay, .queueMatch, .playVsStockfish:
+      return true
+    }
+  }
+
   func humanPlayerColor(queueAssignedColor: ChessColor?) -> ChessColor? {
     switch self {
     case .lesson:
@@ -455,6 +464,793 @@ private struct GeminiLessonFeedbackContext {
   let correctMove: String
   let sideToMove: ChessColor
   let focus: String
+}
+
+private struct SocraticCoachContext: Equatable {
+  let fen: String
+  let moveHistory: [String]
+  let activeColor: ChessColor
+}
+
+private struct SocraticCoachContextUpdatePayload: Encodable {
+  let type = "context_update"
+  let fen: String
+  let move_history: [String]
+  let active_color: String
+  let moves_played: Int
+}
+
+private struct SocraticCoachAudioChunkPayload: Encodable {
+  let type = "audio_chunk"
+  let data: String
+  let mime_type: String
+}
+
+private struct SocraticCoachSimplePayload: Encodable {
+  let type: String
+}
+
+private enum SocraticCoachMicState: String {
+  case inactive
+  case muted
+  case active
+
+  var systemImageName: String {
+    switch self {
+    case .inactive:
+      return "mic.slash"
+    case .muted:
+      return "mic.slash.fill"
+    case .active:
+      return "mic.fill"
+    }
+  }
+
+  var accentColor: Color {
+    switch self {
+    case .inactive:
+      return Color.black.opacity(0.54)
+    case .muted:
+      return Color(red: 0.37, green: 0.22, blue: 0.22).opacity(0.84)
+    case .active:
+      return Color(red: 0.20, green: 0.45, blue: 0.28).opacity(0.90)
+    }
+  }
+
+  var label: String {
+    switch self {
+    case .inactive:
+      return "Mic unavailable"
+    case .muted:
+      return "Mic muted"
+    case .active:
+      return "Mic live"
+    }
+  }
+}
+
+private enum SocraticCoachConnectionState: String {
+  case disconnected
+  case connecting
+  case ready
+  case error
+}
+
+private final class AudioSessionCoordinator {
+  static let shared = AudioSessionCoordinator()
+
+  private let lock = NSLock()
+  private var recordingClients = 0
+
+  private init() {}
+
+  func activatePlaybackSession() throws {
+    try configureAudioSession()
+  }
+
+  func beginRecordingSession() throws {
+    lock.lock()
+    recordingClients += 1
+    lock.unlock()
+    try configureAudioSession()
+  }
+
+  func endRecordingSession() {
+    lock.lock()
+    recordingClients = max(0, recordingClients - 1)
+    lock.unlock()
+    try? configureAudioSession()
+  }
+
+  private func configureAudioSession() throws {
+    let isRecordingPreferred: Bool = {
+      lock.lock()
+      defer { lock.unlock() }
+      return recordingClients > 0
+    }()
+
+    let session = AVAudioSession.sharedInstance()
+    if isRecordingPreferred {
+        try session.setCategory(
+        .playAndRecord,
+        mode: .default,
+        options: [.mixWithOthers, .defaultToSpeaker, .allowBluetoothHFP, .allowBluetoothA2DP]
+      )
+    } else {
+      try session.setCategory(.ambient, mode: .default, options: [.mixWithOthers])
+    }
+    try session.setActive(true, options: [])
+  }
+}
+
+private final class SocraticCoachPCMPlayer {
+  private static let logger = Logger(subsystem: "ARChess", category: "SocraticCoachAudio")
+
+  private let queue = DispatchQueue(label: "ARChess.SocraticCoachAudio")
+  private let engine = AVAudioEngine()
+  private let playerNode = AVAudioPlayerNode()
+  private var configuredSampleRate: Double = 24_000
+  private var pendingBufferCount = 0
+  private var isEngineConfigured = false
+
+  init() {
+    engine.attach(playerNode)
+  }
+
+  func play(base64PCM: String, mimeType: String) {
+    queue.async { [weak self] in
+      guard let self else {
+        return
+      }
+
+      guard let data = Data(base64Encoded: base64PCM) else {
+        Self.logger.error("Coach audio decode failed for base64 chunk.")
+        return
+      }
+
+      let sampleRate = Self.sampleRate(from: mimeType) ?? 24_000
+      let sampleCount = data.count / MemoryLayout<Int16>.size
+      guard sampleCount > 0 else {
+        return
+      }
+
+      var samples = Array(repeating: Int16.zero, count: sampleCount)
+      _ = samples.withUnsafeMutableBytes { destination in
+        data.copyBytes(to: destination)
+      }
+
+      do {
+        try AudioSessionCoordinator.shared.activatePlaybackSession()
+        try self.prepareEngine(sampleRate: sampleRate)
+      } catch {
+        Self.logger.error("Coach audio session failed: \(error.localizedDescription, privacy: .public)")
+        return
+      }
+
+      guard let format = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 1),
+            let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(sampleCount)),
+            let channel = buffer.floatChannelData?[0] else {
+        return
+      }
+
+      buffer.frameLength = AVAudioFrameCount(sampleCount)
+      for index in 0..<sampleCount {
+        channel[index] = Float(samples[index]) / Float(Int16.max)
+      }
+
+      self.pendingBufferCount += 1
+      AmbientMusicController.shared.setSpeechActive(true)
+      self.playerNode.scheduleBuffer(buffer, completionHandler: { [weak self] in
+        guard let self else {
+          return
+        }
+        self.queue.async {
+          self.pendingBufferCount = max(0, self.pendingBufferCount - 1)
+          if self.pendingBufferCount == 0 {
+            AmbientMusicController.shared.setSpeechActive(false)
+          }
+        }
+      })
+
+      if !self.playerNode.isPlaying {
+        self.playerNode.play()
+      }
+    }
+  }
+
+  func stop() {
+    queue.async { [weak self] in
+      guard let self else {
+        return
+      }
+
+      self.pendingBufferCount = 0
+      self.playerNode.stop()
+      self.engine.stop()
+      self.isEngineConfigured = false
+      AmbientMusicController.shared.setSpeechActive(false)
+    }
+  }
+
+  private func prepareEngine(sampleRate: Double) throws {
+    guard let format = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 1) else {
+      throw NSError(
+        domain: "ARChess.SocraticCoach",
+        code: -1301,
+        userInfo: [NSLocalizedDescriptionKey: "Could not prepare Socratic Coach playback format."]
+      )
+    }
+
+    if !isEngineConfigured || configuredSampleRate != sampleRate {
+      engine.stop()
+      playerNode.stop()
+      engine.disconnectNodeOutput(playerNode)
+      engine.connect(playerNode, to: engine.mainMixerNode, format: format)
+      configuredSampleRate = sampleRate
+      isEngineConfigured = true
+    }
+
+    if !engine.isRunning {
+      try engine.start()
+    }
+  }
+
+  private static func sampleRate(from mimeType: String) -> Double? {
+    let lowercased = mimeType.lowercased()
+    guard let range = lowercased.range(of: "rate=") else {
+      return nil
+    }
+    let value = lowercased[range.upperBound...]
+    let numericPrefix = value.prefix { $0.isNumber }
+    return Double(numericPrefix)
+  }
+}
+
+private final class SocraticCoachMicCaptureManager {
+  private static let logger = Logger(subsystem: "ARChess", category: "SocraticCoachMic")
+
+  private let audioEngine = AVAudioEngine()
+  private let targetFormat = AVAudioFormat(standardFormatWithSampleRate: 16_000, channels: 1)!
+  private var audioConverter: AVAudioConverter?
+  private var pendingSamples: [Int16] = []
+
+  var onChunk: ((Data) -> Void)?
+  var onStateChange: ((SocraticCoachMicState) -> Void)?
+
+  private(set) var state: SocraticCoachMicState = .inactive {
+    didSet {
+      guard oldValue != state else {
+        return
+      }
+      onStateChange?(state)
+    }
+  }
+
+  func start(unmuted: Bool) throws {
+    guard state == .inactive else {
+      setMuted(!unmuted)
+      return
+    }
+
+    do {
+      try AudioSessionCoordinator.shared.beginRecordingSession()
+      let inputNode = audioEngine.inputNode
+      let inputFormat = inputNode.inputFormat(forBus: 0)
+      audioConverter = AVAudioConverter(from: inputFormat, to: targetFormat)
+      inputNode.removeTap(onBus: 0)
+      inputNode.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self] buffer, _ in
+        self?.handleInputBuffer(buffer)
+      }
+
+      audioEngine.prepare()
+      try audioEngine.start()
+      state = unmuted ? .active : .muted
+    } catch {
+      audioEngine.inputNode.removeTap(onBus: 0)
+      audioEngine.stop()
+      audioConverter = nil
+      AudioSessionCoordinator.shared.endRecordingSession()
+      throw error
+    }
+  }
+
+  func toggleMute() {
+    switch state {
+    case .inactive:
+      break
+    case .muted:
+      state = .active
+    case .active:
+      state = .muted
+    }
+  }
+
+  func setMuted(_ muted: Bool) {
+    switch state {
+    case .inactive:
+      break
+    case .muted, .active:
+      state = muted ? .muted : .active
+    }
+  }
+
+  func stop() {
+    guard state != .inactive else {
+      return
+    }
+
+    flushPendingSamples()
+    audioEngine.inputNode.removeTap(onBus: 0)
+    audioEngine.stop()
+    audioConverter = nil
+    pendingSamples.removeAll(keepingCapacity: false)
+    state = .inactive
+    AudioSessionCoordinator.shared.endRecordingSession()
+  }
+
+  private func handleInputBuffer(_ buffer: AVAudioPCMBuffer) {
+    guard state == .active else {
+      pendingSamples.removeAll(keepingCapacity: true)
+      return
+    }
+
+    guard let converter = audioConverter else {
+      return
+    }
+
+    let ratio = targetFormat.sampleRate / buffer.format.sampleRate
+    let estimatedFrameCount = max(1, Int(Double(buffer.frameLength) * ratio) + 8)
+    guard let convertedBuffer = AVAudioPCMBuffer(
+      pcmFormat: targetFormat,
+      frameCapacity: AVAudioFrameCount(estimatedFrameCount)
+    ) else {
+      return
+    }
+
+    var sourceBuffer: AVAudioPCMBuffer? = buffer
+    let inputBlock: AVAudioConverterInputBlock = { _, outStatus in
+      if let currentBuffer = sourceBuffer {
+        outStatus.pointee = .haveData
+        sourceBuffer = nil
+        return currentBuffer
+      }
+      outStatus.pointee = .noDataNow
+      return nil
+    }
+
+    var error: NSError?
+    let conversionStatus = converter.convert(to: convertedBuffer, error: &error, withInputFrom: inputBlock)
+    guard error == nil else {
+      Self.logger.error("Coach mic conversion failed: \(error?.localizedDescription ?? "unknown", privacy: .public)")
+      return
+    }
+
+    guard conversionStatus != .error,
+          let channel = convertedBuffer.floatChannelData?[0] else {
+      return
+    }
+
+    for index in 0..<Int(convertedBuffer.frameLength) {
+      let sample = max(-1.0, min(1.0, channel[index]))
+      pendingSamples.append(Int16(sample * Float(Int16.max)))
+    }
+
+    emitFullChunksIfNeeded()
+  }
+
+  private func emitFullChunksIfNeeded() {
+    while pendingSamples.count >= 2048 {
+      let chunk = Array(pendingSamples.prefix(2048))
+      pendingSamples.removeFirst(2048)
+      onChunk?(Self.data(for: chunk))
+    }
+  }
+
+  private func flushPendingSamples() {
+    guard !pendingSamples.isEmpty, state == .active else {
+      return
+    }
+
+    var chunk = pendingSamples
+    pendingSamples.removeAll(keepingCapacity: false)
+    if chunk.count < 2048 {
+      chunk.append(contentsOf: repeatElement(0, count: 2048 - chunk.count))
+    }
+    onChunk?(Self.data(for: Array(chunk.prefix(2048))))
+  }
+
+  private static func data(for samples: [Int16]) -> Data {
+    samples.withUnsafeBufferPointer { pointer in
+      Data(buffer: pointer)
+    }
+  }
+}
+
+@MainActor
+private final class SocraticCoachStore: ObservableObject {
+  private static let logger = Logger(subsystem: "ARChess", category: "SocraticCoach")
+
+  @Published private(set) var connectionState: SocraticCoachConnectionState = .disconnected
+  @Published private(set) var micState: SocraticCoachMicState = .inactive
+  @Published private(set) var isStreamingResponse = false
+  @Published private(set) var statusText = "Socratic Coach is offline."
+  @Published private(set) var lastError: String?
+  @Published private(set) var transcriptText: String?
+
+  private let encoder = JSONEncoder()
+  private let webSocketURL: URL?
+  private let session: URLSession
+  private let micCapture = SocraticCoachMicCaptureManager()
+  private let audioPlayer = SocraticCoachPCMPlayer()
+  private var webSocketTask: URLSessionWebSocketTask?
+  private var isEnabled = false
+  private var currentContext: SocraticCoachContext?
+  private var lastSentContext: SocraticCoachContext?
+  private var reconnectWorkItem: DispatchWorkItem?
+  private var threatZoneHandler: (([String], String?) -> Void)?
+
+  init(
+    apiBaseURL: URL? = AppRuntimeConfig.current.apiBaseURL,
+    session: URLSession = .shared
+  ) {
+    self.webSocketURL = Self.makeWebSocketURL(from: apiBaseURL)
+    self.session = session
+
+    micCapture.onStateChange = { [weak self] nextState in
+      Task { @MainActor [weak self] in
+        self?.micState = nextState
+      }
+    }
+
+    micCapture.onChunk = { [weak self] chunkData in
+      Task { @MainActor [weak self] in
+        await self?.sendAudioChunk(chunkData)
+      }
+    }
+  }
+
+  var isConfigured: Bool {
+    webSocketURL != nil
+  }
+
+  var isVisibleInCurrentMode: Bool {
+    isEnabled
+  }
+
+  var canRequestHelp: Bool {
+    isEnabled && isConfigured && !isStreamingResponse
+  }
+
+  var caption: PiecePersonalityDirector.Caption? {
+    guard let transcriptText = transcriptText?.trimmingCharacters(in: .whitespacesAndNewlines),
+          !transcriptText.isEmpty else {
+      return nil
+    }
+
+    return PiecePersonalityDirector.Caption(
+      title: "Gemini",
+      line: transcriptText,
+      imageAssetName: "GeminiNarratorPortrait"
+    )
+  }
+
+  func setEnabled(_ enabled: Bool) {
+    guard isEnabled != enabled else {
+      return
+    }
+
+    isEnabled = enabled
+    if enabled {
+      ensureConnectedIfNeeded()
+      if let currentContext {
+        sendContextIfNeeded(force: true, context: currentContext)
+      }
+    } else {
+      disconnect()
+    }
+  }
+
+  func bindThreatZoneHandler(_ handler: @escaping ([String], String?) -> Void) {
+    threatZoneHandler = handler
+  }
+
+  func unbindThreatZoneHandler() {
+    threatZoneHandler = nil
+  }
+
+  func updateContext(_ context: SocraticCoachContext?) {
+    currentContext = context
+    guard isEnabled, let context else {
+      return
+    }
+
+    ensureConnectedIfNeeded()
+    sendContextIfNeeded(force: false, context: context)
+  }
+
+  func requestStrategicBriefing() {
+    guard canRequestHelp else {
+      return
+    }
+
+    ensureConnectedIfNeeded()
+    transcriptText = nil
+    audioPlayer.stop()
+    isStreamingResponse = true
+    send(payload: SocraticCoachSimplePayload(type: "help_request"))
+  }
+
+  func toggleMicrophone() async {
+    guard isEnabled, isConfigured else {
+      statusText = "Socratic Coach mic is unavailable until ARChessAPIBaseURL is configured."
+      return
+    }
+
+    ensureConnectedIfNeeded()
+
+    switch micState {
+    case .inactive:
+      let granted = await requestMicrophonePermission()
+      guard granted else {
+        lastError = "Microphone permission was denied."
+        statusText = "Microphone permission is required for live Socratic questions."
+        return
+      }
+
+      do {
+        try micCapture.start(unmuted: true)
+        statusText = "Mic live. Tap again to send your question."
+      } catch {
+        lastError = error.localizedDescription
+        statusText = "Mic could not start."
+      }
+    case .active:
+      micCapture.toggleMute()
+      isStreamingResponse = true
+      send(payload: SocraticCoachSimplePayload(type: "audio_stream_end"))
+      statusText = "Question sent. Socratic Coach is listening for the reply."
+    case .muted:
+      micCapture.toggleMute()
+      isStreamingResponse = false
+      statusText = "Mic live. Tap again to send your question."
+    }
+  }
+
+  func disconnect() {
+    reconnectWorkItem?.cancel()
+    reconnectWorkItem = nil
+    webSocketTask?.cancel(with: .goingAway, reason: nil)
+    webSocketTask = nil
+    micCapture.stop()
+    audioPlayer.stop()
+    connectionState = .disconnected
+    isStreamingResponse = false
+    transcriptText = nil
+    lastSentContext = nil
+    statusText = isConfigured
+      ? "Socratic Coach disconnected."
+      : "Set ARChessAPIBaseURL to enable Socratic Coach."
+  }
+
+  private func ensureConnectedIfNeeded() {
+    guard isEnabled else {
+      return
+    }
+
+    guard let webSocketURL else {
+      connectionState = .error
+      statusText = "Set ARChessAPIBaseURL to enable Socratic Coach."
+      return
+    }
+
+    guard webSocketTask == nil else {
+      return
+    }
+
+    connectionState = .connecting
+    statusText = "Socratic Coach connecting..."
+    let task = session.webSocketTask(with: webSocketURL)
+    webSocketTask = task
+    task.resume()
+    receiveNextMessage()
+  }
+
+  private func receiveNextMessage() {
+    guard let webSocketTask else {
+      return
+    }
+
+    webSocketTask.receive { [weak self] result in
+      guard let self else {
+        return
+      }
+
+      Task { @MainActor [weak self] in
+        guard let self else {
+          return
+        }
+
+        switch result {
+        case .failure(let error):
+          self.handleReceiveFailure(error)
+        case .success(let message):
+          self.handleReceived(message)
+          self.receiveNextMessage()
+        }
+      }
+    }
+  }
+
+  private func handleReceiveFailure(_ error: Error) {
+    webSocketTask = nil
+    connectionState = .connecting
+    lastError = error.localizedDescription
+    statusText = "Socratic Coach reconnecting..."
+
+    guard isEnabled else {
+      return
+    }
+
+    let workItem = DispatchWorkItem { [weak self] in
+      Task { @MainActor [weak self] in
+        self?.ensureConnectedIfNeeded()
+        if let context = self?.currentContext {
+          self?.sendContextIfNeeded(force: true, context: context)
+        }
+      }
+    }
+    reconnectWorkItem?.cancel()
+    reconnectWorkItem = workItem
+    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: workItem)
+  }
+
+  private func handleReceived(_ message: URLSessionWebSocketTask.Message) {
+    let data: Data
+    switch message {
+    case .string(let text):
+      data = Data(text.utf8)
+    case .data(let rawData):
+      data = rawData
+    @unknown default:
+      return
+    }
+
+    guard let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let type = payload["type"] as? String else {
+      return
+    }
+
+    switch type {
+    case "status":
+      let stateValue = (payload["state"] as? String ?? "").lowercased()
+      switch stateValue {
+      case "ready":
+        connectionState = .ready
+        lastError = nil
+        statusText = "Socratic Coach is ready."
+        if let context = currentContext {
+          sendContextIfNeeded(force: true, context: context)
+        }
+      case "connecting":
+        connectionState = .connecting
+        statusText = payload["message"] as? String ?? "Socratic Coach connecting..."
+      case "error":
+        connectionState = .error
+        let message = payload["message"] as? String ?? "Socratic Coach failed."
+        lastError = message
+        statusText = message
+      default:
+        connectionState = .disconnected
+        statusText = payload["message"] as? String ?? "Socratic Coach disconnected."
+      }
+    case "streaming":
+      isStreamingResponse = payload["active"] as? Bool ?? false
+    case "turn_complete":
+      isStreamingResponse = false
+      statusText = "Socratic Coach is ready."
+    case "output_transcription":
+      let text = (payload["text"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+      if let text, !text.isEmpty {
+        transcriptText = text
+      }
+    case "audio_chunk":
+      guard let base64PCM = payload["data"] as? String else {
+        return
+      }
+      let mimeType = payload["mime_type"] as? String ?? "audio/pcm;rate=24000"
+      audioPlayer.play(base64PCM: base64PCM, mimeType: mimeType)
+    case "tool_call":
+      guard let name = payload["name"] as? String, name == "show_threat_zone" else {
+        return
+      }
+      let args = payload["args"] as? [String: Any]
+      let squares = args?["squares"] as? [String] ?? []
+      let reason = args?["reason"] as? String
+      threatZoneHandler?(squares, reason)
+    default:
+      break
+    }
+  }
+
+  private func sendContextIfNeeded(force: Bool, context: SocraticCoachContext) {
+    guard force || lastSentContext != context else {
+      return
+    }
+
+    lastSentContext = context
+    send(
+      payload: SocraticCoachContextUpdatePayload(
+        fen: context.fen,
+        move_history: context.moveHistory,
+        active_color: context.activeColor.fenSymbol,
+        moves_played: context.moveHistory.count
+      )
+    )
+  }
+
+  private func sendAudioChunk(_ chunkData: Data) async {
+    guard isEnabled, webSocketTask != nil else {
+      return
+    }
+
+    let payload = SocraticCoachAudioChunkPayload(
+      data: chunkData.base64EncodedString(),
+      mime_type: "audio/pcm;rate=16000"
+    )
+    send(payload: payload)
+  }
+
+  private func send<T: Encodable>(payload: T) {
+    guard let webSocketTask else {
+      return
+    }
+
+    do {
+      let data = try encoder.encode(payload)
+      guard let text = String(data: data, encoding: .utf8) else {
+        return
+      }
+
+      webSocketTask.send(.string(text)) { [weak self] error in
+        guard let self, let error else {
+          return
+        }
+
+        Task { @MainActor [weak self] in
+          self?.handleReceiveFailure(error)
+        }
+      }
+    } catch {
+      lastError = error.localizedDescription
+      statusText = "Socratic Coach failed to encode a websocket message."
+    }
+  }
+
+  private func requestMicrophonePermission() async -> Bool {
+    await withCheckedContinuation { continuation in
+      AVAudioSession.sharedInstance().requestRecordPermission { granted in
+        continuation.resume(returning: granted)
+      }
+    }
+  }
+
+  private static func makeWebSocketURL(from apiBaseURL: URL?) -> URL? {
+    guard let apiBaseURL else {
+      return nil
+    }
+
+    var components = URLComponents(url: apiBaseURL, resolvingAgainstBaseURL: false)
+    if components?.scheme == "https" {
+      components?.scheme = "wss"
+    } else {
+      components?.scheme = "ws"
+    }
+
+    let existingPath = components?.path.trimmingCharacters(in: CharacterSet(charactersIn: "/")) ?? ""
+    let suffix = "v1/gemini/live"
+    components?.path = existingPath.isEmpty ? "/\(suffix)" : "/\(existingPath)/\(suffix)"
+    return components?.url
+  }
 }
 
 private final class GeminiHintService {
@@ -2809,9 +3605,7 @@ private final class CaptureSoundEffectEngine {
   }
 
   private func ensureRunning() throws {
-    let session = AVAudioSession.sharedInstance()
-    try session.setCategory(.ambient, mode: .default, options: [.mixWithOthers])
-    try session.setActive(true, options: [])
+    try AudioSessionCoordinator.shared.activatePlaybackSession()
 
     guard !engine.isRunning else {
       return
@@ -3039,9 +3833,7 @@ private final class AmbientMusicController {
       return
     }
 
-    let session = AVAudioSession.sharedInstance()
-    try session.setCategory(.ambient, mode: .default, options: [.mixWithOthers])
-    try session.setActive(true, options: [])
+    try AudioSessionCoordinator.shared.activatePlaybackSession()
 
     let nextPlayer = try AVAudioPlayer(contentsOf: url)
     nextPlayer.numberOfLoops = -1
@@ -6635,6 +7427,7 @@ private struct NativeARExperienceView: View {
   @StateObject private var commentary = PiecePersonalityDirector()
   @StateObject private var gameReview = GameReviewStore()
   @StateObject private var lessonStore = OpeningLessonStore()
+  @StateObject private var socraticCoach = SocraticCoachStore()
   @State private var isModePanelVisible = false
   @State private var isMatchLogVisible = false
   @State private var isGeminiDebugVisible = false
@@ -6650,6 +7443,7 @@ private struct NativeARExperienceView: View {
         commentary: commentary,
         gameReview: gameReview,
         lessonStore: lessonStore,
+        socraticCoach: socraticCoach,
         onReviewFinished: returnHome
       )
         .ignoresSafeArea()
@@ -6693,6 +7487,17 @@ private struct NativeARExperienceView: View {
                   .font(.system(size: 13, weight: .bold, design: .rounded))
                   .foregroundStyle(Color.white.opacity(0.92))
 
+                Text(socraticCoach.statusText)
+                  .font(.system(size: 12, weight: .semibold, design: .rounded))
+                  .foregroundStyle(Color(red: 0.78, green: 0.88, blue: 0.98))
+
+                if let coachError = socraticCoach.lastError {
+                  Text(coachError)
+                    .font(.system(size: 11, weight: .semibold, design: .rounded))
+                    .foregroundStyle(Color(red: 0.96, green: 0.72, blue: 0.68))
+                    .lineSpacing(2)
+                }
+
                 if commentary.isHintLoading {
                   HStack(spacing: 10) {
                     ProgressView()
@@ -6733,6 +7538,15 @@ private struct NativeARExperienceView: View {
                       commentary.revealHint()
                     }
 
+                    NativeActionButton(
+                      title: "Help",
+                      style: .outline,
+                      isDisabled: !socraticCoach.canRequestHelp,
+                      showsSpinner: socraticCoach.isStreamingResponse
+                    ) {
+                      socraticCoach.requestStrategicBriefing()
+                    }
+
                     NativeActionButton(title: "Analyze current position", style: .outline) {
                       Task {
                         await commentary.analyzeCurrentPosition()
@@ -6754,7 +7568,7 @@ private struct NativeARExperienceView: View {
 
           Spacer()
 
-          if let caption = commentary.caption {
+          if let caption = socraticCoach.caption ?? commentary.caption {
             PieceSpeechBubble(caption: caption)
             .allowsHitTesting(false)
             .transition(.move(edge: .bottom).combined(with: .opacity))
@@ -6887,9 +7701,29 @@ private struct NativeARExperienceView: View {
                   }
                   syncStockfishDebugVisibility()
                 }
+
+                if socraticCoach.isVisibleInCurrentMode {
+                  overlayToggleButton(
+                    title: socraticCoach.micState.label,
+                    systemImage: socraticCoach.micState.systemImageName,
+                    foregroundColor: .white,
+                    backgroundColor: socraticCoach.micState.accentColor
+                  ) {
+                    Task {
+                      await socraticCoach.toggleMicrophone()
+                    }
+                  }
+                }
               }
 
               Spacer(minLength: 16)
+
+              overlayToggleButton(
+                title: "Exit AR",
+                systemImage: "xmark"
+              ) {
+                closeExperience()
+              }
             } else if let lesson = lessonStore.activeLesson {
               Text(lesson.title)
                 .font(.system(size: 22, weight: .heavy, design: .rounded))
@@ -6954,6 +7788,7 @@ private struct NativeARExperienceView: View {
       }
     }
     .task {
+      socraticCoach.setEnabled(mode.supportsSocraticCoach && gameReview.phase == .idle)
       lessonStore.configure(for: mode)
       if mode.usesLocalMatchLog {
         // Remote move logs assume a standard game start, so custom-FEN devCheck
@@ -6970,6 +7805,7 @@ private struct NativeARExperienceView: View {
       }
     }
     .onChange(of: gameReview.phase) { phase in
+      socraticCoach.setEnabled(mode.supportsSocraticCoach && phase == .idle)
       guard phase != .idle else {
         return
       }
@@ -6999,6 +7835,8 @@ private struct NativeARExperienceView: View {
       commentary.unbindHintAvailabilityProvider()
       commentary.unbindRecentHistoryProvider()
       commentary.unbindReactionHandler()
+      socraticCoach.unbindThreatZoneHandler()
+      socraticCoach.disconnect()
       switch mode {
       case .lesson:
         break
@@ -7015,16 +7853,18 @@ private struct NativeARExperienceView: View {
   private func overlayToggleButton(
     title: String,
     systemImage: String,
+    foregroundColor: Color = .white,
+    backgroundColor: Color = Color.black.opacity(0.54),
     action: @escaping () -> Void
   ) -> some View {
     Button(action: action) {
       Image(systemName: systemImage)
         .font(.system(size: 15, weight: .bold))
-        .foregroundStyle(.white)
+        .foregroundStyle(foregroundColor)
         .frame(width: 42, height: 42)
         .background(
           Circle()
-            .fill(Color.black.opacity(0.54))
+            .fill(backgroundColor)
             .overlay(
               Circle()
                 .stroke(Color.white.opacity(0.16), lineWidth: 1)
@@ -7645,18 +8485,28 @@ private struct NativeActionButton: View {
 
   let title: String
   let style: ButtonStyleKind
+  var isDisabled = false
+  var showsSpinner = false
   let action: () -> Void
 
   var body: some View {
     Button(action: action) {
-      Text(title)
-        .font(.system(size: 18, weight: .bold, design: .rounded))
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 18)
-        .foregroundStyle(foregroundColor)
-        .background(background)
+      HStack(spacing: 10) {
+        if showsSpinner {
+          ProgressView()
+            .tint(foregroundColor)
+        }
+
+        Text(title)
+          .font(.system(size: 18, weight: .bold, design: .rounded))
+      }
+      .frame(maxWidth: .infinity)
+      .padding(.vertical, 18)
+      .foregroundStyle(foregroundColor.opacity(isDisabled ? 0.66 : 1.0))
+      .background(background.opacity(isDisabled ? 0.72 : 1.0))
     }
     .buttonStyle(.plain)
+    .disabled(isDisabled)
     .shadow(color: Color.black.opacity(style == .solid ? 0.22 : 0.0), radius: 14, y: 10)
   }
 
@@ -8628,6 +9478,7 @@ private struct NativeARView: UIViewRepresentable {
   @ObservedObject var commentary: PiecePersonalityDirector
   @ObservedObject var gameReview: GameReviewStore
   @ObservedObject var lessonStore: OpeningLessonStore
+  @ObservedObject var socraticCoach: SocraticCoachStore
   let onReviewFinished: () -> Void
 
   func makeCoordinator() -> Coordinator {
@@ -8638,6 +9489,7 @@ private struct NativeARView: UIViewRepresentable {
       commentary: commentary,
       gameReview: gameReview,
       lessonStore: lessonStore,
+      socraticCoach: socraticCoach,
       onReviewFinished: onReviewFinished
     )
   }
@@ -8672,8 +9524,8 @@ private struct NativeARView: UIViewRepresentable {
     }
 
     private let boardSize: Float = 0.40
-    private let boardInset: Float = 0.08
-    private let minimumBoardScale: Float = 1.0
+    private let boardInset: Float = 0.035
+    private let minimumBoardScale: Float = 0.72
     private let maximumBoardScale: Float = 2.4
     private static let brilliantAnimation = GIFAnimationSequence.loadFromBundle(named: "brilliant", withExtension: "gif")
     private let matchLog: MatchLogStore
@@ -8682,17 +9534,22 @@ private struct NativeARView: UIViewRepresentable {
     private let commentary: PiecePersonalityDirector
     private let gameReview: GameReviewStore
     private let lessonStore: OpeningLessonStore
+    private let socraticCoach: SocraticCoachStore
     private let onReviewFinished: () -> Void
     private weak var arView: ARView?
     private var boardAnchor: AnchorEntity?
-    private var boardBaseWorldTransform: simd_float4x4?
     private var boardWorldTransform: simd_float4x4?
     private var boardRoot = Entity()
     private var boardScale: Float = 1.0
-    private var appliedBoardViewerColor: ChessColor?
+    private var boardViewerColor: ChessColor = .black
     private var pinchStartScale: Float = 1.0
     private var piecesContainer = Entity()
     private var highlightsContainer = Entity()
+    private var threatOverlayContainer = Entity()
+    private var activeThreatSquares: [BoardSquare] = []
+    private var activeThreatEntities: [ModelEntity] = []
+    private var threatOverlayDisplayLink: CADisplayLink?
+    private var threatOverlayHideWorkItem: DispatchWorkItem?
     private var trackedPlaneID: UUID?
     private var gameState = ChessGameState.initial()
     private var selectedSquare: BoardSquare?
@@ -8727,6 +9584,7 @@ private struct NativeARView: UIViewRepresentable {
       commentary: PiecePersonalityDirector,
       gameReview: GameReviewStore,
       lessonStore: OpeningLessonStore,
+      socraticCoach: SocraticCoachStore,
       onReviewFinished: @escaping () -> Void
     ) {
       self.matchLog = matchLog
@@ -8735,6 +9593,7 @@ private struct NativeARView: UIViewRepresentable {
       self.commentary = commentary
       self.gameReview = gameReview
       self.lessonStore = lessonStore
+      self.socraticCoach = socraticCoach
       self.onReviewFinished = onReviewFinished
 
       switch mode {
@@ -8760,11 +9619,16 @@ private struct NativeARView: UIViewRepresentable {
       reviewEngineTask?.cancel()
       brilliantMarkerDisplayLink?.invalidate()
       brilliantMarkerHideWorkItem?.cancel()
+      threatOverlayDisplayLink?.invalidate()
+      threatOverlayHideWorkItem?.cancel()
       AmbientMusicController.shared.stop()
     }
 
     func configure(_ arView: ARView) {
       self.arView = arView
+      socraticCoach.bindThreatZoneHandler { [weak self] squares, _ in
+        self?.showThreatOverlay(algebraicSquares: squares)
+      }
       arView.automaticallyConfigureSession = false
       arView.environment.background = .cameraFeed()
       arView.renderOptions.insert(.disableMotionBlur)
@@ -8875,6 +9739,8 @@ private struct NativeARView: UIViewRepresentable {
         coachingOverlay.trailingAnchor.constraint(equalTo: arView.trailingAnchor),
         coachingOverlay.bottomAnchor.constraint(equalTo: arView.bottomAnchor),
       ])
+
+      syncSocraticCoachContext(force: true)
     }
 
     private static func preferredVideoFormat() -> ARConfiguration.VideoFormat? {
@@ -8898,10 +9764,11 @@ private struct NativeARView: UIViewRepresentable {
     func syncRuntimeState(queueAssignedColor: ChessColor?) {
       self.queueAssignedColor = queueAssignedColor
       syncLessonStateIfNeeded()
-      syncReviewStateIfNeeded()
       syncBoardPerspectiveIfNeeded()
       syncLessonAutoplayIfNeeded()
+      syncReviewStateIfNeeded()
       syncAutomatedOpponentTurnIfNeeded()
+      syncSocraticCoachContext()
     }
 
     nonisolated func session(_ session: ARSession, didAdd anchors: [ARAnchor]) {
@@ -9010,8 +9877,10 @@ private struct NativeARView: UIViewRepresentable {
       }
 
       let squareSize = boardSize / 8.0
-      let file = Int(floor((localX + halfBoard) / squareSize))
-      let rank = Int(floor((halfBoard - localZ) / squareSize))
+      let presentedFile = Int(floor((localX + halfBoard) / squareSize))
+      let presentedRank = Int(floor((halfBoard - localZ) / squareSize))
+      let file = boardViewerColor == .white ? 7 - presentedFile : presentedFile
+      let rank = boardViewerColor == .white ? 7 - presentedRank : presentedRank
       let square = BoardSquare(
         file: max(0, min(7, file)),
         rank: max(0, min(7, rank))
@@ -9045,33 +9914,119 @@ private struct NativeARView: UIViewRepresentable {
       }
     }
 
-    private func orientedBoardWorldTransform(
-      from baseTransform: simd_float4x4,
-      viewerColor: ChessColor
-    ) -> simd_float4x4 {
-      guard viewerColor == .white else {
-        return baseTransform
+    private func syncBoardPerspectiveIfNeeded() {
+      let viewerColor = desiredBoardViewerColor()
+      guard boardViewerColor != viewerColor else {
+        return
       }
 
-      let rotation = simd_float4x4(simd_quatf(angle: .pi, axis: SIMD3<Float>(0, 1, 0)))
-      return baseTransform * rotation
+      boardViewerColor = viewerColor
+      rebuildBoardEntityForPerspective()
     }
 
-    private func syncBoardPerspectiveIfNeeded() {
-      guard let boardAnchor,
-            let baseTransform = boardBaseWorldTransform else {
+    private func rebuildBoardEntityForPerspective() {
+      guard let boardAnchor else {
         return
       }
 
-      let viewerColor = desiredBoardViewerColor()
-      guard appliedBoardViewerColor != viewerColor || boardWorldTransform == nil else {
+      boardRoot.removeFromParent()
+      let refreshedBoardRoot = makeBoardEntity()
+      boardAnchor.addChild(refreshedBoardRoot)
+      refreshBoardPresentation()
+    }
+
+    private func syncSocraticCoachContext(force: Bool = false) {
+      let shouldEnableCoach = mode.supportsSocraticCoach && gameReview.phase == .idle
+      socraticCoach.setEnabled(shouldEnableCoach)
+      guard shouldEnableCoach else {
+        socraticCoach.updateContext(nil)
         return
       }
 
-      let nextTransformMatrix = orientedBoardWorldTransform(from: baseTransform, viewerColor: viewerColor)
-      boardAnchor.transform = Transform(matrix: nextTransformMatrix)
-      boardWorldTransform = nextTransformMatrix
-      appliedBoardViewerColor = viewerColor
+      socraticCoach.updateContext(
+        SocraticCoachContext(
+          fen: gameState.fenString,
+          moveHistory: fullNarrativeMoveHistory(),
+          activeColor: gameState.turn
+        )
+      )
+      if force {
+        clearThreatOverlay()
+      }
+    }
+
+    private func fullNarrativeMoveHistory() -> [String] {
+      narrativeHistory.map(\.san)
+    }
+
+    private func showThreatOverlay(algebraicSquares: [String]) {
+      var resolvedSquares: [BoardSquare] = []
+      var seenSquares = Set<BoardSquare>()
+      for square in algebraicSquares.compactMap(BoardSquare.init(algebraic:)) {
+        if seenSquares.insert(square).inserted {
+          resolvedSquares.append(square)
+        }
+      }
+      guard !resolvedSquares.isEmpty else {
+        return
+      }
+
+      activeThreatSquares = resolvedSquares
+      syncThreatOverlay()
+      startThreatOverlayAnimationIfNeeded()
+
+      threatOverlayHideWorkItem?.cancel()
+      let hideWorkItem = DispatchWorkItem { [weak self] in
+        self?.clearThreatOverlay()
+      }
+      threatOverlayHideWorkItem = hideWorkItem
+      DispatchQueue.main.asyncAfter(deadline: .now() + 4.0, execute: hideWorkItem)
+    }
+
+    private func clearThreatOverlay() {
+      threatOverlayHideWorkItem?.cancel()
+      threatOverlayHideWorkItem = nil
+      threatOverlayDisplayLink?.invalidate()
+      threatOverlayDisplayLink = nil
+      activeThreatSquares.removeAll(keepingCapacity: false)
+      Array(threatOverlayContainer.children).forEach { $0.removeFromParent() }
+      activeThreatEntities.removeAll(keepingCapacity: false)
+    }
+
+    private func startThreatOverlayAnimationIfNeeded() {
+      guard threatOverlayDisplayLink == nil else {
+        return
+      }
+
+      let displayLink = CADisplayLink(target: self, selector: #selector(handleThreatOverlayDisplayLink))
+      displayLink.add(to: .main, forMode: .common)
+      threatOverlayDisplayLink = displayLink
+    }
+
+    @objc
+    private func handleThreatOverlayDisplayLink() {
+      let alpha = currentThreatPulseAlpha()
+      let scale = currentThreatPulseScale()
+      for entity in activeThreatEntities {
+        entity.model?.materials = [
+          SimpleMaterial(
+            color: UIColor(red: 0.92, green: 0.18, blue: 0.24, alpha: alpha),
+            roughness: 0.10,
+            isMetallic: false
+          )
+        ]
+        entity.scale = SIMD3<Float>(repeating: scale)
+      }
+    }
+
+    private func currentThreatPulseAlpha() -> CGFloat {
+      let pulse = (sin(CACurrentMediaTime() * (.pi * 3.0)) + 1.0) * 0.5
+      return CGFloat(0.30 + (pulse * 0.50))
+    }
+
+    private func currentThreatPulseScale() -> Float {
+      let pulse = (sin(CACurrentMediaTime() * (.pi * 3.0)) + 1.0) * 0.5
+      return Float(0.97 + (pulse * 0.06))
     }
 
     private func handleTapOnPiece(at square: BoardSquare) {
@@ -9218,12 +10173,13 @@ private struct NativeARView: UIViewRepresentable {
       }
 
       syncedQueueMoves = orderedMoves
-      narrativeHistory = Array(rebuiltNarrativeHistory.suffix(10))
+      narrativeHistory = rebuiltNarrativeHistory
       guard !newMoves.isEmpty else {
         gameState = rebuiltState
         selectedSquare = nil
         selectedMoves = []
         refreshBoardPresentation()
+        syncSocraticCoachContext()
         return
       }
 
@@ -9232,6 +10188,7 @@ private struct NativeARView: UIViewRepresentable {
         selectedSquare = nil
         selectedMoves = []
         refreshBoardPresentation()
+        syncSocraticCoachContext()
       }
 
       for item in newMoves {
@@ -9585,6 +10542,7 @@ private struct NativeARView: UIViewRepresentable {
         loadedLessonReloadVersion = lessonStore.reloadVersion
         refreshBoardPresentation()
         commentary.noteExternalStatus(step.focus)
+        syncSocraticCoachContext(force: true)
       } catch {
         commentary.noteExternalStatus("Lesson step could not load.")
         lessonStore.resetSession()
@@ -9629,6 +10587,7 @@ private struct NativeARView: UIViewRepresentable {
         loadedReviewReloadVersion = gameReview.checkpointReloadVersion
         refreshBoardPresentation()
         commentary.noteExternalStatus("Game Review checkpoint \(gameReview.currentReviewIndex + 1) ready.")
+        syncSocraticCoachContext(force: true)
       } catch {
         commentary.noteExternalStatus("Game Review skipped an invalid checkpoint.")
         if gameReview.advanceToNextCheckpoint() {
@@ -9693,17 +10652,15 @@ private struct NativeARView: UIViewRepresentable {
     private func recordNarrativeMove(_ move: ChessMove, before state: ChessGameState) {
       let entry = NarrativeMove(ply: ply(for: state), san: state.sanNotation(for: move))
       narrativeHistory.append(entry)
-      if narrativeHistory.count > 10 {
-        narrativeHistory.removeFirst(narrativeHistory.count - 10)
-      }
     }
 
     private func recentNarrativeSequence() -> String? {
-      guard !narrativeHistory.isEmpty else {
+      let recentMoves = Array(narrativeHistory.suffix(10))
+      guard !recentMoves.isEmpty else {
         return nil
       }
 
-      return narrativeHistory.map { entry in
+      return recentMoves.map { entry in
         let moveNumber = (entry.ply + 1) / 2
         if entry.ply.isMultiple(of: 2) {
           return "\(moveNumber)... \(entry.san)"
@@ -9741,6 +10698,8 @@ private struct NativeARView: UIViewRepresentable {
 
     @MainActor
     private func animateAndApply(_ context: AnimatedMoveContext) async {
+      clearThreatOverlay()
+
       if activeKnightForkBinding?.clearsOnMoveBy == context.move.piece.color {
         activeKnightForkBinding = nil
       }
@@ -9758,6 +10717,7 @@ private struct NativeARView: UIViewRepresentable {
       gameState = context.afterState
       syncBoardPerspectiveIfNeeded()
       refreshBoardPresentation()
+      syncSocraticCoachContext()
       await context.postApply?()
       await maybeBeginPostGameFlowIfNeeded(after: context.afterState)
     }
@@ -10588,16 +11548,16 @@ private struct NativeARView: UIViewRepresentable {
         return
       }
 
+      boardScale = preferredInitialBoardScale(for: selectedPlane)
       let transform = boardTransform(for: selectedPlane, frame: frame)
 
       if let arView {
         let boardAnchor = AnchorEntity(world: transform)
+        boardViewerColor = desiredBoardViewerColor()
         boardAnchor.addChild(makeBoardEntity())
         arView.scene.addAnchor(boardAnchor)
         self.boardAnchor = boardAnchor
-        boardBaseWorldTransform = transform
         boardWorldTransform = transform
-        syncBoardPerspectiveIfNeeded()
         refreshBoardPresentation()
         AmbientMusicController.shared.playLoopIfNeeded()
       }
@@ -10708,23 +11668,18 @@ private struct NativeARView: UIViewRepresentable {
         return false
       }
 
-      let minExtent = boardSize + (boardInset * 2)
+      let minExtent = (boardSize * minimumBoardScale) + (boardInset * 2)
       guard plane.extent.x >= minExtent, plane.extent.z >= minExtent else {
         return false
       }
 
-      if isTableClassification(plane.classification) {
-        return true
-      }
+      let cameraY = frame.camera.transform.columns.3.y
+      let planeY = plane.transform.columns.3.y
+      let verticalDrop = cameraY - planeY
 
-      if isUnknownClassification(plane.classification) {
-        let cameraY = frame.camera.transform.columns.3.y
-        let planeY = plane.transform.columns.3.y
-        let verticalDrop = cameraY - planeY
-        return verticalDrop > 0.10 && verticalDrop < 1.40
-      }
-
-      return false
+      // Beds and rough cloth-covered tables often classify as unknown or floor
+      // even when they are usable flat placement surfaces.
+      return verticalDrop > 0.05 && verticalDrop < 1.50 && !isCeilingClassification(plane.classification)
     }
 
     private func planeScore(_ plane: ARPlaneAnchor, frame: ARFrame) -> Float {
@@ -10745,9 +11700,9 @@ private struct NativeARView: UIViewRepresentable {
       }
     }
 
-    private func isUnknownClassification(_ classification: ARPlaneAnchor.Classification) -> Bool {
+    private func isCeilingClassification(_ classification: ARPlaneAnchor.Classification) -> Bool {
       switch classification {
-      case ARPlaneAnchor.Classification.none:
+      case ARPlaneAnchor.Classification.ceiling:
         return true
       default:
         return false
@@ -10760,9 +11715,10 @@ private struct NativeARView: UIViewRepresentable {
       let cameraForward = simd_normalize(-simd_make_float3(frame.camera.transform.columns.2))
       let inversePlane = planeTransform.inverse
       let planeHeight = planeTransform.columns.3.y
+      let scaledBoardSize = boardSize * boardScale
 
-      let availableX = max(0, (plane.extent.x * 0.5) - (boardSize * 0.5) - boardInset)
-      let availableZ = max(0, (plane.extent.z * 0.5) - (boardSize * 0.5) - boardInset)
+      let availableX = max(0, (plane.extent.x * 0.5) - (scaledBoardSize * 0.5) - boardInset)
+      let availableZ = max(0, (plane.extent.z * 0.5) - (scaledBoardSize * 0.5) - boardInset)
 
       let horizontalForward = normalized(
         SIMD2<Float>(cameraForward.x, cameraForward.z),
@@ -10798,6 +11754,15 @@ private struct NativeARView: UIViewRepresentable {
       return result
     }
 
+    private func preferredInitialBoardScale(for plane: ARPlaneAnchor) -> Float {
+      let usableWidth = max(0, plane.extent.x - (boardInset * 2))
+      let usableDepth = max(0, plane.extent.z - (boardInset * 2))
+      let widthScale = usableWidth / boardSize
+      let depthScale = usableDepth / boardSize
+      let fitScale = min(widthScale, depthScale, 1.0)
+      return clamp(fitScale, min: minimumBoardScale, max: 1.0)
+    }
+
     private func normalized(_ value: SIMD2<Float>, fallback: SIMD2<Float>) -> SIMD2<Float> {
       let length = simd_length(value)
       guard length > 0.0001 else {
@@ -10817,6 +11782,8 @@ private struct NativeARView: UIViewRepresentable {
       self.boardRoot = boardRoot
       piecesContainer = Entity()
       highlightsContainer = Entity()
+      threatOverlayContainer = Entity()
+      activeThreatEntities = []
 
       let squareSize = boardSize / 8.0
       let baseMesh = MeshResource.generateBox(size: SIMD3<Float>(boardSize + 0.03, 0.012, boardSize + 0.03))
@@ -10846,6 +11813,7 @@ private struct NativeARView: UIViewRepresentable {
         }
       }
 
+      boardRoot.addChild(threatOverlayContainer)
       boardRoot.addChild(highlightsContainer)
       boardRoot.addChild(piecesContainer)
       return boardRoot
@@ -10854,6 +11822,7 @@ private struct NativeARView: UIViewRepresentable {
     private func refreshBoardPresentation() {
       syncPieceEntities()
       syncHighlights()
+      syncThreatOverlay()
     }
 
     private func syncPieceEntities() {
@@ -10875,9 +11844,7 @@ private struct NativeARView: UIViewRepresentable {
         let pieceEntity = makePieceEntity(kind: piece.kind, material: pieceMaterial(for: piece.color))
         pieceEntity.name = pieceName(square)
         pieceEntity.position = boardPosition(square, squareSize: squareSize)
-        if piece.color == .black {
-          pieceEntity.orientation = simd_quatf(angle: .pi, axis: SIMD3<Float>(0, 1, 0))
-        }
+        pieceEntity.orientation = pieceFacingOrientation(for: piece.color)
 
         if selectedSquare == square {
           pieceEntity.position.y += 0.016
@@ -10941,10 +11908,26 @@ private struct NativeARView: UIViewRepresentable {
         ghost.name = "lesson_ghost_piece"
         ghost.position = boardPosition(revealSquare, squareSize: squareSize) + SIMD3<Float>(0, 0.0015, 0)
         ghost.scale = SIMD3<Float>(repeating: 0.96)
-        if expectedMove.piece.color == .black {
-          ghost.orientation = simd_quatf(angle: .pi, axis: SIMD3<Float>(0, 1, 0))
-        }
+        ghost.orientation = pieceFacingOrientation(for: expectedMove.piece.color)
         highlightsContainer.addChild(ghost)
+      }
+    }
+
+    private func syncThreatOverlay() {
+      Array(threatOverlayContainer.children).forEach { $0.removeFromParent() }
+      activeThreatEntities.removeAll(keepingCapacity: false)
+
+      guard !activeThreatSquares.isEmpty else {
+        return
+      }
+
+      let squareSize = boardSize / 8.0
+      let alpha = currentThreatPulseAlpha()
+      for square in activeThreatSquares {
+        let threatEntity = makeThreatOverlayEntity(size: squareSize * 0.96, alpha: alpha)
+        threatEntity.position = boardPosition(square, squareSize: squareSize) + SIMD3<Float>(0, 0.0042, 0)
+        threatOverlayContainer.addChild(threatEntity)
+        activeThreatEntities.append(threatEntity)
       }
     }
 
@@ -10952,6 +11935,19 @@ private struct NativeARView: UIViewRepresentable {
       ModelEntity(
         mesh: .generateBox(size: SIMD3<Float>(size, 0.0012, size)),
         materials: [SimpleMaterial(color: color, roughness: 0.15, isMetallic: false)]
+      )
+    }
+
+    private func makeThreatOverlayEntity(size: Float, alpha: CGFloat) -> ModelEntity {
+      ModelEntity(
+        mesh: .generateBox(size: SIMD3<Float>(size, 0.0014, size)),
+        materials: [
+          SimpleMaterial(
+            color: UIColor(red: 0.92, green: 0.18, blue: 0.24, alpha: alpha),
+            roughness: 0.10,
+            isMetallic: false
+          )
+        ]
       )
     }
 
@@ -11015,9 +12011,17 @@ private struct NativeARView: UIViewRepresentable {
       }
     }
 
+    private func pieceFacingOrientation(for color: ChessColor) -> simd_quatf {
+      color == boardViewerColor
+        ? simd_quatf(angle: .pi, axis: SIMD3<Float>(0, 1, 0))
+        : simd_quatf(angle: 0, axis: SIMD3<Float>(0, 1, 0))
+    }
+
     private func boardPosition(_ square: BoardSquare, squareSize: Float) -> SIMD3<Float> {
-      let x = (Float(square.file) - 3.5) * squareSize
-      let z = (3.5 - Float(square.rank)) * squareSize
+      let presentedFile = boardViewerColor == .white ? 7 - square.file : square.file
+      let presentedRank = boardViewerColor == .white ? 7 - square.rank : square.rank
+      let x = (Float(presentedFile) - 3.5) * squareSize
+      let z = (3.5 - Float(presentedRank)) * squareSize
       return SIMD3<Float>(x, 0.004, z)
     }
 
