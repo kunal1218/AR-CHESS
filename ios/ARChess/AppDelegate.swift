@@ -520,7 +520,7 @@ private enum SocraticCoachMicState: String {
   var label: String {
     switch self {
     case .inactive:
-      return "Mic unavailable"
+      return "Mic off"
     case .muted:
       return "Mic muted"
     case .active:
@@ -539,8 +539,15 @@ private enum SocraticCoachConnectionState: String {
 private final class AudioSessionCoordinator {
   static let shared = AudioSessionCoordinator()
 
+  private enum SessionProfile {
+    case playback
+    case recording
+  }
+
   private let lock = NSLock()
   private var recordingClients = 0
+  private var configuredProfile: SessionProfile?
+  private var isSessionActive = false
 
   private init() {}
 
@@ -563,23 +570,31 @@ private final class AudioSessionCoordinator {
   }
 
   private func configureAudioSession() throws {
-    let isRecordingPreferred: Bool = {
+    let desiredProfile: SessionProfile = {
       lock.lock()
       defer { lock.unlock() }
-      return recordingClients > 0
+      return recordingClients > 0 ? .recording : .playback
     }()
 
+    guard configuredProfile != desiredProfile || !isSessionActive else {
+      return
+    }
+
     let session = AVAudioSession.sharedInstance()
-    if isRecordingPreferred {
-        try session.setCategory(
+    switch desiredProfile {
+    case .recording:
+      try session.setCategory(
         .playAndRecord,
-        mode: .default,
-        options: [.mixWithOthers, .defaultToSpeaker, .allowBluetoothHFP, .allowBluetoothA2DP]
+        mode: .voiceChat,
+        options: [.defaultToSpeaker, .allowBluetoothHFP]
       )
-    } else {
+    case .playback:
       try session.setCategory(.ambient, mode: .default, options: [.mixWithOthers])
     }
+
     try session.setActive(true, options: [])
+    configuredProfile = desiredProfile
+    isSessionActive = true
   }
 }
 
@@ -592,6 +607,7 @@ private final class SocraticCoachPCMPlayer {
   private var configuredSampleRate: Double = 24_000
   private var pendingBufferCount = 0
   private var isEngineConfigured = false
+  private var speechReleaseWorkItem: DispatchWorkItem?
 
   init() {
     engine.attach(playerNode)
@@ -638,6 +654,7 @@ private final class SocraticCoachPCMPlayer {
         channel[index] = Float(samples[index]) / Float(Int16.max)
       }
 
+      self.speechReleaseWorkItem?.cancel()
       self.pendingBufferCount += 1
       AmbientMusicController.shared.setSpeechActive(true)
       self.playerNode.scheduleBuffer(buffer, completionHandler: { [weak self] in
@@ -647,7 +664,11 @@ private final class SocraticCoachPCMPlayer {
         self.queue.async {
           self.pendingBufferCount = max(0, self.pendingBufferCount - 1)
           if self.pendingBufferCount == 0 {
-            AmbientMusicController.shared.setSpeechActive(false)
+            let releaseWorkItem = DispatchWorkItem {
+              AmbientMusicController.shared.setSpeechActive(false)
+            }
+            self.speechReleaseWorkItem = releaseWorkItem
+            self.queue.asyncAfter(deadline: .now() + 0.45, execute: releaseWorkItem)
           }
         }
       })
@@ -665,6 +686,8 @@ private final class SocraticCoachPCMPlayer {
       }
 
       self.pendingBufferCount = 0
+      self.speechReleaseWorkItem?.cancel()
+      self.speechReleaseWorkItem = nil
       self.playerNode.stop()
       self.engine.stop()
       self.isEngineConfigured = false
@@ -779,13 +802,22 @@ private final class SocraticCoachMicCaptureManager {
       return
     }
 
-    flushPendingSamples()
+    _ = finishStreamingTurn()
+  }
+
+  func finishStreamingTurn() -> Data? {
+    guard state != .inactive else {
+      return nil
+    }
+
+    let finalChunk = flushPendingSamplesForManualSend()
     audioEngine.inputNode.removeTap(onBus: 0)
     audioEngine.stop()
     audioConverter = nil
     pendingSamples.removeAll(keepingCapacity: false)
     state = .inactive
     AudioSessionCoordinator.shared.endRecordingSession()
+    return finalChunk
   }
 
   private func handleInputBuffer(_ buffer: AVAudioPCMBuffer) {
@@ -847,8 +879,16 @@ private final class SocraticCoachMicCaptureManager {
   }
 
   private func flushPendingSamples() {
-    guard !pendingSamples.isEmpty, state == .active else {
+    guard let chunkData = flushPendingSamplesForManualSend() else {
       return
+    }
+
+    onChunk?(chunkData)
+  }
+
+  private func flushPendingSamplesForManualSend() -> Data? {
+    guard !pendingSamples.isEmpty, state == .active else {
+      return nil
     }
 
     var chunk = pendingSamples
@@ -856,7 +896,7 @@ private final class SocraticCoachMicCaptureManager {
     if chunk.count < 2048 {
       chunk.append(contentsOf: repeatElement(0, count: 2048 - chunk.count))
     }
-    onChunk?(Self.data(for: Array(chunk.prefix(2048))))
+    return Self.data(for: Array(chunk.prefix(2048)))
   }
 
   private static func data(for samples: [Int16]) -> Data {
@@ -899,6 +939,7 @@ private final class SocraticCoachStore: ObservableObject {
     micCapture.onStateChange = { [weak self] nextState in
       Task { @MainActor [weak self] in
         self?.micState = nextState
+        AmbientMusicController.shared.setSpeechActive(nextState == .active)
       }
     }
 
@@ -1005,9 +1046,12 @@ private final class SocraticCoachStore: ObservableObject {
         statusText = "Mic could not start."
       }
     case .active:
-      micCapture.toggleMute()
+      let finalChunk = micCapture.finishStreamingTurn()
       transcriptText = nil
       audioPlayer.stop()
+      if let finalChunk {
+        await sendAudioChunk(finalChunk)
+      }
       isStreamingResponse = true
       send(payload: SocraticCoachSimplePayload(type: "audio_stream_end"))
       statusText = "Question sent. Socratic Coach is listening for the reply."
@@ -3778,7 +3822,7 @@ private final class AmbientMusicController {
   private var player: AVAudioPlayer?
   private var ambientTrackMissing = false
   private let idleVolume: Float = 0.09
-  private let speechDuckedVolume: Float = 0.045
+  private let speechDuckedVolume: Float = 0.0
   private var isSpeechActive = false
   private var isPlayingRequested = false
 
