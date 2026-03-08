@@ -10,6 +10,7 @@ if str(SERVER_APP_ROOT) not in sys.path:
 from services.move_parser import parse_natural_move  # noqa: E402
 from services.socratic_coach import (  # noqa: E402
     GameStateStore,
+    SocraticCoachSession,
     build_socratic_system_prompt,
     build_context_update_text,
     handle_analyze_hypothetical,
@@ -120,6 +121,24 @@ def test_build_socratic_system_prompt_appends_fletcher_personality_without_silky
     assert "ultra-intense chess coach" in prompt
     assert "Do not just roleplay anger. Teach through the anger." in prompt
     assert "calm and soothing" not in prompt
+
+
+def test_help_request_prompt_explicitly_skips_hypothetical_tool() -> None:
+    session = SocraticCoachSession(
+        frontend_socket=object(),
+        stockfish_engine=object(),
+        api_key="test-key",
+    )
+    observed: dict[str, str] = {}
+
+    async def fake_send_user_turn(text: str) -> None:
+        observed["text"] = text
+
+    session._send_user_turn = fake_send_user_turn  # type: ignore[method-assign]
+
+    asyncio.run(session._handle_frontend_message({"type": "help_request"}))
+
+    assert "do not call analyze_hypothetical_move for this reply" in observed["text"]
 
 
 class FakeStockfishEngine:

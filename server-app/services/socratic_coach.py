@@ -335,6 +335,7 @@ class SocraticCoachSession:
             self._begin_response_tracking()
             await self._send_user_turn(
                 "Provide a strategic briefing on the current position. "
+                "The player has not proposed a specific move, so do not call analyze_hypothetical_move for this reply. "
                 "Speak directly to the player in second person, as if answering them face-to-face. "
                 "Keep it concise: 2 to 4 short sentences, hard cap 5."
             )

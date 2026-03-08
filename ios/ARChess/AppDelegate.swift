@@ -1078,7 +1078,7 @@ private final class SocraticCoachMicCaptureManager {
 @MainActor
 private final class SocraticCoachStore: ObservableObject {
   private static let logger = Logger(subsystem: "ARChess", category: "SocraticCoach")
-  private static let startupConnectDelay: TimeInterval = 1.1
+  private static let startupConnectDelay: TimeInterval = 0.15
   private static let microphonePrewarmDelay: TimeInterval = 0.45
   private static let blockedTranscriptMarkers = [
     "the user",
@@ -1220,6 +1220,9 @@ private final class SocraticCoachStore: ObservableObject {
 
     delayedConnectWorkItem?.cancel()
     ensureConnectedIfNeeded()
+    if let currentContext {
+      sendContextIfNeeded(force: true, context: currentContext)
+    }
     transcriptText = nil
     audioPlayer.stop()
     isStreamingResponse = true
@@ -1234,6 +1237,9 @@ private final class SocraticCoachStore: ObservableObject {
 
     delayedConnectWorkItem?.cancel()
     ensureConnectedIfNeeded()
+    if let currentContext {
+      sendContextIfNeeded(force: true, context: currentContext)
+    }
 
     switch micState {
     case .inactive:
@@ -5522,6 +5528,8 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   private var recentHistoryProvider: (() -> String?)?
   private var hintTask: Task<Void, Never>?
   private var geminiStatusTask: Task<Void, Never>?
+  private var engineWarmupTask: Task<Void, Never>?
+  private var hasPreparedEngine = false
   private var hintCache: [String: String] = [:]
   private var currentHintKey: String?
   private var pendingHintReveal = false
@@ -5548,6 +5556,38 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
 
   func attachEngineHost(to view: UIView) {
     analyzer.attach(to: view)
+  }
+
+  func prepareEngineIfNeeded() {
+    guard engineWarmupTask == nil, !hasPreparedEngine else {
+      return
+    }
+
+    engineWarmupTask = Task { @MainActor [weak self] in
+      guard let self else {
+        return
+      }
+
+      defer {
+        self.engineWarmupTask = nil
+      }
+
+      do {
+        try await self.analyzer.newGame()
+        self.hasPreparedEngine = true
+        guard self.cachedAnalysis == nil else {
+          return
+        }
+        self.analysisStatus = "Local Stockfish is standing by."
+        self.latestAssessment = "Board ready. Stockfish will wake on demand."
+      } catch {
+        guard self.cachedAnalysis == nil else {
+          return
+        }
+        self.analysisStatus = "Stockfish will wake when needed."
+        self.latestAssessment = "Board ready."
+      }
+    }
   }
 
   func prepare(with state: ChessGameState, force: Bool = false) async {
@@ -5608,6 +5648,9 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     commentaryRequestTask = nil
     geminiStatusTask?.cancel()
     geminiStatusTask = nil
+    engineWarmupTask?.cancel()
+    engineWarmupTask = nil
+    hasPreparedEngine = false
     recentHistoryProvider = nil
     hintCache.removeAll()
     currentHintKey = nil
@@ -10503,10 +10546,13 @@ private struct NativeARView: UIViewRepresentable {
       arView.renderOptions.insert(.disableGroundingShadows)
       Task { @MainActor [weak self] in
         self?.commentary.attachEngineHost(to: arView)
+        if self?.mode.warmsStockfishAnalysis == true {
+          self?.commentary.prepareEngineIfNeeded()
+        }
       }
       noteWarmupStatus(
         mode.warmsStockfishAnalysis
-          ? "Waiting for board placement before warming Stockfish..."
+          ? "Scanning for board placement. Local Stockfish is warming in the background..."
           : "Waiting for board placement to start the lesson..."
       )
       if case .playVsStockfish(let configuration) = mode {
@@ -12486,13 +12532,13 @@ private struct NativeARView: UIViewRepresentable {
       if boardAnchor == nil {
         noteWarmupStatus(
           mode.warmsStockfishAnalysis
-            ? "Waiting for board placement before warming Stockfish..."
+            ? "Scanning for board placement. Local Stockfish is warming in the background..."
             : "Waiting for board placement to start the lesson..."
         )
       } else if stableTrackingFrames < 60 {
         noteWarmupStatus(
           mode.warmsStockfishAnalysis
-            ? "Waiting for AR tracking to stabilize before warming Stockfish..."
+            ? "Board placed. Waiting for AR tracking to stabilize..."
             : "Waiting for AR tracking to stabilize before starting the lesson..."
         )
       } else {
@@ -12519,23 +12565,10 @@ private struct NativeARView: UIViewRepresentable {
       }
 
       hasScheduledInitialAnalysis = true
-      noteWarmupStatus("Tracking stable. Warming local Stockfish...")
       initialAnalysisTask?.cancel()
-      initialAnalysisTask = Task { @MainActor [weak self] in
-        try? await Task.sleep(nanoseconds: 2_500_000_000)
-        guard let self else {
-          return
-        }
-
-        guard self.boardAnchor != nil, self.stableTrackingFrames >= 60 else {
-          self.hasScheduledInitialAnalysis = false
-          self.noteWarmupStatus("AR tracking slipped. Waiting to warm Stockfish again...")
-          return
-        }
-
-        await self.commentary.prepare(with: self.gameState, force: true)
-        self.syncAutomatedOpponentTurnIfNeeded()
-      }
+      initialAnalysisTask = nil
+      commentary.prepareEngineIfNeeded()
+      noteWarmupStatus("Board ready. Local Stockfish is standing by.")
     }
 
     private func noteWarmupStatus(_ message: String) {
