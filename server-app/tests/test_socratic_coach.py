@@ -89,11 +89,29 @@ def test_sanitize_model_narration_text_strips_meta_segments_from_mixed_response(
     )
 
 
+def test_sanitize_model_narration_text_caps_to_five_sentences() -> None:
+    raw_text = (
+        "You gave away the center. "
+        "Your king is still uncastled. "
+        "The loose bishop is asking to be hit. "
+        "Your pieces are not helping each other. "
+        "You must fix development now. "
+        "Which piece can do that first?"
+    )
+
+    assert sanitize_model_narration_text(raw_text) == (
+        "You gave away the center. Your king is still uncastled. "
+        "The loose bishop is asking to be hit. Your pieces are not helping each other. "
+        "You must fix development now."
+    )
+
+
 def test_build_socratic_system_prompt_appends_silky_personality() -> None:
     prompt = build_socratic_system_prompt("silky")
 
     assert "You are a Socratic chess coach." in prompt
     assert "calm, silky, confident delivery" in prompt
+    assert "never exceed 5 short sentences" in prompt
 
 
 def test_build_socratic_system_prompt_appends_fletcher_personality_without_silky_bias() -> None:

@@ -412,6 +412,27 @@ def env_int(name: str, default: int) -> int:
     return default
 
 
+def truncate_narration_text(text: str, *, max_sentences: int, max_characters: int) -> str:
+    condensed = re.sub(r"\s+", " ", text).strip()
+    if not condensed:
+        return ""
+
+    sentences = re.findall(r"[^.!?]+[.!?]+|[^.!?]+$", condensed)
+    if sentences:
+        condensed = " ".join(sentence.strip() for sentence in sentences[:max_sentences] if sentence.strip()).strip()
+
+    if len(condensed) <= max_characters:
+        return condensed
+
+    shortened = condensed[:max_characters].rsplit(" ", 1)[0].strip()
+    if not shortened:
+        shortened = condensed[:max_characters].strip()
+    shortened = shortened.rstrip(" ,;:-")
+    if shortened.endswith((".", "!", "?")):
+        return shortened
+    return f"{shortened}..."
+
+
 def gemini_fallback_hint(payload: GeminiHintRequest) -> str:
     if payload.narrator == "fletcher":
         if payload.gives_check:
@@ -463,7 +484,7 @@ def sanitize_hint_text(raw_text: str, fallback: str) -> str:
         return fallback
     if GEMINI_HINT_MOVE_PATTERN.search(trimmed):
         return fallback
-    condensed = re.sub(r"\s+", " ", trimmed).strip()
+    condensed = truncate_narration_text(trimmed, max_sentences=1, max_characters=120)
     return condensed or fallback
 
 
@@ -483,13 +504,9 @@ def gemini_fallback_lesson_feedback(payload: GeminiLessonFeedbackRequest) -> str
 
 
 def sanitize_lesson_feedback_text(raw_text: str, fallback: str) -> str:
-    condensed = re.sub(r"\s+", " ", raw_text).strip()
+    condensed = truncate_narration_text(raw_text, max_sentences=2, max_characters=220)
     if not condensed:
         return fallback
-
-    if len(condensed) > 280:
-        shortened = condensed[:277].rsplit(" ", 1)[0].strip()
-        return f"{shortened}..." if shortened else fallback
 
     return condensed
 

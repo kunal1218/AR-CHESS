@@ -18,6 +18,10 @@ from services.move_parser import parse_natural_move, uci_to_san
 from services.narrator_personality import DEFAULT_NARRATOR, narrator_personality_addon, normalize_narrator
 from services.stockfish_engine import StockfishEngine
 
+SOCRATIC_REPLY_SENTENCE_LIMIT = 5
+SOCRATIC_REPLY_CHARACTER_LIMIT = 420
+SOCRATIC_MAX_OUTPUT_TOKENS = 160
+
 
 SOCRATIC_BASE_SYSTEM_PROMPT = """
 You are a Socratic chess coach.
@@ -86,6 +90,8 @@ If mate_in is not null: pause before speaking. Then:
 End every strategic briefing with one Socratic question that leads toward the correct idea
 without revealing it. The question should make the answer feel inevitable in hindsight.
 Example: "Where must a knight stand to make the queen irrelevant?"
+Keep every reply concise. Aim for 2 to 4 short sentences and never exceed 5 short sentences.
+Keep the spoken interruption brief; target roughly 12 seconds or less.
 """.strip()
 
 
@@ -330,7 +336,8 @@ class SocraticCoachSession:
             self._begin_response_tracking()
             await self._send_user_turn(
                 "Provide a strategic briefing on the current position. "
-                "Speak directly to the player in second person, as if answering them face-to-face."
+                "Speak directly to the player in second person, as if answering them face-to-face. "
+                "Keep it concise: 2 to 4 short sentences, hard cap 5."
             )
             return
 
@@ -422,6 +429,7 @@ class SocraticCoachSession:
                 "model": self._model,
                 "generationConfig": {
                     "responseModalities": ["AUDIO"],
+                    "maxOutputTokens": SOCRATIC_MAX_OUTPUT_TOKENS,
                     "speechConfig": {
                         "voiceConfig": {
                             "prebuiltVoiceConfig": {
@@ -771,7 +779,34 @@ def sanitize_model_narration_text(text: str) -> str:
 
         kept_segments.append(segment)
 
-    return " ".join(kept_segments).strip()
+    condensed = " ".join(kept_segments).strip()
+    return _truncate_narration_text(
+        condensed,
+        max_sentences=SOCRATIC_REPLY_SENTENCE_LIMIT,
+        max_characters=SOCRATIC_REPLY_CHARACTER_LIMIT,
+    )
+
+
+def _truncate_narration_text(text: str, *, max_sentences: int, max_characters: int) -> str:
+    if not text:
+        return ""
+
+    sentences = re.findall(r"[^.!?]+[.!?]+|[^.!?]+$", text)
+    if sentences:
+        trimmed = " ".join(sentence.strip() for sentence in sentences[:max_sentences] if sentence.strip()).strip()
+    else:
+        trimmed = text.strip()
+
+    if len(trimmed) <= max_characters:
+        return trimmed
+
+    shortened = trimmed[:max_characters].rsplit(" ", 1)[0].strip()
+    if not shortened:
+        shortened = trimmed[:max_characters].strip()
+    shortened = shortened.rstrip(" ,;:-")
+    if shortened.endswith((".", "!", "?")):
+        return shortened
+    return f"{shortened}..."
 
 
 def _looks_like_section_heading(text: str) -> bool:

@@ -148,6 +148,52 @@ private enum NarratorType: String, CaseIterable, Identifiable {
   }
 }
 
+private let geminiNarrationSentenceLimit = 5
+private let geminiNarrationCharacterLimit = 320
+
+private func cappedNarrationText(
+  _ text: String,
+  maxSentences: Int = geminiNarrationSentenceLimit,
+  maxCharacters: Int = geminiNarrationCharacterLimit
+) -> (text: String, truncated: Bool) {
+  let normalized = text
+    .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+    .trimmingCharacters(in: .whitespacesAndNewlines)
+  guard !normalized.isEmpty else {
+    return ("", false)
+  }
+
+  var capped = normalized
+  var truncated = false
+
+  if maxSentences > 0,
+     let regex = try? NSRegularExpression(pattern: #"[.!?]+(?:["')\]]+)?(?=\s|$)"#) {
+    let range = NSRange(capped.startIndex..., in: capped)
+    let matches = regex.matches(in: capped, range: range)
+    if matches.count > maxSentences,
+       let cutoff = Range(matches[maxSentences - 1].range, in: capped) {
+      capped = String(capped[..<cutoff.upperBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+      truncated = true
+    }
+  }
+
+  if capped.count > maxCharacters {
+    let index = capped.index(capped.startIndex, offsetBy: maxCharacters)
+    var shortened = String(capped[..<index]).trimmingCharacters(in: .whitespacesAndNewlines)
+    if let lastSpace = shortened.lastIndex(of: " ") {
+      shortened = String(shortened[..<lastSpace]).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+    shortened = shortened.trimmingCharacters(in: CharacterSet(charactersIn: " ,;:-"))
+    if !shortened.hasSuffix(".") && !shortened.hasSuffix("!") && !shortened.hasSuffix("?") {
+      shortened.append("...")
+    }
+    capped = shortened
+    truncated = true
+  }
+
+  return (capped, truncated)
+}
+
 private enum StockfishMatchLaunchKind: Hashable {
   case standard
   case devCheck
@@ -982,6 +1028,7 @@ private final class SocraticCoachStore: ObservableObject {
   private var lastSentContext: SocraticCoachContext?
   private var reconnectWorkItem: DispatchWorkItem?
   private var threatZoneHandler: (([String], String?) -> Void)?
+  private var suppressIncomingAudio = false
 
   init(
     narrator: NarratorType,
@@ -1070,6 +1117,7 @@ private final class SocraticCoachStore: ObservableObject {
     }
 
     ensureConnectedIfNeeded()
+    suppressIncomingAudio = false
     transcriptText = nil
     audioPlayer.stop()
     isStreamingResponse = true
@@ -1095,6 +1143,7 @@ private final class SocraticCoachStore: ObservableObject {
 
       do {
         try micCapture.start(unmuted: true)
+        suppressIncomingAudio = false
         statusText = "Mic live. Tap again to send your question."
       } catch {
         lastError = error.localizedDescription
@@ -1102,6 +1151,7 @@ private final class SocraticCoachStore: ObservableObject {
       }
     case .active:
       let finalChunk = micCapture.finishStreamingTurn()
+      suppressIncomingAudio = false
       transcriptText = nil
       audioPlayer.stop()
       if let finalChunk {
@@ -1122,6 +1172,7 @@ private final class SocraticCoachStore: ObservableObject {
     reconnectWorkItem = nil
     webSocketTask?.cancel(with: .goingAway, reason: nil)
     webSocketTask = nil
+    suppressIncomingAudio = false
     micCapture.stop()
     audioPlayer.stop()
     connectionState = .disconnected
@@ -1186,6 +1237,7 @@ private final class SocraticCoachStore: ObservableObject {
     webSocketTask = nil
     connectionState = .connecting
     isStreamingResponse = false
+    suppressIncomingAudio = false
     lastError = error.localizedDescription
     statusText = "Socratic Coach reconnecting..."
 
@@ -1248,17 +1300,28 @@ private final class SocraticCoachStore: ObservableObject {
       }
     case "streaming":
       isStreamingResponse = payload["active"] as? Bool ?? false
+      if !isStreamingResponse {
+        suppressIncomingAudio = false
+      }
     case "turn_complete":
       isStreamingResponse = false
+      suppressIncomingAudio = false
       statusText = "Socratic Coach is ready."
     case "output_transcription":
-      let text = (payload["text"] as? String).flatMap(Self.sanitizedTranscript)
-      if let text {
-        transcriptText = text
+      let capped = (payload["text"] as? String).flatMap(Self.sanitizedTranscript)
+      if let capped {
+        transcriptText = capped.text
+        if capped.truncated {
+          suppressIncomingAudio = true
+          audioPlayer.stop()
+        }
       } else {
         transcriptText = nil
       }
     case "audio_chunk":
+      guard !suppressIncomingAudio else {
+        return
+      }
       guard let base64PCM = payload["data"] as? String else {
         return
       }
@@ -1331,7 +1394,7 @@ private final class SocraticCoachStore: ObservableObject {
     }
   }
 
-  private static func sanitizedTranscript(_ text: String) -> String? {
+  private static func sanitizedTranscript(_ text: String) -> (text: String, truncated: Bool)? {
     let normalized = text
       .replacingOccurrences(of: "**", with: " ")
       .replacingOccurrences(of: "__", with: " ")
@@ -1350,7 +1413,11 @@ private final class SocraticCoachStore: ObservableObject {
       return nil
     }
 
-    return normalized
+    let capped = cappedNarrationText(normalized)
+    guard !capped.text.isEmpty else {
+      return nil
+    }
+    return capped
   }
 
   private static func looksLikeSectionHeading(_ text: String) -> Bool {
@@ -6702,7 +6769,12 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       return false
     }
 
-    let utterance = AVSpeechUtterance(string: text)
+    let capped = cappedNarrationText(text)
+    guard !capped.text.isEmpty else {
+      return false
+    }
+
+    let utterance = AVSpeechUtterance(string: capped.text)
     utterance.voice = AVSpeechSynthesisVoice(language: "en-US")
     utterance.pitchMultiplier = 1.02
     utterance.rate = 0.47
@@ -6710,7 +6782,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     utterance.preUtteranceDelay = 0.02
     utteranceCaptions[ObjectIdentifier(utterance)] = Caption(
       title: title,
-      line: text,
+      line: capped.text,
       imageAssetName: "GeminiNarratorPortrait"
     )
     synthesizer.speak(utterance)

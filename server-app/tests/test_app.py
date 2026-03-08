@@ -20,6 +20,8 @@ from main import (  # noqa: E402
     narrator_personality_addon,
     normalize_postgres_dsn,
     parse_gemini_coach_response,
+    sanitize_hint_text,
+    sanitize_lesson_feedback_text,
 )
 
 
@@ -424,6 +426,25 @@ def test_create_gemini_hint_returns_sanitized_hint(monkeypatch) -> None:
     assert response.status_code == 200
     # Coordinates are stripped via fallback to keep hints beginner-friendly.
     assert response.json()["hint"] == "Good. Grab central space instead of drifting around doing nothing."
+
+
+def test_sanitize_hint_text_caps_to_one_sentence() -> None:
+    fallback = "Fallback hint."
+    raw_text = "Hit the center hard. Then pile onto the weak king. Do not drift."
+
+    assert sanitize_hint_text(raw_text, fallback) == "Hit the center hard."
+
+
+def test_sanitize_lesson_feedback_text_caps_to_two_sentences() -> None:
+    fallback = "Fallback lesson feedback."
+    raw_text = (
+        "That move neglects development. Your king stays exposed. "
+        "You also gave up the center for no reason."
+    )
+
+    assert sanitize_lesson_feedback_text(raw_text, fallback) == (
+        "That move neglects development. Your king stays exposed."
+    )
 
 
 def test_build_gemini_lesson_feedback_query_includes_narrator_addon() -> None:
