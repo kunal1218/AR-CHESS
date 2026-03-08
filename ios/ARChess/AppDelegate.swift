@@ -666,7 +666,7 @@ private final class AudioSessionCoordinator {
         options: [.defaultToSpeaker, .allowBluetoothHFP]
       )
     case .playback:
-      try session.setCategory(.ambient, mode: .default, options: [.mixWithOthers])
+      try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
     }
 
     try session.setActive(true, options: [])
@@ -1028,7 +1028,6 @@ private final class SocraticCoachStore: ObservableObject {
   private var lastSentContext: SocraticCoachContext?
   private var reconnectWorkItem: DispatchWorkItem?
   private var threatZoneHandler: (([String], String?) -> Void)?
-  private var suppressIncomingAudio = false
 
   init(
     narrator: NarratorType,
@@ -1117,7 +1116,6 @@ private final class SocraticCoachStore: ObservableObject {
     }
 
     ensureConnectedIfNeeded()
-    suppressIncomingAudio = false
     transcriptText = nil
     audioPlayer.stop()
     isStreamingResponse = true
@@ -1143,7 +1141,6 @@ private final class SocraticCoachStore: ObservableObject {
 
       do {
         try micCapture.start(unmuted: true)
-        suppressIncomingAudio = false
         statusText = "Mic live. Tap again to send your question."
       } catch {
         lastError = error.localizedDescription
@@ -1151,7 +1148,6 @@ private final class SocraticCoachStore: ObservableObject {
       }
     case .active:
       let finalChunk = micCapture.finishStreamingTurn()
-      suppressIncomingAudio = false
       transcriptText = nil
       audioPlayer.stop()
       if let finalChunk {
@@ -1172,7 +1168,6 @@ private final class SocraticCoachStore: ObservableObject {
     reconnectWorkItem = nil
     webSocketTask?.cancel(with: .goingAway, reason: nil)
     webSocketTask = nil
-    suppressIncomingAudio = false
     micCapture.stop()
     audioPlayer.stop()
     connectionState = .disconnected
@@ -1237,7 +1232,6 @@ private final class SocraticCoachStore: ObservableObject {
     webSocketTask = nil
     connectionState = .connecting
     isStreamingResponse = false
-    suppressIncomingAudio = false
     lastError = error.localizedDescription
     statusText = "Socratic Coach reconnecting..."
 
@@ -1300,28 +1294,17 @@ private final class SocraticCoachStore: ObservableObject {
       }
     case "streaming":
       isStreamingResponse = payload["active"] as? Bool ?? false
-      if !isStreamingResponse {
-        suppressIncomingAudio = false
-      }
     case "turn_complete":
       isStreamingResponse = false
-      suppressIncomingAudio = false
       statusText = "Socratic Coach is ready."
     case "output_transcription":
       let capped = (payload["text"] as? String).flatMap(Self.sanitizedTranscript)
       if let capped {
         transcriptText = capped.text
-        if capped.truncated {
-          suppressIncomingAudio = true
-          audioPlayer.stop()
-        }
       } else {
         transcriptText = nil
       }
     case "audio_chunk":
-      guard !suppressIncomingAudio else {
-        return
-      }
       guard let base64PCM = payload["data"] as? String else {
         return
       }
@@ -5660,6 +5643,35 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     after afterState: ChessGameState
   ) async -> MoveEvaluationDelta? {
     completedPlyCount += 1
+    let reachedCommentaryWindow = completedPlyCount >= nextCommentaryPly
+
+    if afterState.isCheckmate(for: afterState.turn) {
+      latestAssessment = "Checkmate."
+      if speakRandomLine(from: checkmateLines(), priority: .urgent) {
+        scheduleNextCommentaryWindow()
+        try? await Task.sleep(nanoseconds: 180_000_000)
+      }
+    } else if reachedCommentaryWindow {
+      let dialogueLines: [SpokenLine]
+      let priority: SpeechPriority
+      if afterState.isInCheck(for: afterState.turn) {
+        latestAssessment = "Check."
+        dialogueLines = checkLines()
+        priority = .urgent
+      } else if let captured = move.captured {
+        dialogueLines = captureLines(for: captured.kind)
+        priority = .normal
+      } else {
+        dialogueLines = moveFlavorLines(for: move.piece.kind)
+        priority = .normal
+      }
+
+      if speakRandomLine(from: dialogueLines, priority: priority) {
+        scheduleNextCommentaryWindow()
+        try? await Task.sleep(nanoseconds: 180_000_000)
+      }
+    }
+
     let beforeAnalysis = await analysisForCurrentTurn(state: beforeState)
     let afterAnalysis = await analysisForCurrentTurn(state: afterState)
     let evaluationDelta = moveEvaluationDelta(
@@ -5708,10 +5720,6 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     }
 
     if afterState.isCheckmate(for: afterState.turn) {
-      latestAssessment = "Checkmate."
-      if speakRandomLine(from: checkmateLines(), priority: .urgent) {
-        scheduleNextCommentaryWindow()
-      }
       return evaluationDelta
     }
 
@@ -5745,26 +5753,12 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       reactionHandler?(ReactionCue(kind: .knightFork(targets: knightForkTargets)))
     }
 
-    guard completedPlyCount >= nextCommentaryPly else {
+    guard !reachedCommentaryWindow else {
       return evaluationDelta
     }
 
-    let dialogueLines: [SpokenLine]
-    let priority: SpeechPriority
-    if afterState.isInCheck(for: afterState.turn) {
-      latestAssessment = "Check."
-      dialogueLines = checkLines()
-      priority = .urgent
-    } else if let captured = move.captured {
-      dialogueLines = captureLines(for: captured.kind)
-      priority = .normal
-    } else {
-      dialogueLines = moveFlavorLines(for: move.piece.kind)
-      priority = .normal
-    }
-
-    if speakRandomLine(from: dialogueLines, priority: priority) {
-      scheduleNextCommentaryWindow()
+    guard completedPlyCount >= nextCommentaryPly else {
+      return evaluationDelta
     }
 
     return evaluationDelta
@@ -6746,6 +6740,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       return false
     }
 
+    try? AudioSessionCoordinator.shared.activatePlaybackSession()
     let utterance = AVSpeechUtterance(string: line.text)
     utterance.voice = AVSpeechSynthesisVoice(language: "en-US")
     utterance.pitchMultiplier = min(max(resolvedPitch(for: line), 0.5), 2.0)
@@ -6774,6 +6769,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       return false
     }
 
+    try? AudioSessionCoordinator.shared.activatePlaybackSession()
     let utterance = AVSpeechUtterance(string: capped.text)
     utterance.voice = AVSpeechSynthesisVoice(language: "en-US")
     utterance.pitchMultiplier = 1.02

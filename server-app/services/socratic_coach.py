@@ -20,7 +20,6 @@ from services.stockfish_engine import StockfishEngine
 
 SOCRATIC_REPLY_SENTENCE_LIMIT = 5
 SOCRATIC_REPLY_CHARACTER_LIMIT = 420
-SOCRATIC_MAX_OUTPUT_TOKENS = 160
 
 
 SOCRATIC_BASE_SYSTEM_PROMPT = """
@@ -429,7 +428,6 @@ class SocraticCoachSession:
                 "model": self._model,
                 "generationConfig": {
                     "responseModalities": ["AUDIO"],
-                    "maxOutputTokens": SOCRATIC_MAX_OUTPUT_TOKENS,
                     "speechConfig": {
                         "voiceConfig": {
                             "prebuiltVoiceConfig": {
