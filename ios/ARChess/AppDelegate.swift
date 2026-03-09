@@ -524,20 +524,6 @@ private struct GeminiHintResponsePayload: Decodable {
   let hint: String
 }
 
-private struct GeminiLessonFeedbackRequestPayload: Encodable {
-  let fen: String
-  let lesson_title: String
-  let attempted_move: String
-  let correct_move: String
-  let side_to_move: String
-  let narrator: String
-  let focus: String
-}
-
-private struct GeminiLessonFeedbackResponsePayload: Decodable {
-  let explanation: String
-}
-
 private struct GeminiCoachCommentaryRequestPayload: Encodable {
   let fen: String
   let narrator: String
@@ -593,16 +579,6 @@ private struct GeminiCoachCommentaryContext: Equatable {
   let narrator: NarratorType
 }
 
-private struct GeminiLessonFeedbackContext {
-  let fen: String
-  let lessonTitle: String
-  let attemptedMove: String
-  let correctMove: String
-  let sideToMove: ChessColor
-  let narrator: NarratorType
-  let focus: String
-}
-
 private struct SocraticCoachContext: Equatable {
   let fen: String
   let moveHistory: [String]
@@ -632,6 +608,21 @@ private struct SocraticCoachLessonIntroPayload: Encodable {
   let lesson_title: String
   let prompt: String
   let focus: String
+}
+
+private struct SocraticCoachLessonAttemptFeedbackPayload: Encodable {
+  let type = "lesson_attempt_feedback"
+  let lesson_title: String
+  let prompt: String
+  let focus: String
+  let remaining_tries: Int
+  let move_revealed: Bool
+}
+
+private struct SocraticCoachLessonCompletionPayload: Encodable {
+  let type = "lesson_complete"
+  let lesson_title: String
+  let summary: String
 }
 
 private struct SocraticCoachVoiceMoveCommitPayload: Encodable {
@@ -1329,39 +1320,56 @@ private final class SocraticCoachStore: ObservableObject {
   }
 
   func requestStrategicBriefing() {
-    guard canRequestHelp else {
+    guard canRequestHelp, prepareNarrationRequest() else {
       return
     }
-
-    delayedConnectWorkItem?.cancel()
-    ensureConnectedIfNeeded()
-    if let currentContext {
-      sendContextIfNeeded(force: true, context: currentContext)
-    }
-    transcriptText = nil
-    audioPlayer.stop()
-    isStreamingResponse = true
     send(payload: SocraticCoachSimplePayload(type: "help_request"))
   }
 
   func requestLessonIntro(lessonTitle: String, prompt: String, focus: String) {
-    guard isEnabled, isConfigured, !isStreamingResponse else {
+    guard prepareNarrationRequest() else {
       return
     }
-
-    delayedConnectWorkItem?.cancel()
-    ensureConnectedIfNeeded()
-    if let currentContext {
-      sendContextIfNeeded(force: true, context: currentContext)
-    }
-    transcriptText = nil
-    audioPlayer.stop()
-    isStreamingResponse = true
     send(
       payload: SocraticCoachLessonIntroPayload(
         lesson_title: lessonTitle,
         prompt: prompt,
         focus: focus
+      )
+    )
+  }
+
+  func requestLessonAttemptFeedback(
+    lessonTitle: String,
+    prompt: String,
+    focus: String,
+    remainingTries: Int,
+    moveRevealed: Bool
+  ) {
+    guard prepareNarrationRequest() else {
+      return
+    }
+
+    send(
+      payload: SocraticCoachLessonAttemptFeedbackPayload(
+        lesson_title: lessonTitle,
+        prompt: prompt,
+        focus: focus,
+        remaining_tries: remainingTries,
+        move_revealed: moveRevealed
+      )
+    )
+  }
+
+  func requestLessonCompletion(lessonTitle: String, summary: String) {
+    guard prepareNarrationRequest() else {
+      return
+    }
+
+    send(
+      payload: SocraticCoachLessonCompletionPayload(
+        lesson_title: lessonTitle,
+        summary: summary
       )
     )
   }
@@ -1473,6 +1481,22 @@ private final class SocraticCoachStore: ObservableObject {
     webSocketTask = task
     task.resume()
     receiveNextMessage()
+  }
+
+  private func prepareNarrationRequest() -> Bool {
+    guard isEnabled, isConfigured, !isStreamingResponse else {
+      return false
+    }
+
+    delayedConnectWorkItem?.cancel()
+    ensureConnectedIfNeeded()
+    if let currentContext {
+      sendContextIfNeeded(force: true, context: currentContext)
+    }
+    transcriptText = nil
+    audioPlayer.stop()
+    isStreamingResponse = true
+    return true
   }
 
   private func scheduleDelayedConnect() {
@@ -1923,72 +1947,6 @@ private final class GeminiHintService {
     return sanitized
   }
 
-  func fetchLessonFeedback(for context: GeminiLessonFeedbackContext) async throws -> String {
-    guard let baseURL = apiBaseURL else {
-      throw NSError(
-        domain: "ARChess.GeminiHint",
-        code: -1010,
-        userInfo: [NSLocalizedDescriptionKey: "Gemini lesson feedback is disabled until ARChessAPIBaseURL is configured."]
-      )
-    }
-
-    var request = URLRequest(
-      url: baseURL
-        .appendingPathComponent("v1")
-        .appendingPathComponent("gemini")
-        .appendingPathComponent("lesson-feedback")
-    )
-    request.httpMethod = "POST"
-    request.timeoutInterval = 8.0
-    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-    request.setValue("application/json", forHTTPHeaderField: "Accept")
-    request.httpBody = try JSONEncoder().encode(
-      GeminiLessonFeedbackRequestPayload(
-        fen: context.fen,
-        lesson_title: context.lessonTitle,
-        attempted_move: context.attemptedMove,
-        correct_move: context.correctMove,
-        side_to_move: context.sideToMove.displayName.lowercased(),
-        narrator: context.narrator.rawValue,
-        focus: context.focus
-      )
-    )
-
-    let startedAt = Date()
-    let (data, response) = try await session.data(for: request)
-    let durationMs = Int(Date().timeIntervalSince(startedAt) * 1_000)
-    guard let httpResponse = response as? HTTPURLResponse else {
-      throw NSError(
-        domain: "ARChess.GeminiHint",
-        code: -1011,
-        userInfo: [NSLocalizedDescriptionKey: "Gemini lesson feedback did not return an HTTP response."]
-      )
-    }
-
-    guard (200..<300).contains(httpResponse.statusCode) else {
-      let message = String(data: data, encoding: .utf8) ?? "Unexpected Gemini lesson feedback response."
-      Self.logger.error("Gemini lesson feedback request failed status=\(httpResponse.statusCode, privacy: .public) duration_ms=\(durationMs, privacy: .public)")
-      throw NSError(
-        domain: "ARChess.GeminiHint",
-        code: httpResponse.statusCode,
-        userInfo: [NSLocalizedDescriptionKey: message]
-      )
-    }
-
-    let payload = try JSONDecoder().decode(GeminiLessonFeedbackResponsePayload.self, from: data)
-    let sanitized = sanitizeLessonFeedback(payload.explanation)
-    guard !sanitized.isEmpty else {
-      throw NSError(
-        domain: "ARChess.GeminiHint",
-        code: -1012,
-        userInfo: [NSLocalizedDescriptionKey: "Gemini lesson feedback returned no explanation text."]
-      )
-    }
-
-    Self.logger.info("Gemini lesson feedback ready via backend duration_ms=\(durationMs, privacy: .public)")
-    return sanitized
-  }
-
   func fetchConnectionStatus() async throws -> GeminiLiveStatusPayload {
     guard let baseURL = apiBaseURL else {
       throw NSError(
@@ -2097,14 +2055,6 @@ private final class GeminiHintService {
     )
     let final = condensed.trimmingCharacters(in: .whitespacesAndNewlines)
     return final.isEmpty ? fallback : final
-  }
-
-  private func sanitizeLessonFeedback(_ raw: String) -> String {
-    let condensed = raw
-      .trimmingCharacters(in: .whitespacesAndNewlines)
-      .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
-
-    return condensed
   }
 
   private func fallbackHint(for context: GeminiHintContext) -> String {
@@ -3729,12 +3679,8 @@ private final class OpeningLessonStore: ObservableObject {
   @Published private(set) var activeLesson: OpeningLessonDefinition?
   @Published private(set) var currentStepIndex = 0
   @Published private(set) var remainingTries = 3
-  @Published private(set) var feedbackText: String?
-  @Published private(set) var isLoadingFeedback = false
   @Published private(set) var isMoveRevealed = false
   @Published private(set) var reloadVersion = 0
-
-  private var feedbackRequestID = 0
 
   var currentStep: OpeningLessonStep? {
     guard let activeLesson,
@@ -3817,44 +3763,20 @@ private final class OpeningLessonStore: ObservableObject {
     }
 
     isMoveRevealed = true
-    isLoadingFeedback = false
-    feedbackText = nil
   }
 
-  func noteRevealedMoveReminder() {
-    guard phase == .active, isMoveRevealed else {
-      return
-    }
-
-    feedbackText = nil
-  }
-
-  func registerIncorrectAttempt() -> Int? {
+  @discardableResult
+  func registerIncorrectAttempt() -> Bool {
     guard phase == .active, currentStep != nil, !isMoveRevealed else {
-      return nil
+      return false
     }
 
     remainingTries = max(0, remainingTries - 1)
-    isLoadingFeedback = true
-    feedbackText = nil
-    feedbackRequestID += 1
-    let requestID = feedbackRequestID
 
     if remainingTries == 0 {
       isMoveRevealed = true
     }
 
-    return requestID
-  }
-
-  @discardableResult
-  func applyFeedback(_ text: String, for requestID: Int) -> Bool {
-    guard phase == .active, requestID == feedbackRequestID else {
-      return false
-    }
-
-    isLoadingFeedback = false
-    feedbackText = text
     return true
   }
 
@@ -3863,9 +3785,6 @@ private final class OpeningLessonStore: ObservableObject {
       return nil
     }
 
-    feedbackRequestID += 1
-    isLoadingFeedback = false
-    feedbackText = nil
     isMoveRevealed = false
 
     let nextIndex = currentStepIndex + 1
@@ -3885,10 +3804,7 @@ private final class OpeningLessonStore: ObservableObject {
     phase = .active
     currentStepIndex = 0
     remainingTries = Self.maximumTriesPerStep
-    feedbackText = nil
-    isLoadingFeedback = false
     isMoveRevealed = false
-    feedbackRequestID += 1
     reloadVersion += 1
   }
 
@@ -3897,11 +3813,8 @@ private final class OpeningLessonStore: ObservableObject {
     activeLesson = nil
     currentStepIndex = 0
     remainingTries = Self.maximumTriesPerStep
-    feedbackText = nil
-    isLoadingFeedback = false
     isMoveRevealed = false
     reloadVersion = 0
-    feedbackRequestID = 0
   }
 }
 
@@ -6037,50 +5950,6 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     }
   }
 
-  func lessonWrongMoveFeedback(
-    lesson: OpeningLessonDefinition,
-    step: OpeningLessonStep,
-    state: ChessGameState,
-    attemptedMove: ChessMove,
-    correctMove: ChessMove
-  ) async -> String {
-    let fallback = fallbackLessonFeedback(for: step)
-
-    guard hintService.isConfigured else {
-      appendGeminiDebug("Lesson feedback fell back because ARChessAPIBaseURL is not configured.")
-      return fallback
-    }
-
-    if geminiConnectionState == .error, geminiLooksTerminal(geminiConnectionLastError) {
-      appendGeminiDebug("Lesson feedback fell back because Gemini Live reported a terminal error.")
-      return fallback
-    }
-
-    let context = GeminiLessonFeedbackContext(
-      fen: state.fenString,
-      lessonTitle: lesson.title,
-      attemptedMove: attemptedMove.uciString,
-      correctMove: correctMove.uciString,
-      sideToMove: state.turn,
-      narrator: narrator,
-      focus: step.focus
-    )
-
-    do {
-      let explanation = try await hintService.fetchLessonFeedback(for: context)
-      appendGeminiDebug("Gemini lesson feedback ready for \(lesson.id) move \(attemptedMove.uciString).")
-      return explanation
-    } catch {
-      appendGeminiDebug("Gemini lesson feedback failed: \(error.localizedDescription)")
-      return fallback
-    }
-  }
-
-  func narrateLessonFeedback(_ text: String) {
-    appendGeminiDebug("Narrating Gemini lesson feedback.")
-    _ = speakGeminiNarration(text: text, title: "Gemini", priority: .urgent)
-  }
-
   func bindReactionHandler(_ handler: @escaping (ReactionCue) -> Void) {
     reactionHandler = handler
   }
@@ -6707,10 +6576,6 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     coachLines = normalizedLines
     topWorkers = Array(commentary.topWorkers.prefix(3))
     topTraitors = Array(commentary.topTraitors.prefix(3))
-  }
-
-  private func fallbackLessonFeedback(for step: OpeningLessonStep) -> String {
-    "That move is playable, but it is not the lesson move here. Look for a move that better supports development, center control, or pressure in the Italian Opening. \(step.focus)"
   }
 
   private func narrateGeminiHintIfNeeded(text: String, key: String, allowRepeat: Bool = false) {
@@ -8776,18 +8641,6 @@ private struct NativeARExperienceView: View {
         }
       }
 
-      if gameReview.phase == .idle, isLessonMode, let caption = lessonNarrationCaption {
-        VStack {
-          Spacer()
-
-          PieceSpeechBubble(caption: caption)
-            .allowsHitTesting(false)
-            .transition(.move(edge: .bottom).combined(with: .opacity))
-        }
-        .padding(.horizontal, 18)
-        .padding(.bottom, 24)
-      }
-
       if gameReview.isAwaitingEntryDecision {
         reviewDecisionOverlay
       } else if gameReview.isLoading {
@@ -9150,26 +9003,8 @@ private struct NativeARExperienceView: View {
     return max(0, min(3, used))
   }
 
-  private var lessonNarrationCaption: PiecePersonalityDirector.Caption? {
-    if let caption = commentary.caption {
-      return caption
-    }
-
-    guard isLessonMode,
-          let feedback = lessonStore.feedbackText?.trimmingCharacters(in: .whitespacesAndNewlines),
-          !feedback.isEmpty else {
-      return nil
-    }
-
-    return PiecePersonalityDirector.Caption(
-      title: "Gemini",
-      line: feedback,
-      imageAssetName: "GeminiNarratorPortrait"
-    )
-  }
-
   private var lessonActionBottomInset: CGFloat {
-    lessonNarrationCaption == nil ? 30 : 138
+    30
   }
 
   private func lessonStrikeBadge(isUsed: Bool) -> some View {
@@ -11572,7 +11407,13 @@ private struct NativeARView: UIViewRepresentable {
       if lessonStore.isMoveRevealed {
         guard move.uciString == correctMove.uciString else {
           clearSelection()
-          lessonStore.noteRevealedMoveReminder()
+          socraticCoach.requestLessonAttemptFeedback(
+            lessonTitle: lesson.title,
+            prompt: step.prompt,
+            focus: step.focus,
+            remainingTries: lessonStore.remainingTries,
+            moveRevealed: true
+          )
           return
         }
 
@@ -11582,26 +11423,16 @@ private struct NativeARView: UIViewRepresentable {
 
       guard move.uciString == correctMove.uciString else {
         clearSelection()
-        guard let requestID = lessonStore.registerIncorrectAttempt() else {
+        guard lessonStore.registerIncorrectAttempt() else {
           return
         }
-
-        Task { @MainActor [weak self] in
-          guard let self else {
-            return
-          }
-
-          let feedback = await self.commentary.lessonWrongMoveFeedback(
-            lesson: lesson,
-            step: step,
-            state: self.gameState,
-            attemptedMove: move,
-            correctMove: correctMove
-          )
-          if self.lessonStore.applyFeedback(feedback, for: requestID) {
-            self.commentary.narrateLessonFeedback(feedback)
-          }
-        }
+        socraticCoach.requestLessonAttemptFeedback(
+          lessonTitle: lesson.title,
+          prompt: step.prompt,
+          focus: step.focus,
+          remainingTries: lessonStore.remainingTries,
+          moveRevealed: lessonStore.isMoveRevealed
+        )
         return
       }
 
@@ -11623,6 +11454,10 @@ private struct NativeARView: UIViewRepresentable {
 
             if self.lessonStore.advanceAfterCorrectMove() != nil {
               self.commentary.noteExternalStatus("\(lesson.title) complete.")
+              self.socraticCoach.requestLessonCompletion(
+                lessonTitle: lesson.title,
+                summary: lesson.summary
+              )
             } else if let nextStep = self.lessonStore.currentStep {
               self.commentary.noteExternalStatus(nextStep.focus)
             }
@@ -11703,6 +11538,10 @@ private struct NativeARView: UIViewRepresentable {
 
               if self.lessonStore.advanceAfterCorrectMove() != nil {
                 self.commentary.noteExternalStatus("\(lesson.title) complete.")
+                self.socraticCoach.requestLessonCompletion(
+                  lessonTitle: lesson.title,
+                  summary: lesson.summary
+                )
               } else if let nextStep = self.lessonStore.currentStep {
                 self.commentary.noteExternalStatus(nextStep.focus)
               }

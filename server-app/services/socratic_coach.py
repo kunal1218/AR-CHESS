@@ -369,6 +369,47 @@ class SocraticCoachSession:
             )
             return
 
+        if message_type == "lesson_attempt_feedback":
+            lesson_title = str(payload.get("lesson_title") or "").strip() or "Untitled lesson"
+            lesson_prompt = str(payload.get("prompt") or "").strip() or "No lesson prompt provided."
+            lesson_focus = str(payload.get("focus") or "").strip() or "No lesson focus provided."
+            remaining_tries = max(0, int(payload.get("remaining_tries") or 0))
+            move_revealed = bool(payload.get("move_revealed"))
+            reveal_instruction = (
+                "The correct move is now revealed on the board, so you may acknowledge that briefly."
+                if move_revealed
+                else "Do not reveal the exact move."
+            )
+            self._begin_response_tracking()
+            await self._send_user_turn(
+                "The player just made the wrong move in a guided chess lesson. "
+                "Do not call analyze_hypothetical_move for this reply. "
+                "Speak directly to the player in second person, as if correcting them in real time. "
+                "Give brief corrective coaching in 1 to 3 short sentences, hard cap 4. "
+                "Teach the lesson concept through the correction and keep the player focused on the underlying idea. "
+                f"{reveal_instruction}\n"
+                f"Lesson title: {lesson_title}\n"
+                f"Lesson prompt: {lesson_prompt}\n"
+                f"Lesson focus: {lesson_focus}\n"
+                f"Remaining tries: {remaining_tries}"
+            )
+            return
+
+        if message_type == "lesson_complete":
+            lesson_title = str(payload.get("lesson_title") or "").strip() or "Untitled lesson"
+            lesson_summary = str(payload.get("summary") or "").strip() or "No lesson summary provided."
+            self._begin_response_tracking()
+            await self._send_user_turn(
+                "The player has just completed a guided chess lesson. "
+                "Do not call analyze_hypothetical_move for this reply. "
+                "Congratulate the player directly in 1 to 3 short sentences, hard cap 4. "
+                "Keep the tone aligned with your narrator persona while making the praise feel earned. "
+                "Briefly mention the concept the player just practiced.\n"
+                f"Lesson title: {lesson_title}\n"
+                f"Lesson summary: {lesson_summary}"
+            )
+            return
+
         if message_type == "audio_chunk":
             base64_data = str(payload.get("data") or "").strip()
             if not base64_data:
