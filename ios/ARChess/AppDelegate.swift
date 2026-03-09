@@ -5734,7 +5734,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   private static let substantialGainThreshold = 120
   private static let substantialDropThreshold = -140
   private static let pieceVoiceLineChance = 1.0
-  private static let pieceVoiceLineWordLimit = 20
+  private static let pieceVoiceLineCharacterLimit = 180
 
   struct ReactionCue {
     enum Kind {
@@ -6650,7 +6650,10 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     appendGeminiDebug("Piece voice ready: \(line)")
   }
 
-  private func cappedPieceVoiceLineText(_ text: String, maxCharacters: Int = 120) -> String {
+  private func cappedPieceVoiceLineText(
+    _ text: String,
+    maxCharacters: Int = Self.pieceVoiceLineCharacterLimit
+  ) -> String {
     let normalized = text
       .replacingOccurrences(of: "[“”\"]", with: "", options: .regularExpression)
       .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
@@ -6664,21 +6667,24 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       with: "",
       options: .regularExpression
     )
-    let cappedBySentence = cappedNarrationText(withoutLabel, maxSentences: 2, maxCharacters: maxCharacters).text
-    let words = cappedBySentence.split(separator: " ")
-    let limitedWords = words.prefix(Self.pieceVoiceLineWordLimit)
-    guard !limitedWords.isEmpty else {
+    let cappedBySentence = cappedNarrationText(
+      withoutLabel,
+      maxSentences: 1,
+      maxCharacters: max(maxCharacters, Self.pieceVoiceLineCharacterLimit)
+    ).text
+    guard !cappedBySentence.isEmpty else {
       return ""
     }
 
-    var limited = limitedWords.map(String.init).joined(separator: " ")
-    if words.count > Self.pieceVoiceLineWordLimit {
-      limited = limited.trimmingCharacters(in: CharacterSet(charactersIn: " ,;:-"))
-      if !limited.hasSuffix(".") && !limited.hasSuffix("!") && !limited.hasSuffix("?") {
-        limited.append("...")
-      }
+    var capped = cappedBySentence.trimmingCharacters(in: CharacterSet(charactersIn: " \n\t,;:-"))
+    if capped.hasSuffix("...") {
+      capped.removeLast(3)
+      capped = capped.trimmingCharacters(in: CharacterSet(charactersIn: " \n\t,;:-"))
     }
-    return limited
+    if !capped.isEmpty && !capped.hasSuffix(".") && !capped.hasSuffix("!") && !capped.hasSuffix("?") {
+      capped.append(".")
+    }
+    return capped
   }
 
   private func chebyshevDistance(from source: BoardSquare, to target: BoardSquare) -> Int {
@@ -7585,7 +7591,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       text: text,
       style: .pieceVoice(speaker: speaker),
       priority: priority,
-      maxCharacters: 120
+      maxCharacters: Self.pieceVoiceLineCharacterLimit
     )
   }
 
@@ -11095,6 +11101,12 @@ private struct NativeARView: UIViewRepresentable {
       let clearsOnMoveBy: ChessColor
     }
 
+    private struct ActivePieceDrag {
+      let originSquare: BoardSquare
+      let legalMoves: [ChessMove]
+      var previewSquare: BoardSquare?
+    }
+
     private static let boardTemplateSize: Float = 0.40
     private static let boardSquareSize: Float = boardTemplateSize / 8.0
     private static let boardBaseMesh = MeshResource.generateBox(
@@ -11165,6 +11177,7 @@ private struct NativeARView: UIViewRepresentable {
     private var gameState = ChessGameState.initial()
     private var selectedSquare: BoardSquare?
     private var selectedMoves: [ChessMove] = []
+    private var activePieceDrag: ActivePieceDrag?
     private var syncedQueueMoves: [QueueMatchMovePayload] = []
     private var queueAssignedColor: ChessColor?
     private var hasBoundReactionHandler = false
@@ -11272,6 +11285,11 @@ private struct NativeARView: UIViewRepresentable {
 
       let tapRecognizer = UITapGestureRecognizer(target: self, action: #selector(handleTap(_:)))
       arView.addGestureRecognizer(tapRecognizer)
+
+      let panRecognizer = UIPanGestureRecognizer(target: self, action: #selector(handlePan(_:)))
+      panRecognizer.maximumNumberOfTouches = 1
+      tapRecognizer.require(toFail: panRecognizer)
+      arView.addGestureRecognizer(panRecognizer)
 
       let pinchRecognizer = UIPinchGestureRecognizer(target: self, action: #selector(handlePinch(_:)))
       arView.addGestureRecognizer(pinchRecognizer)
@@ -11466,6 +11484,38 @@ private struct NativeARView: UIViewRepresentable {
     }
 
     @objc
+    private func handlePan(_ recognizer: UIPanGestureRecognizer) {
+      guard !gameReview.isLoading else {
+        return
+      }
+
+      guard moveAnimationTask == nil, pendingAnimatedMoves.isEmpty else {
+        cancelPieceDrag()
+        return
+      }
+
+      guard let arView else {
+        cancelPieceDrag()
+        return
+      }
+
+      let location = recognizer.location(in: arView)
+
+      switch recognizer.state {
+      case .began:
+        beginPieceDrag(at: location, in: arView)
+      case .changed:
+        updatePieceDrag(at: location, in: arView)
+      case .ended:
+        endPieceDrag()
+      case .cancelled, .failed:
+        cancelPieceDrag()
+      default:
+        break
+      }
+    }
+
+    @objc
     private func handlePinch(_ recognizer: UIPinchGestureRecognizer) {
       guard boardAnchor != nil else {
         return
@@ -11487,7 +11537,67 @@ private struct NativeARView: UIViewRepresentable {
       }
     }
 
-    private func boardSquare(at location: CGPoint, in arView: ARView) -> BoardSquare? {
+    private func beginPieceDrag(at location: CGPoint, in arView: ARView) {
+      guard let entity = arView.entity(at: location),
+            let square = square(for: entity, prefix: "piece"),
+            let piece = gameState.piece(at: square),
+            canControlPiece(piece, at: square) else {
+        activePieceDrag = nil
+        return
+      }
+
+      select(square)
+      guard !selectedMoves.isEmpty else {
+        activePieceDrag = nil
+        return
+      }
+
+      activePieceDrag = ActivePieceDrag(originSquare: square, legalMoves: selectedMoves, previewSquare: nil)
+      updatePieceDrag(at: location, in: arView)
+    }
+
+    private func updatePieceDrag(at location: CGPoint, in arView: ARView) {
+      guard var activePieceDrag else {
+        return
+      }
+
+      activePieceDrag.previewSquare = previewDestinationSquare(
+        for: location,
+        in: arView,
+        originSquare: activePieceDrag.originSquare,
+        legalMoves: activePieceDrag.legalMoves
+      )
+      self.activePieceDrag = activePieceDrag
+      refreshBoardPresentation()
+    }
+
+    private func endPieceDrag() {
+      guard let activePieceDrag else {
+        return
+      }
+
+      let move = activePieceDrag.previewSquare.flatMap { destination in
+        activePieceDrag.legalMoves.first(where: { $0.to == destination })
+      }
+      self.activePieceDrag = nil
+
+      if let move {
+        apply(move)
+      } else {
+        clearSelection()
+      }
+    }
+
+    private func cancelPieceDrag() {
+      guard activePieceDrag != nil else {
+        return
+      }
+
+      activePieceDrag = nil
+      clearSelection()
+    }
+
+    private func boardLocalPoint(at location: CGPoint, in arView: ARView) -> SIMD2<Float>? {
       guard let boardWorldTransform else {
         return nil
       }
@@ -11503,12 +11613,15 @@ private struct NativeARView: UIViewRepresentable {
         hit.worldTransform.columns.3.z
       )
       let localPoint4 = boardWorldTransform.inverse * SIMD4<Float>(worldPoint.x, worldPoint.y, worldPoint.z, 1)
-      let localX = localPoint4.x / boardScale
-      let localZ = localPoint4.z / boardScale
+      return SIMD2<Float>(localPoint4.x / boardScale, localPoint4.z / boardScale)
+    }
+
+    private func boardSquare(forBoardLocalPoint localPoint: SIMD2<Float>) -> BoardSquare? {
+      let localX = localPoint.x
+      let localZ = localPoint.y
       let halfBoard = boardSize * 0.5
 
       guard localX >= -halfBoard, localX <= halfBoard, localZ >= -halfBoard, localZ <= halfBoard else {
-        clearSelection()
         return nil
       }
 
@@ -11527,6 +11640,50 @@ private struct NativeARView: UIViewRepresentable {
       }
 
       return square
+    }
+
+    private func boardSquare(at location: CGPoint, in arView: ARView) -> BoardSquare? {
+      guard let localPoint = boardLocalPoint(at: location, in: arView) else {
+        return nil
+      }
+
+      return boardSquare(forBoardLocalPoint: localPoint)
+    }
+
+    private func previewDestinationSquare(
+      for location: CGPoint,
+      in arView: ARView,
+      originSquare: BoardSquare,
+      legalMoves: [ChessMove]
+    ) -> BoardSquare? {
+      guard let localPoint = boardLocalPoint(at: location, in: arView) else {
+        return nil
+      }
+
+      let legalDestinations = Array(Set(legalMoves.map(\.to)))
+      guard !legalDestinations.isEmpty else {
+        return nil
+      }
+
+      if let exactSquare = boardSquare(forBoardLocalPoint: localPoint),
+         legalDestinations.contains(exactSquare) {
+        return exactSquare
+      }
+
+      let squareSize = boardSize / 8.0
+      let originPosition = boardPosition(originSquare, squareSize: squareSize)
+      let dragVector = SIMD2<Float>(localPoint.x - originPosition.x, localPoint.y - originPosition.z)
+      guard simd_length(dragVector) >= (squareSize * 0.33) else {
+        return nil
+      }
+
+      return legalDestinations.min { left, right in
+        let leftPosition = boardPosition(left, squareSize: squareSize)
+        let rightPosition = boardPosition(right, squareSize: squareSize)
+        let leftDistance = simd_length(SIMD2<Float>(localPoint.x - leftPosition.x, localPoint.y - leftPosition.z))
+        let rightDistance = simd_length(SIMD2<Float>(localPoint.x - rightPosition.x, localPoint.y - rightPosition.z))
+        return leftDistance < rightDistance
+      }
     }
 
     private func applyBoardScale() {
@@ -11719,6 +11876,7 @@ private struct NativeARView: UIViewRepresentable {
     }
 
     private func select(_ square: BoardSquare) {
+      activePieceDrag = nil
       selectedSquare = square
       selectedMoves = gameState.legalMoves(from: square)
 
@@ -11730,6 +11888,7 @@ private struct NativeARView: UIViewRepresentable {
     }
 
     private func clearSelection() {
+      activePieceDrag = nil
       selectedSquare = nil
       selectedMoves = []
       refreshBoardPresentation()
@@ -11892,6 +12051,8 @@ private struct NativeARView: UIViewRepresentable {
     }
 
     private func apply(_ move: ChessMove) {
+      activePieceDrag = nil
+
       if gameReview.isReviewMode {
         applyReviewPlayerMove(move)
         return
@@ -13690,6 +13851,9 @@ private struct NativeARView: UIViewRepresentable {
     private func syncPieceEntities() {
       Array(piecesContainer.children).forEach { $0.removeFromParent() }
       let squareSize = boardSize / 8.0
+      let draggingOriginSquare = activePieceDrag?.originSquare
+      let draggingPreviewSquare = activePieceDrag?.previewSquare
+      let draggingPieceColor = draggingOriginSquare.flatMap { gameState.piece(at: $0)?.color }
 
       let orderedSquares = gameState.board.keys.sorted {
         if $0.rank == $1.rank {
@@ -13703,12 +13867,24 @@ private struct NativeARView: UIViewRepresentable {
           continue
         }
 
+        if let draggingPreviewSquare,
+           let draggingPieceColor,
+           square == draggingPreviewSquare,
+           square != draggingOriginSquare,
+           piece.color != draggingPieceColor {
+          continue
+        }
+
         let pieceEntity = piecePrototype(for: piece.kind, color: piece.color).clone(recursive: true)
         pieceEntity.name = pieceName(square)
         pieceEntity.position = boardPosition(square, squareSize: squareSize)
         pieceEntity.orientation = pieceFacingOrientation(for: piece.color)
 
-        if selectedSquare == square {
+        if let activePieceDrag, activePieceDrag.originSquare == square {
+          let presentedSquare = activePieceDrag.previewSquare ?? square
+          pieceEntity.position = boardPosition(presentedSquare, squareSize: squareSize) + SIMD3<Float>(0, 0.022, 0)
+          pieceEntity.scale = SIMD3<Float>(repeating: 1.08)
+        } else if selectedSquare == square {
           pieceEntity.position.y += 0.016
           pieceEntity.scale = SIMD3<Float>(repeating: 1.06)
         }

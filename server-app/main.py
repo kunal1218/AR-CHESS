@@ -634,15 +634,17 @@ def sanitize_piece_voice_line_text(raw_text: str) -> str:
         flags=re.IGNORECASE,
     )
     condensed = condensed.strip("\"' ")
-    condensed = truncate_narration_text(condensed, max_sentences=2, max_characters=120)
     if not condensed:
         return ""
 
-    words = condensed.split()
-    if len(words) > 20:
-        condensed = " ".join(words[:20]).rstrip(" ,;:-")
-        if condensed and condensed[-1] not in ".!?":
-            condensed += "..."
+    first_sentence_match = re.match(r"^(.+?[.!?])(?:\s|$)", condensed)
+    if first_sentence_match:
+        condensed = first_sentence_match.group(1).strip()
+
+    if len(condensed) > 180:
+        shortened = condensed[:180].rsplit(" ", 1)[0].strip()
+        condensed = shortened or condensed[:180].strip()
+        condensed = condensed.rstrip(" ,;:-")
 
     return condensed
 
