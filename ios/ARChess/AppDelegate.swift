@@ -5,6 +5,7 @@ import Foundation
 import ImageIO
 import OSLog
 import RealityKit
+import Speech
 import SwiftUI
 import UIKit
 import WebKit
@@ -328,9 +329,7 @@ private enum ExperienceMode: Hashable {
 
   var supportsSocraticCoach: Bool {
     switch self {
-    case .lesson:
-      return false
-    case .passAndPlay, .queueMatch, .playVsStockfish:
+    case .lesson, .passAndPlay, .queueMatch, .playVsStockfish:
       return true
     }
   }
@@ -628,6 +627,19 @@ private struct SocraticCoachSimplePayload: Encodable {
   let type: String
 }
 
+private struct SocraticCoachLessonIntroPayload: Encodable {
+  let type = "lesson_intro"
+  let lesson_title: String
+  let prompt: String
+  let focus: String
+}
+
+private struct SocraticCoachVoiceMoveCommitPayload: Encodable {
+  let type = "voice_move_commit"
+  let uci: String
+  let spoken: String?
+}
+
 private enum SocraticCoachMicState: String {
   case inactive
   case muted
@@ -879,6 +891,7 @@ private final class SocraticCoachMicCaptureManager {
 
   var onChunk: ((Data) -> Void)?
   var onStateChange: ((SocraticCoachMicState) -> Void)?
+  var onInputBuffer: ((AVAudioPCMBuffer) -> Void)?
 
   private(set) var state: SocraticCoachMicState = .inactive {
     didSet {
@@ -973,6 +986,9 @@ private final class SocraticCoachMicCaptureManager {
     audioConverter = AVAudioConverter(from: inputFormat, to: targetFormat)
     inputNode.removeTap(onBus: 0)
     inputNode.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { buffer, _ in
+      if self.state == .active {
+        self.onInputBuffer?(buffer)
+      }
       onBuffer(buffer)
     }
 
@@ -1075,6 +1091,91 @@ private final class SocraticCoachMicCaptureManager {
   }
 }
 
+private final class SocraticCoachDirectCommandRecognizer {
+  private static let logger = Logger(subsystem: "ARChess", category: "SocraticCoachSpeech")
+  private static let finishWaitNanoseconds: UInt64 = 350_000_000
+
+  private let transcriptLock = NSLock()
+  private let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
+  private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
+  private var recognitionTask: SFSpeechRecognitionTask?
+  private var latestTranscript = ""
+
+  static func authorizationStatus() -> SFSpeechRecognizerAuthorizationStatus {
+    SFSpeechRecognizer.authorizationStatus()
+  }
+
+  static func requestAuthorization() async -> SFSpeechRecognizerAuthorizationStatus {
+    await withCheckedContinuation { continuation in
+      SFSpeechRecognizer.requestAuthorization { status in
+        continuation.resume(returning: status)
+      }
+    }
+  }
+
+  func startIfAuthorized() {
+    cancel()
+
+    guard Self.authorizationStatus() == .authorized,
+          let recognizer,
+          recognizer.isAvailable else {
+      return
+    }
+
+    let request = SFSpeechAudioBufferRecognitionRequest()
+    request.shouldReportPartialResults = true
+    if #available(iOS 16.0, *) {
+      request.addsPunctuation = false
+    }
+
+    latestTranscript = ""
+    recognitionRequest = request
+    recognitionTask = recognizer.recognitionTask(with: request) { [weak self] result, error in
+      guard let self else {
+        return
+      }
+
+      if let result {
+        self.transcriptLock.lock()
+        self.latestTranscript = result.bestTranscription.formattedString
+        self.transcriptLock.unlock()
+      }
+
+      if let error {
+        Self.logger.debug("Direct command recognition finished with error: \(error.localizedDescription, privacy: .public)")
+      }
+    }
+  }
+
+  func append(_ buffer: AVAudioPCMBuffer) {
+    recognitionRequest?.append(buffer)
+  }
+
+  func finish() async -> String? {
+    recognitionRequest?.endAudio()
+    try? await Task.sleep(nanoseconds: Self.finishWaitNanoseconds)
+    let transcript = currentTranscript()
+    cancel()
+    return transcript
+  }
+
+  func cancel() {
+    recognitionTask?.cancel()
+    recognitionTask = nil
+    recognitionRequest = nil
+    transcriptLock.lock()
+    latestTranscript = ""
+    transcriptLock.unlock()
+  }
+
+  private func currentTranscript() -> String? {
+    transcriptLock.lock()
+    let transcript = latestTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
+    transcriptLock.unlock()
+    return transcript.isEmpty ? nil : transcript
+  }
+}
+
 @MainActor
 private final class SocraticCoachStore: ObservableObject {
   private static let logger = Logger(subsystem: "ARChess", category: "SocraticCoach")
@@ -1116,6 +1217,7 @@ private final class SocraticCoachStore: ObservableObject {
   private let session: URLSession
   private let micCapture = SocraticCoachMicCaptureManager()
   private let audioPlayer = SocraticCoachPCMPlayer()
+  private let directCommandRecognizer = SocraticCoachDirectCommandRecognizer()
   private var webSocketTask: URLSessionWebSocketTask?
   private var isEnabled = false
   private var currentContext: SocraticCoachContext?
@@ -1125,6 +1227,7 @@ private final class SocraticCoachStore: ObservableObject {
   private var microphonePrewarmWorkItem: DispatchWorkItem?
   private var threatZoneHandler: (([String], String?) -> Void)?
   private var moveHandler: ((String, String?) -> Void)?
+  private var directVoiceCommandHandler: ((String) -> String?)?
 
   init(
     narrator: NarratorType,
@@ -1146,6 +1249,10 @@ private final class SocraticCoachStore: ObservableObject {
         await self?.sendAudioChunk(chunkData)
       }
     }
+
+    micCapture.onInputBuffer = { [weak self] buffer in
+      self?.directCommandRecognizer.append(buffer)
+    }
   }
 
   var isConfigured: Bool {
@@ -1161,16 +1268,7 @@ private final class SocraticCoachStore: ObservableObject {
   }
 
   var caption: PiecePersonalityDirector.Caption? {
-    guard let transcriptText = transcriptText?.trimmingCharacters(in: .whitespacesAndNewlines),
-          !transcriptText.isEmpty else {
-      return nil
-    }
-
-    return PiecePersonalityDirector.Caption(
-      title: "Gemini",
-      line: transcriptText,
-      imageAssetName: "GeminiNarratorPortrait"
-    )
+    nil
   }
 
   func setEnabled(_ enabled: Bool) {
@@ -1209,6 +1307,14 @@ private final class SocraticCoachStore: ObservableObject {
     moveHandler = nil
   }
 
+  func bindDirectVoiceCommandHandler(_ handler: @escaping (String) -> String?) {
+    directVoiceCommandHandler = handler
+  }
+
+  func unbindDirectVoiceCommandHandler() {
+    directVoiceCommandHandler = nil
+  }
+
   func updateContext(_ context: SocraticCoachContext?) {
     currentContext = context
     guard isEnabled, let context else {
@@ -1238,6 +1344,28 @@ private final class SocraticCoachStore: ObservableObject {
     send(payload: SocraticCoachSimplePayload(type: "help_request"))
   }
 
+  func requestLessonIntro(lessonTitle: String, prompt: String, focus: String) {
+    guard isEnabled, isConfigured, !isStreamingResponse else {
+      return
+    }
+
+    delayedConnectWorkItem?.cancel()
+    ensureConnectedIfNeeded()
+    if let currentContext {
+      sendContextIfNeeded(force: true, context: currentContext)
+    }
+    transcriptText = nil
+    audioPlayer.stop()
+    isStreamingResponse = true
+    send(
+      payload: SocraticCoachLessonIntroPayload(
+        lesson_title: lessonTitle,
+        prompt: prompt,
+        focus: focus
+      )
+    )
+  }
+
   func toggleMicrophone() async {
     guard isEnabled, isConfigured else {
       statusText = "Socratic Coach mic is unavailable until ARChessAPIBaseURL is configured."
@@ -1259,6 +1387,13 @@ private final class SocraticCoachStore: ObservableObject {
         return
       }
 
+      let speechAuthorization = await requestSpeechRecognitionAuthorizationIfNeeded()
+      if speechAuthorization == .authorized {
+        directCommandRecognizer.startIfAuthorized()
+      } else {
+        directCommandRecognizer.cancel()
+      }
+
       do {
         try await startMicCapture(unmuted: true)
         statusText = "Mic live. Tap again to send your question."
@@ -1270,6 +1405,19 @@ private final class SocraticCoachStore: ObservableObject {
       let finalChunk = micCapture.finishStreamingTurn()
       transcriptText = nil
       audioPlayer.stop()
+      let directVoiceCommandTranscript = await directCommandRecognizer.finish()
+      if let directVoiceCommandTranscript,
+         let committedMoveUCI = directVoiceCommandHandler?(directVoiceCommandTranscript) {
+        send(
+          payload: SocraticCoachVoiceMoveCommitPayload(
+            uci: committedMoveUCI,
+            spoken: directVoiceCommandTranscript
+          )
+        )
+        isStreamingResponse = false
+        statusText = "Voice move ready."
+        return
+      }
       if let finalChunk {
         await sendAudioChunk(finalChunk)
       }
@@ -1293,6 +1441,7 @@ private final class SocraticCoachStore: ObservableObject {
     webSocketTask?.cancel(with: .goingAway, reason: nil)
     webSocketTask = nil
     micCapture.stop()
+    directCommandRecognizer.cancel()
     audioPlayer.stop()
     connectionState = .disconnected
     isStreamingResponse = false
@@ -1474,11 +1623,9 @@ private final class SocraticCoachStore: ObservableObject {
     case "output_transcription":
       let capped = (payload["text"] as? String).flatMap(Self.sanitizedTranscript)
       if let capped {
-        transcriptText = capped.text
         maybeHighlightNarrationFocus(capped.text)
-      } else {
-        transcriptText = nil
       }
+      transcriptText = nil
     case "audio_chunk":
       guard let base64PCM = payload["data"] as? String else {
         return
@@ -1643,6 +1790,18 @@ private final class SocraticCoachStore: ObservableObject {
       AVAudioSession.sharedInstance().requestRecordPermission { granted in
         continuation.resume(returning: granted)
       }
+    }
+  }
+
+  private func requestSpeechRecognitionAuthorizationIfNeeded() async -> SFSpeechRecognizerAuthorizationStatus {
+    let currentStatus = SocraticCoachDirectCommandRecognizer.authorizationStatus()
+    switch currentStatus {
+    case .authorized, .denied, .restricted:
+      return currentStatus
+    case .notDetermined:
+      return await SocraticCoachDirectCommandRecognizer.requestAuthorization()
+    @unknown default:
+      return .denied
     }
   }
 
@@ -8562,6 +8721,30 @@ private struct NativeARExperienceView: View {
               Spacer(minLength: 12)
 
               HStack(spacing: 8) {
+                if socraticCoach.isVisibleInCurrentMode {
+                  overlayToggleButton(
+                    title: "Lesson Help",
+                    systemImage: "questionmark.bubble.fill",
+                    foregroundColor: socraticCoach.canRequestHelp ? .white : Color.white.opacity(0.56),
+                    backgroundColor: socraticCoach.canRequestHelp
+                      ? Color.black.opacity(0.54)
+                      : Color.black.opacity(0.28)
+                  ) {
+                    socraticCoach.requestStrategicBriefing()
+                  }
+
+                  overlayToggleButton(
+                    title: socraticCoach.micState.label,
+                    systemImage: socraticCoach.micState.systemImageName,
+                    foregroundColor: .white,
+                    backgroundColor: socraticCoach.micState.accentColor
+                  ) {
+                    Task {
+                      await socraticCoach.toggleMicrophone()
+                    }
+                  }
+                }
+
                 musicToggleButton
 
                 ForEach(0..<3, id: \.self) { index in
@@ -8688,6 +8871,7 @@ private struct NativeARExperienceView: View {
       commentary.unbindPieceAudioBusyDurationProvider()
       socraticCoach.unbindThreatZoneHandler()
       socraticCoach.unbindMoveHandler()
+      socraticCoach.unbindDirectVoiceCommandHandler()
       socraticCoach.disconnect()
       switch mode {
       case .lesson:
@@ -10517,6 +10701,8 @@ private struct NativeARView: UIViewRepresentable {
     private var loadedReviewCheckpointID: UUID?
     private var loadedReviewReloadVersion = 0
     private var loadedLessonReloadVersion = 0
+    private var lastLessonMoveRevealState = false
+    private var lastLessonIntroNarrationKey: String?
 
     init(
       matchLog: MatchLogStore,
@@ -10572,6 +10758,9 @@ private struct NativeARView: UIViewRepresentable {
       }
       socraticCoach.bindMoveHandler { [weak self] uci, _ in
         self?.applyVoiceCommandMove(uci)
+      }
+      socraticCoach.bindDirectVoiceCommandHandler { [weak self] transcript in
+        self?.applyDirectVoiceCommand(transcript)
       }
       arView.automaticallyConfigureSession = false
       arView.environment.background = .cameraFeed()
@@ -10721,6 +10910,7 @@ private struct NativeARView: UIViewRepresentable {
     func syncRuntimeState(queueAssignedColor: ChessColor?) {
       self.queueAssignedColor = queueAssignedColor
       syncLessonStateIfNeeded()
+      syncLessonRevealPresentationIfNeeded()
       syncBoardPerspectiveIfNeeded()
       syncLessonAutoplayIfNeeded()
       syncReviewStateIfNeeded()
@@ -11070,6 +11260,149 @@ private struct NativeARView: UIViewRepresentable {
 
       clearSelection()
       apply(move)
+    }
+
+    private func applyDirectVoiceCommand(_ transcript: String) -> String? {
+      guard boardAnchor != nil,
+            pendingAnimatedMoves.isEmpty,
+            let move = directVoiceCommandMove(from: transcript),
+            let piece = gameState.piece(at: move.from),
+            canControlPiece(piece, at: move.from) else {
+        return nil
+      }
+
+      showThreatOverlay(algebraicSquares: [move.to.algebraic])
+      clearSelection()
+      apply(move)
+      return move.uciString
+    }
+
+    private func directVoiceCommandMove(from transcript: String) -> ChessMove? {
+      let normalized = normalizeDirectVoiceCommand(transcript)
+      guard !normalized.isEmpty else {
+        return nil
+      }
+
+      if let castlingMove = directVoiceCastlingMove(for: normalized) {
+        return castlingMove
+      }
+
+      let components = normalized.split(separator: " ")
+      let destinationToken: Substring
+      let desiredKind: ChessPieceKind
+
+      switch components.count {
+      case 1:
+        guard let token = components.first, isDirectVoiceSquare(token) else {
+          return nil
+        }
+        destinationToken = token
+        desiredKind = .pawn
+      case 2:
+        guard let first = components.first, let second = components.last else {
+          return nil
+        }
+        guard let kind = directVoicePieceKind(token: first), isDirectVoiceSquare(second) else {
+          return nil
+        }
+        destinationToken = second
+        desiredKind = kind
+      case 3:
+        guard let first = components.first,
+              components[1] == "to",
+              let third = components.last,
+              let kind = directVoicePieceKind(token: first),
+              isDirectVoiceSquare(third) else {
+          return nil
+        }
+        destinationToken = third
+        desiredKind = kind
+      default:
+        return nil
+      }
+
+      guard let destination = BoardSquare(algebraic: String(destinationToken)) else {
+        return nil
+      }
+
+      let candidates = directVoiceLegalMoves().filter {
+        $0.to == destination && $0.piece.kind == desiredKind
+      }
+      return candidates.count == 1 ? candidates[0] : nil
+    }
+
+    private func directVoiceLegalMoves() -> [ChessMove] {
+      gameState.board.compactMap { square, piece -> [ChessMove]? in
+        guard piece.color == gameState.turn else {
+          return nil
+        }
+        return gameState.legalMoves(from: square)
+      }
+      .flatMap { $0 }
+    }
+
+    private func directVoiceCastlingMove(for normalized: String) -> ChessMove? {
+      let kingsidePhrases = ["castle kingside", "castle king side", "short castle", "castle short"]
+      let queensidePhrases = ["castle queenside", "castle queen side", "long castle", "castle long"]
+
+      if kingsidePhrases.contains(normalized) {
+        let targetFile = 6
+        return directVoiceLegalMoves().first {
+          $0.piece.kind == .king && $0.rookMove != nil && $0.to.file == targetFile
+        }
+      }
+
+      if queensidePhrases.contains(normalized) {
+        let targetFile = 2
+        return directVoiceLegalMoves().first {
+          $0.piece.kind == .king && $0.rookMove != nil && $0.to.file == targetFile
+        }
+      }
+
+      return nil
+    }
+
+    private func normalizeDirectVoiceCommand(_ transcript: String) -> String {
+      let lowered = transcript.lowercased()
+      let alphanumerics = lowered.replacingOccurrences(
+        of: "[^a-z0-9\\s-]",
+        with: " ",
+        options: .regularExpression
+      )
+      let collapsedSquares = alphanumerics.replacingOccurrences(
+        of: "\\b([a-h])[\\s-]+([1-8])\\b",
+        with: "$1$2",
+        options: .regularExpression
+      )
+      return collapsedSquares.replacingOccurrences(
+        of: "\\s+",
+        with: " ",
+        options: .regularExpression
+      )
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func isDirectVoiceSquare(_ token: Substring) -> Bool {
+      String(token).range(of: "^[a-h][1-8]$", options: .regularExpression) != nil
+    }
+
+    private func directVoicePieceKind(token: Substring) -> ChessPieceKind? {
+      switch token {
+      case "pawn":
+        return .pawn
+      case "knight", "horse":
+        return .knight
+      case "bishop":
+        return .bishop
+      case "rook":
+        return .rook
+      case "queen":
+        return .queen
+      case "king":
+        return .king
+      default:
+        return nil
+      }
     }
 
     private func apply(_ move: ChessMove) {
@@ -11503,6 +11836,8 @@ private struct NativeARView: UIViewRepresentable {
             lessonStore.isActive,
             let step = lessonStore.currentStep else {
         loadedLessonReloadVersion = 0
+        lastLessonMoveRevealState = false
+        lastLessonIntroNarrationKey = nil
         return
       }
 
@@ -11531,13 +11866,52 @@ private struct NativeARView: UIViewRepresentable {
       do {
         gameState = try ChessGameState(fen: step.startingFEN)
         loadedLessonReloadVersion = lessonStore.reloadVersion
+        lastLessonMoveRevealState = lessonStore.isMoveRevealed
         refreshBoardPresentation()
         commentary.noteExternalStatus(step.focus)
         syncSocraticCoachContext(force: true)
+        maybeRequestLessonIntroIfNeeded()
       } catch {
         commentary.noteExternalStatus("Lesson step could not load.")
         lessonStore.resetSession()
       }
+    }
+
+    private func maybeRequestLessonIntroIfNeeded() {
+      guard mode.isLessonMode,
+            boardAnchor != nil,
+            lessonStore.isActive,
+            let lesson = lessonStore.activeLesson,
+            let step = lessonStore.currentStep else {
+        return
+      }
+
+      let introKey = "\(lesson.id):\(lessonStore.reloadVersion):\(step.id)"
+      guard lastLessonIntroNarrationKey != introKey else {
+        return
+      }
+
+      lastLessonIntroNarrationKey = introKey
+      socraticCoach.requestLessonIntro(
+        lessonTitle: lesson.title,
+        prompt: step.prompt,
+        focus: step.focus
+      )
+    }
+
+    private func syncLessonRevealPresentationIfNeeded() {
+      guard mode.isLessonMode else {
+        lastLessonMoveRevealState = false
+        return
+      }
+
+      let revealState = lessonStore.isMoveRevealed
+      guard revealState != lastLessonMoveRevealState else {
+        return
+      }
+
+      lastLessonMoveRevealState = revealState
+      refreshBoardPresentation()
     }
 
     private func syncReviewStateIfNeeded(force: Bool = false) {
@@ -12556,6 +12930,7 @@ private struct NativeARView: UIViewRepresentable {
       }
 
       trackedPlaneID = selectedPlane.identifier
+      maybeRequestLessonIntroIfNeeded()
       maybeScheduleInitialAnalysis()
       syncLessonAutoplayIfNeeded()
       syncAutomatedOpponentTurnIfNeeded()

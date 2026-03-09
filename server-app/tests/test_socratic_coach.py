@@ -165,6 +165,37 @@ def test_help_request_prompt_explicitly_skips_hypothetical_tool() -> None:
     assert "do not call analyze_hypothetical_move for this reply" in observed["text"]
 
 
+def test_lesson_intro_prompt_briefly_introduces_the_lesson_concept() -> None:
+    session = SocraticCoachSession(
+        frontend_socket=object(),
+        stockfish_engine=object(),
+        api_key="test-key",
+    )
+    observed: dict[str, str] = {}
+
+    async def fake_send_user_turn(text: str) -> None:
+        observed["text"] = text
+
+    session._send_user_turn = fake_send_user_turn  # type: ignore[method-assign]
+
+    asyncio.run(
+        session._handle_frontend_message(
+            {
+                "type": "lesson_intro",
+                "lesson_title": "Learn the Italian Opening",
+                "prompt": "White starts by claiming the center. What is the first Italian Opening move?",
+                "focus": "Open with a central pawn so your bishop and queen can breathe.",
+            }
+        )
+    )
+
+    assert "do not call analyze_hypothetical_move for this reply" in observed["text"]
+    assert "2 to 3 short sentences, hard cap 4" in observed["text"]
+    assert "Lesson title: Learn the Italian Opening" in observed["text"]
+    assert "Lesson prompt: White starts by claiming the center." in observed["text"]
+    assert "Lesson focus: Open with a central pawn so your bishop and queen can breathe." in observed["text"]
+
+
 def test_audio_stream_end_emits_voice_move_for_direct_command() -> None:
     session = SocraticCoachSession(
         frontend_socket=object(),

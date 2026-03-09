@@ -352,6 +352,23 @@ class SocraticCoachSession:
             )
             return
 
+        if message_type == "lesson_intro":
+            lesson_title = str(payload.get("lesson_title") or "").strip() or "Untitled lesson"
+            lesson_prompt = str(payload.get("prompt") or "").strip() or "No lesson prompt provided."
+            lesson_focus = str(payload.get("focus") or "").strip() or "No lesson focus provided."
+            self._begin_response_tracking()
+            await self._send_user_turn(
+                "You are introducing a chess lesson position. "
+                "The player has not proposed a move, so do not call analyze_hypothetical_move for this reply. "
+                "Speak directly to the player in second person, as if answering them face-to-face. "
+                "Briefly explain the core lesson concept in 2 to 3 short sentences, hard cap 4. "
+                "Do not reveal the exact move immediately unless the concept requires it.\n"
+                f"Lesson title: {lesson_title}\n"
+                f"Lesson prompt: {lesson_prompt}\n"
+                f"Lesson focus: {lesson_focus}"
+            )
+            return
+
         if message_type == "audio_chunk":
             base64_data = str(payload.get("data") or "").strip()
             if not base64_data:
@@ -393,6 +410,21 @@ class SocraticCoachSession:
             await self._wait_until_gemini_ready()
             self._begin_response_tracking()
             await self._send_gemini_json({"realtimeInput": {"audioStreamEnd": True}})
+            return
+
+        if message_type == "voice_move_commit":
+            self._audio_turn_open = False
+            self._awaiting_direct_voice_move_after_end = False
+            self._pending_direct_voice_move_uci = None
+            self._latest_input_transcription = ""
+            self._buffered_frontend_payloads = []
+            self._buffered_turn_complete = False
+            self._suppress_response_until_turn_complete = True
+            try:
+                await self._wait_until_gemini_ready()
+                await self._send_gemini_json({"realtimeInput": {"audioStreamEnd": True}})
+            except Exception:
+                self._suppress_response_until_turn_complete = False
             return
 
         if message_type == "ping":
@@ -594,6 +626,9 @@ class SocraticCoachSession:
             turn_complete = server_content.get("turn_complete")
         if bool(turn_complete):
             await self._flush_buffered_text_if_needed()
+            if self._suppress_response_until_turn_complete and not self._response_in_flight:
+                self._suppress_response_until_turn_complete = False
+                return
             if self._should_defer_response_payloads():
                 self._buffered_turn_complete = True
                 self._buffered_frontend_payloads.append({"type": "turn_complete", "turn_complete": True})
