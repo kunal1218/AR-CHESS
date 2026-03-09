@@ -16,6 +16,7 @@ from main import (  # noqa: E402
     build_narrator_prompt,
     build_narrator_turn_addon,
     build_piece_voice_line_query,
+    build_piece_voice_line_retry_query,
     get_postgres_dsn,
     is_placeholder_value,
     narrator_personality_addon,
@@ -450,10 +451,9 @@ def test_sanitize_lesson_feedback_text_caps_to_two_sentences() -> None:
 
 
 def test_sanitize_piece_voice_line_text_caps_word_count_and_strips_labels() -> None:
-    fallback = "Crush file."
     raw_text = 'Knight: "A graceful leap toward glory and danger with far too many extra words for one short line indeed."'
 
-    sanitized = sanitize_piece_voice_line_text(raw_text, fallback)
+    sanitized = sanitize_piece_voice_line_text(raw_text)
 
     assert not sanitized.startswith("Knight:")
     assert '"' not in sanitized
@@ -515,6 +515,10 @@ def test_build_piece_voice_line_query_includes_personality_and_context() -> None
     assert "Move: g1 to e4" in query
     assert "Fork threat: yes" in query
     assert "Move quality: tactical" in query
+
+    retry_query = build_piece_voice_line_retry_query(payload, 'Knight: "Too long."')
+    assert "Do not reuse the previous wording." in retry_query
+    assert 'Previous invalid answer: Knight: "Too long."' in retry_query
 
 
 def test_build_narrator_prompt_appends_selected_personality() -> None:
@@ -697,6 +701,54 @@ def test_create_gemini_piece_voice_line_returns_sanitized_line(monkeypatch) -> N
 
     assert response.status_code == 200
     assert response.json() == {"line": "Break them now."}
+
+
+def test_create_gemini_piece_voice_line_retries_empty_response(monkeypatch) -> None:
+    responses = iter(["   ", "A sanctified strike through the dark."])
+
+    async def fake_run_turn(prompt: str, *, metadata=None, timeout_seconds: float = 0.0) -> str:
+        current = next(responses)
+        if current.strip():
+            assert metadata["retry_reason"] == "empty_or_invalid_piece_voice_line"
+            assert "Do not reuse the previous wording." in prompt
+        _ = timeout_seconds
+        return current
+
+    monkeypatch.setattr("main.GEMINI_LIVE_CLIENT.run_turn", fake_run_turn)
+
+    client = TestClient(app)
+    response = client.post(
+        "/v1/gemini/piece-voice-line",
+        json={
+            "fen": "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBR1 w KQkq - 0 1",
+            "piece_type": "bishop",
+            "piece_color": "white",
+            "from_square": "f1",
+            "to_square": "c4",
+            "is_capture": False,
+            "is_check": False,
+            "is_near_enemy_king": False,
+            "is_attacked": False,
+            "is_attacked_by_multiple": False,
+            "is_defended": True,
+            "is_well_defended": True,
+            "is_hanging": False,
+            "is_pinned": False,
+            "is_retreat": False,
+            "is_aggressive_advance": True,
+            "is_fork_threat": False,
+            "attacker_count": 0,
+            "defender_count": 2,
+            "eval_before": -40,
+            "eval_after": -10,
+            "eval_delta": 30,
+            "position_state": "losing",
+            "move_quality": "aggressive",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"line": "A sanctified strike through the dark."}
 
 
 def test_get_postgres_dsn_prefers_railway_private_url(monkeypatch) -> None:

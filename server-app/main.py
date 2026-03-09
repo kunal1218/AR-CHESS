@@ -622,48 +622,7 @@ def sanitize_lesson_feedback_text(raw_text: str, fallback: str) -> str:
     return condensed
 
 
-def gemini_fallback_piece_voice_line(payload: GeminiPieceVoiceRequest) -> str:
-    if payload.is_check:
-        return {
-            "pawn": "Point me at their king.",
-            "knight": "A noble check, at last.",
-            "bishop": "Judgment reaches the throne.",
-            "rook": "Break king now.",
-            "queen": "I told you I'd handle it.",
-            "king": "Press them. No mercy.",
-        }[payload.piece_type]
-
-    if payload.is_capture:
-        return {
-            "pawn": "Good. More blood.",
-            "knight": "A most elegant kill.",
-            "bishop": "Their sins are counted.",
-            "rook": "Smash done.",
-            "queen": "I cleaned it up.",
-            "king": "They fold before me.",
-        }[payload.piece_type]
-
-    if payload.position_state == "losing":
-        return {
-            "pawn": "Then we die fighting.",
-            "knight": "A grim board, but onward.",
-            "bishop": "Faith sharpens under siege.",
-            "rook": "Still crush.",
-            "queen": "This mess is beneath me.",
-            "king": "Where is my cover?",
-        }[payload.piece_type]
-
-    return {
-        "pawn": "Front line's where I belong.",
-        "knight": "A graceful leap.",
-        "bishop": "The diagonal is sanctified.",
-        "rook": "Crush file.",
-        "queen": "Try to keep up.",
-        "king": "They will kneel.",
-    }[payload.piece_type]
-
-
-def sanitize_piece_voice_line_text(raw_text: str, fallback: str) -> str:
+def sanitize_piece_voice_line_text(raw_text: str) -> str:
     condensed = re.sub(r"\s+", " ", raw_text).strip().strip("\"'")
     condensed = re.sub(
         r"^(pawn|knight|bishop|rook|queen|king)\s*:\s*",
@@ -674,7 +633,7 @@ def sanitize_piece_voice_line_text(raw_text: str, fallback: str) -> str:
     condensed = condensed.strip("\"' ")
     condensed = truncate_narration_text(condensed, max_sentences=2, max_characters=120)
     if not condensed:
-        return fallback
+        return ""
 
     words = condensed.split()
     if len(words) > 20:
@@ -682,7 +641,7 @@ def sanitize_piece_voice_line_text(raw_text: str, fallback: str) -> str:
         if condensed and condensed[-1] not in ".!?":
             condensed += "..."
 
-    return condensed or fallback
+    return condensed
 
 
 def build_gemini_user_query(payload: GeminiHintRequest) -> str:
@@ -797,6 +756,19 @@ def build_piece_voice_line_query(payload: GeminiPieceVoiceRequest) -> str:
         f"Eval before: {eval_before}\n"
         f"Eval after: {eval_after}\n"
         f"Eval delta: {eval_delta}"
+    )
+
+
+def build_piece_voice_line_retry_query(payload: GeminiPieceVoiceRequest, previous_response: str) -> str:
+    trimmed_previous = re.sub(r"\s+", " ", previous_response).strip()
+    return (
+        build_piece_voice_line_query(payload)
+        + "\n\n"
+        + "Your previous answer was unusable for the app. "
+        + "Return exactly one fresh in-character line right now. "
+        + "Do not reuse the previous wording. "
+        + "Do not return labels, quotes, headings, or explanations. "
+        + f"Previous invalid answer: {trimmed_previous or '(empty)'}"
     )
 
 
@@ -1844,7 +1816,6 @@ async def create_gemini_lesson_feedback(payload: GeminiLessonFeedbackRequest) ->
 
 @app.post("/v1/gemini/piece-voice-line", response_model=GeminiPieceVoiceResponse)
 async def create_gemini_piece_voice_line(payload: GeminiPieceVoiceRequest) -> dict[str, Any]:
-    fallback = gemini_fallback_piece_voice_line(payload)
     query = build_piece_voice_line_query(payload)
     metadata = {
         "current_fen": payload.fen,
@@ -1862,6 +1833,17 @@ async def create_gemini_piece_voice_line(payload: GeminiPieceVoiceRequest) -> di
             metadata=metadata,
             timeout_seconds=GEMINI_LIVE_TURN_TIMEOUT_SECONDS,
         )
+        line = sanitize_piece_voice_line_text(raw_line)
+        if not line:
+            retry_query = build_piece_voice_line_retry_query(payload, raw_line)
+            retry_metadata = dict(metadata)
+            retry_metadata["retry_reason"] = "empty_or_invalid_piece_voice_line"
+            raw_line = await GEMINI_LIVE_CLIENT.run_turn(
+                retry_query,
+                metadata=retry_metadata,
+                timeout_seconds=GEMINI_LIVE_TURN_TIMEOUT_SECONDS,
+            )
+            line = sanitize_piece_voice_line_text(raw_line)
     except GeminiLiveConfigurationError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except GeminiLiveBusyError as exc:
@@ -1872,9 +1854,10 @@ async def create_gemini_piece_voice_line(payload: GeminiPieceVoiceRequest) -> di
         logger.exception("Gemini Live piece voice request failed unexpectedly")
         raise HTTPException(status_code=503, detail=f"Gemini piece voice failed: {exc}") from exc
 
-    return {
-        "line": sanitize_piece_voice_line_text(raw_line, fallback),
-    }
+    if not line:
+        raise HTTPException(status_code=503, detail="Gemini piece voice returned no usable line.")
+
+    return {"line": line}
 
 
 @app.post("/v1/gemini/commentary", response_model=GeminiCoachResponse)
