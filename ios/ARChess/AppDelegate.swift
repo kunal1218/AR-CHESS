@@ -619,6 +619,13 @@ private struct SocraticCoachLessonAttemptFeedbackPayload: Encodable {
   let move_revealed: Bool
 }
 
+private struct SocraticCoachLessonSuccessPayload: Encodable {
+  let type = "lesson_success"
+  let lesson_title: String
+  let prompt: String
+  let focus: String
+}
+
 private struct SocraticCoachLessonCompletionPayload: Encodable {
   let type = "lesson_complete"
   let lesson_title: String
@@ -1357,6 +1364,20 @@ private final class SocraticCoachStore: ObservableObject {
         focus: focus,
         remaining_tries: remainingTries,
         move_revealed: moveRevealed
+      )
+    )
+  }
+
+  func requestLessonSuccess(lessonTitle: String, prompt: String, focus: String) {
+    guard prepareNarrationRequest() else {
+      return
+    }
+
+    send(
+      payload: SocraticCoachLessonSuccessPayload(
+        lesson_title: lessonTitle,
+        prompt: prompt,
+        focus: focus
       )
     )
   }
@@ -11407,17 +11428,10 @@ private struct NativeARView: UIViewRepresentable {
       if lessonStore.isMoveRevealed {
         guard move.uciString == correctMove.uciString else {
           clearSelection()
-          socraticCoach.requestLessonAttemptFeedback(
-            lessonTitle: lesson.title,
-            prompt: step.prompt,
-            focus: step.focus,
-            remainingTries: lessonStore.remainingTries,
-            moveRevealed: true
-          )
           return
         }
 
-        commitLessonMove(move, lesson: lesson)
+        commitLessonMove(move, lesson: lesson, step: step)
         return
       }
 
@@ -11426,20 +11440,26 @@ private struct NativeARView: UIViewRepresentable {
         guard lessonStore.registerIncorrectAttempt() else {
           return
         }
-        socraticCoach.requestLessonAttemptFeedback(
-          lessonTitle: lesson.title,
-          prompt: step.prompt,
-          focus: step.focus,
-          remainingTries: lessonStore.remainingTries,
-          moveRevealed: lessonStore.isMoveRevealed
-        )
+        if lessonStore.isMoveRevealed {
+          socraticCoach.requestLessonAttemptFeedback(
+            lessonTitle: lesson.title,
+            prompt: step.prompt,
+            focus: step.focus,
+            remainingTries: lessonStore.remainingTries,
+            moveRevealed: true
+          )
+        }
         return
       }
 
-      commitLessonMove(move, lesson: lesson)
+      commitLessonMove(move, lesson: lesson, step: step)
     }
 
-    private func commitLessonMove(_ move: ChessMove, lesson: OpeningLessonDefinition) {
+    private func commitLessonMove(
+      _ move: ChessMove,
+      lesson: OpeningLessonDefinition,
+      step: OpeningLessonStep
+    ) {
       let beforeState = gameState
       let afterState = gameState.applying(move)
       enqueueMoveAnimation(
@@ -11452,15 +11472,24 @@ private struct NativeARView: UIViewRepresentable {
               return
             }
 
-            if self.lessonStore.advanceAfterCorrectMove() != nil {
+            let lessonCompleted = self.lessonStore.advanceAfterCorrectMove() != nil
+            if lessonCompleted {
               self.commentary.noteExternalStatus("\(lesson.title) complete.")
               self.socraticCoach.requestLessonCompletion(
                 lessonTitle: lesson.title,
                 summary: lesson.summary
               )
-            } else if let nextStep = self.lessonStore.currentStep {
-              self.commentary.noteExternalStatus(nextStep.focus)
+            } else {
+              self.socraticCoach.requestLessonSuccess(
+                lessonTitle: lesson.title,
+                prompt: step.prompt,
+                focus: step.focus
+              )
+              if let nextStep = self.lessonStore.currentStep {
+                self.commentary.noteExternalStatus(nextStep.focus)
+              }
             }
+
             self.syncLessonAutoplayIfNeeded()
           }
         )

@@ -395,6 +395,23 @@ class SocraticCoachSession:
             )
             return
 
+        if message_type == "lesson_success":
+            lesson_title = str(payload.get("lesson_title") or "").strip() or "Untitled lesson"
+            lesson_prompt = str(payload.get("prompt") or "").strip() or "No lesson prompt provided."
+            lesson_focus = str(payload.get("focus") or "").strip() or "No lesson focus provided."
+            self._begin_response_tracking()
+            await self._send_user_turn(
+                "The player just found the correct move in a guided chess lesson. "
+                "Do not call analyze_hypothetical_move for this reply. "
+                "Give a brief compliment directly to the player in your narrator style. "
+                "Keep it very short: 1 short sentence, or at most 2 short sentences. "
+                "Do not launch into a full explanation.\n"
+                f"Lesson title: {lesson_title}\n"
+                f"Lesson prompt: {lesson_prompt}\n"
+                f"Lesson focus: {lesson_focus}"
+            )
+            return
+
         if message_type == "lesson_complete":
             lesson_title = str(payload.get("lesson_title") or "").strip() or "Untitled lesson"
             lesson_summary = str(payload.get("summary") or "").strip() or "No lesson summary provided."

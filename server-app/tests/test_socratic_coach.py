@@ -135,7 +135,8 @@ def test_build_socratic_system_prompt_appends_silky_personality() -> None:
     prompt = build_socratic_system_prompt("silky")
 
     assert "You are a Socratic chess coach." in prompt
-    assert "calm, silky, confident delivery" in prompt
+    assert "smooth, charismatic chess narrator" in prompt
+    assert "Vary your commentary rhythm using two speaking styles." in prompt
     assert "never exceed 5 short sentences" in prompt
 
 
@@ -254,6 +255,35 @@ def test_lesson_complete_prompt_requests_congratulatory_reply() -> None:
     assert "Congratulate the player directly in 1 to 3 short sentences, hard cap 4." in observed["text"]
     assert "Lesson title: Learn the Italian Opening" in observed["text"]
     assert "Lesson summary: Play the White side of the Italian Opening while Black replies automatically." in observed["text"]
+
+
+def test_lesson_success_prompt_requests_short_compliment_only() -> None:
+    session = SocraticCoachSession(
+        frontend_socket=object(),
+        stockfish_engine=object(),
+        api_key="test-key",
+    )
+    observed: dict[str, str] = {}
+
+    async def fake_send_user_turn(text: str) -> None:
+        observed["text"] = text
+
+    session._send_user_turn = fake_send_user_turn  # type: ignore[method-assign]
+
+    asyncio.run(
+        session._handle_frontend_message(
+            {
+                "type": "lesson_success",
+                "lesson_title": "Learn the Italian Opening",
+                "prompt": "Now continue with White. Which move develops while attacking e5?",
+                "focus": "Develop a knight, hit the center, and prepare to castle.",
+            }
+        )
+    )
+
+    assert "Give a brief compliment directly to the player in your narrator style." in observed["text"]
+    assert "Keep it very short: 1 short sentence, or at most 2 short sentences." in observed["text"]
+    assert "Do not launch into a full explanation." in observed["text"]
 
 
 def test_audio_stream_end_emits_voice_move_for_direct_command() -> None:
