@@ -14,7 +14,7 @@ import websockets
 from fastapi import WebSocket
 
 from services.gemini_live import GeminiLiveClient
-from services.move_parser import parse_natural_move, uci_to_san
+from services.move_parser import parse_direct_move_command, parse_natural_move, uci_to_san
 from services.narrator_personality import DEFAULT_NARRATOR, narrator_personality_addon, normalize_narrator
 from services.stockfish_engine import StockfishEngine
 
@@ -237,6 +237,7 @@ class GameStateStore:
 
 class SocraticCoachSession:
     DEFAULT_CONTEXT_DEBOUNCE_MS = int(os.getenv("CONTEXT_STREAM_DEBOUNCE_MS", "500"))
+    DIRECT_VOICE_MOVE_GRACE_SECONDS = 0.45
 
     def __init__(
         self,
@@ -274,6 +275,14 @@ class SocraticCoachSession:
         self._response_in_flight = False
         self._received_output_transcription = False
         self._buffered_model_text_parts: list[str] = []
+        self._audio_turn_open = False
+        self._awaiting_direct_voice_move_after_end = False
+        self._suppress_response_until_turn_complete = False
+        self._latest_input_transcription = ""
+        self._pending_direct_voice_move_uci: str | None = None
+        self._direct_voice_move_resolution_task: asyncio.Task[None] | None = None
+        self._buffered_frontend_payloads: list[dict[str, Any]] = []
+        self._buffered_turn_complete = False
 
         self._game_store = GameStateStore()
         self._game_store.subscribe(self._schedule_context_push)
@@ -310,6 +319,8 @@ class SocraticCoachSession:
         for task in (self._context_push_task, self._reconnect_task, self._gemini_reader_task):
             if task is not None and not task.done():
                 task.cancel()
+        if self._direct_voice_move_resolution_task is not None and not self._direct_voice_move_resolution_task.done():
+            self._direct_voice_move_resolution_task.cancel()
 
         gemini_ws = self._gemini_ws
         self._gemini_ws = None
@@ -345,6 +356,12 @@ class SocraticCoachSession:
             base64_data = str(payload.get("data") or "").strip()
             if not base64_data:
                 return
+            if not self._audio_turn_open:
+                self._audio_turn_open = True
+                self._awaiting_direct_voice_move_after_end = False
+                self._suppress_response_until_turn_complete = False
+                self._latest_input_transcription = ""
+                self._pending_direct_voice_move_uci = None
             await self._wait_until_gemini_ready()
             await self._send_gemini_json(
                 {
@@ -359,6 +376,20 @@ class SocraticCoachSession:
             return
 
         if message_type == "audio_stream_end":
+            self._audio_turn_open = False
+            move_uci = self._pending_direct_voice_move_uci or self._parse_direct_voice_move(
+                self._latest_input_transcription
+            )
+            spoken_text = self._latest_input_transcription.strip() or None
+            self._pending_direct_voice_move_uci = None
+            self._latest_input_transcription = ""
+
+            if move_uci:
+                await self._emit_direct_voice_move(move_uci, spoken_text)
+                return
+
+            self._awaiting_direct_voice_move_after_end = True
+            self._schedule_direct_voice_move_resolution()
             await self._wait_until_gemini_ready()
             self._begin_response_tracking()
             await self._send_gemini_json({"realtimeInput": {"audioStreamEnd": True}})
@@ -490,26 +521,42 @@ class SocraticCoachSession:
             self._schedule_context_push(immediate=True)
             return
 
+        input_transcription = payload.get("inputTranscription") or payload.get("input_transcription")
+        if isinstance(input_transcription, dict):
+            text = str(input_transcription.get("text") or "").strip()
+            if text:
+                self._latest_input_transcription = text
+                if self._audio_turn_open or self._awaiting_direct_voice_move_after_end:
+                    self._pending_direct_voice_move_uci = self._parse_direct_voice_move(text)
+                await self._send_frontend({"type": "input_transcription", "text": text})
+                if self._awaiting_direct_voice_move_after_end and self._pending_direct_voice_move_uci:
+                    await self._emit_direct_voice_move(
+                        self._pending_direct_voice_move_uci,
+                        self._latest_input_transcription.strip() or None,
+                    )
+                    return
+
         if "toolCall" in payload or "tool_call" in payload:
+            if self._should_defer_response_payloads() or self._suppress_response_until_turn_complete:
+                return
             await self._handle_tool_call(payload.get("toolCall") or payload.get("tool_call"))
             return
 
         output_transcription = payload.get("outputTranscription") or payload.get("output_transcription")
         if isinstance(output_transcription, dict):
             text = sanitize_model_narration_text(str(output_transcription.get("text") or ""))
-            if text and self._response_in_flight:
+            if text and self._response_in_flight and not self._suppress_response_until_turn_complete:
                 self._received_output_transcription = True
-                await self._send_frontend({"type": "output_transcription", "text": text})
-
-        input_transcription = payload.get("inputTranscription") or payload.get("input_transcription")
-        if isinstance(input_transcription, dict):
-            text = str(input_transcription.get("text") or "").strip()
-            if text:
-                await self._send_frontend({"type": "input_transcription", "text": text})
+                await self._send_or_buffer_frontend({"type": "output_transcription", "text": text})
 
         direct_audio = payload.get("data")
-        if self._response_in_flight and isinstance(direct_audio, str) and direct_audio:
-            await self._send_frontend(
+        if (
+            self._response_in_flight
+            and not self._suppress_response_until_turn_complete
+            and isinstance(direct_audio, str)
+            and direct_audio
+        ):
+            await self._send_or_buffer_frontend(
                 {
                     "type": "audio_chunk",
                     "data": direct_audio,
@@ -530,8 +577,8 @@ class SocraticCoachSession:
                 inline_data = part.get("inlineData") or part.get("inline_data")
                 if isinstance(inline_data, dict):
                     raw_data = str(inline_data.get("data") or "").strip()
-                    if raw_data and self._response_in_flight:
-                        await self._send_frontend(
+                    if raw_data and self._response_in_flight and not self._suppress_response_until_turn_complete:
+                        await self._send_or_buffer_frontend(
                             {
                                 "type": "audio_chunk",
                                 "data": raw_data,
@@ -539,7 +586,7 @@ class SocraticCoachSession:
                             }
                         )
                 text = str(part.get("text") or "").strip()
-                if text:
+                if text and not self._suppress_response_until_turn_complete:
                     self._buffer_model_text(text)
 
         turn_complete = server_content.get("turnComplete")
@@ -547,6 +594,11 @@ class SocraticCoachSession:
             turn_complete = server_content.get("turn_complete")
         if bool(turn_complete):
             await self._flush_buffered_text_if_needed()
+            if self._should_defer_response_payloads():
+                self._buffered_turn_complete = True
+                self._buffered_frontend_payloads.append({"type": "turn_complete", "turn_complete": True})
+                self._buffered_frontend_payloads.append({"type": "streaming", "active": False})
+                return
             await self._send_frontend({"type": "turn_complete", "turn_complete": True})
             await self._send_frontend({"type": "streaming", "active": False})
             self._end_response_tracking()
@@ -720,11 +772,25 @@ class SocraticCoachSession:
         self._response_in_flight = True
         self._received_output_transcription = False
         self._buffered_model_text_parts = []
+        self._buffered_frontend_payloads = []
+        self._buffered_turn_complete = False
 
     def _end_response_tracking(self) -> None:
         self._response_in_flight = False
         self._received_output_transcription = False
         self._buffered_model_text_parts = []
+        self._awaiting_direct_voice_move_after_end = False
+        self._suppress_response_until_turn_complete = False
+        current_task = asyncio.current_task()
+        if (
+            self._direct_voice_move_resolution_task is not None
+            and not self._direct_voice_move_resolution_task.done()
+            and self._direct_voice_move_resolution_task is not current_task
+        ):
+            self._direct_voice_move_resolution_task.cancel()
+        self._direct_voice_move_resolution_task = None
+        self._buffered_frontend_payloads = []
+        self._buffered_turn_complete = False
 
     def _buffer_model_text(self, text: str) -> None:
         if not self._response_in_flight:
@@ -732,6 +798,59 @@ class SocraticCoachSession:
         self._buffered_model_text_parts.append(text)
         if len(self._buffered_model_text_parts) > 12:
             self._buffered_model_text_parts = self._buffered_model_text_parts[-12:]
+
+    def _parse_direct_voice_move(self, spoken_text: str) -> str | None:
+        if not spoken_text.strip():
+            return None
+        return parse_direct_move_command(spoken_text, self._game_store.get_current_fen())
+
+    async def _emit_direct_voice_move(self, move_uci: str, spoken_text: str | None) -> None:
+        self._pending_direct_voice_move_uci = None
+        self._awaiting_direct_voice_move_after_end = False
+        self._end_response_tracking()
+        self._suppress_response_until_turn_complete = True
+        await self._send_frontend(
+            {
+                "type": "voice_move",
+                "uci": move_uci,
+                "spoken": spoken_text,
+            }
+        )
+        await self._send_frontend({"type": "turn_complete", "turn_complete": True})
+        await self._send_frontend({"type": "streaming", "active": False})
+
+    def _schedule_direct_voice_move_resolution(self) -> None:
+        if self._direct_voice_move_resolution_task is not None and not self._direct_voice_move_resolution_task.done():
+            self._direct_voice_move_resolution_task.cancel()
+        self._direct_voice_move_resolution_task = asyncio.create_task(
+            self._resolve_direct_voice_move_window_after_delay()
+        )
+
+    async def _resolve_direct_voice_move_window_after_delay(self) -> None:
+        try:
+            await asyncio.sleep(self.DIRECT_VOICE_MOVE_GRACE_SECONDS)
+            if not self._awaiting_direct_voice_move_after_end:
+                return
+            self._awaiting_direct_voice_move_after_end = False
+            buffered_payloads = list(self._buffered_frontend_payloads)
+            buffered_turn_complete = self._buffered_turn_complete
+            self._buffered_frontend_payloads = []
+            self._buffered_turn_complete = False
+            for payload in buffered_payloads:
+                await self._send_frontend(payload)
+            if buffered_turn_complete:
+                self._end_response_tracking()
+        except asyncio.CancelledError:
+            raise
+
+    def _should_defer_response_payloads(self) -> bool:
+        return self._awaiting_direct_voice_move_after_end and not self._suppress_response_until_turn_complete
+
+    async def _send_or_buffer_frontend(self, payload: dict[str, Any]) -> None:
+        if self._should_defer_response_payloads():
+            self._buffered_frontend_payloads.append(payload)
+            return
+        await self._send_frontend(payload)
 
     async def _flush_buffered_text_if_needed(self) -> None:
         if not self._response_in_flight or self._received_output_transcription:

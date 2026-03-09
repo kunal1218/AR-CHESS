@@ -20,6 +20,13 @@ _FILLER_PATTERNS = (
 )
 _CAPTURE_PATTERN = re.compile(r"\b(take|capture|captures|capturing|x|eat)\b")
 _DESTINATION_PATTERN = re.compile(r"\b([a-h][1-8])\b")
+_DIRECT_MOVE_COMMAND_PATTERNS = (
+    re.compile(r"^[a-h][1-8]$"),
+    re.compile(r"^(pawn|knight|horse|bishop|rook|queen|king)\s+(?:to\s+)?[a-h][1-8]$"),
+    re.compile(
+        r"^(castle kingside|castle king side|castle queenside|castle queen side|short castle|castle short|long castle|castle long)$"
+    ),
+)
 
 _PIECE_ALIASES: dict[str, int] = {
     "knight": chess.KNIGHT,
@@ -76,6 +83,17 @@ def parse_natural_move(natural_move: str, fen: str) -> str | None:
     return candidates[0].uci()
 
 
+def parse_direct_move_command(spoken_text: str, fen: str) -> str | None:
+    normalized = _normalize_direct_command_text(spoken_text)
+    if not normalized:
+        return None
+
+    if not any(pattern.fullmatch(normalized) for pattern in _DIRECT_MOVE_COMMAND_PATTERNS):
+        return None
+
+    return parse_natural_move(spoken_text, fen)
+
+
 def uci_to_san(fen: str, uci: str) -> str | None:
     board = chess.Board(fen)
 
@@ -95,8 +113,21 @@ def _normalize_text(raw_text: str) -> str:
     for pattern in _FILLER_PATTERNS:
         normalized = re.sub(pattern, " ", normalized)
     normalized = re.sub(r"[^a-z0-9\s-]", " ", normalized)
+    normalized = _collapse_spoken_square_tokens(normalized)
     normalized = re.sub(r"\s+", " ", normalized).strip()
     return normalized
+
+
+def _normalize_direct_command_text(raw_text: str) -> str:
+    normalized = raw_text.strip().lower()
+    normalized = re.sub(r"[^a-z0-9\s-]", " ", normalized)
+    normalized = _collapse_spoken_square_tokens(normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized
+
+
+def _collapse_spoken_square_tokens(text: str) -> str:
+    return re.sub(r"\b([a-h])[\s-]+([1-8])\b", r"\1\2", text)
 
 
 def _parse_piece_type(normalized: str) -> int:

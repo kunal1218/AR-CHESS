@@ -1124,6 +1124,7 @@ private final class SocraticCoachStore: ObservableObject {
   private var delayedConnectWorkItem: DispatchWorkItem?
   private var microphonePrewarmWorkItem: DispatchWorkItem?
   private var threatZoneHandler: (([String], String?) -> Void)?
+  private var moveHandler: ((String, String?) -> Void)?
 
   init(
     narrator: NarratorType,
@@ -1198,6 +1199,14 @@ private final class SocraticCoachStore: ObservableObject {
 
   func unbindThreatZoneHandler() {
     threatZoneHandler = nil
+  }
+
+  func bindMoveHandler(_ handler: @escaping (String, String?) -> Void) {
+    moveHandler = handler
+  }
+
+  func unbindMoveHandler() {
+    moveHandler = nil
   }
 
   func updateContext(_ context: SocraticCoachContext?) {
@@ -1484,6 +1493,19 @@ private final class SocraticCoachStore: ObservableObject {
       let squares = args?["squares"] as? [String] ?? []
       let reason = args?["reason"] as? String
       threatZoneHandler?(squares, reason)
+    case "voice_move":
+      guard let uci = payload["uci"] as? String else {
+        return
+      }
+      let spoken = payload["spoken"] as? String
+      isStreamingResponse = false
+      transcriptText = nil
+      audioPlayer.stop()
+      statusText = "Voice move ready."
+      if let destinationSquare = Self.destinationSquare(forVoiceMoveUCI: uci) {
+        threatZoneHandler?([destinationSquare], "Voice command")
+      }
+      moveHandler?(uci, spoken)
     default:
       break
     }
@@ -1644,6 +1666,14 @@ private final class SocraticCoachStore: ObservableObject {
     queryItems.append(URLQueryItem(name: "narrator", value: narrator.rawValue))
     components?.queryItems = queryItems
     return components?.url
+  }
+
+  private static func destinationSquare(forVoiceMoveUCI uci: String) -> String? {
+    let trimmed = uci.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    guard trimmed.count >= 4 else {
+      return nil
+    }
+    return String(trimmed.dropFirst(2).prefix(2))
   }
 }
 
@@ -8657,6 +8687,7 @@ private struct NativeARExperienceView: View {
       commentary.unbindNarrationHighlightHandler()
       commentary.unbindPieceAudioBusyDurationProvider()
       socraticCoach.unbindThreatZoneHandler()
+      socraticCoach.unbindMoveHandler()
       socraticCoach.disconnect()
       switch mode {
       case .lesson:
@@ -10539,6 +10570,9 @@ private struct NativeARView: UIViewRepresentable {
       socraticCoach.bindThreatZoneHandler { [weak self] squares, _ in
         self?.showThreatOverlay(algebraicSquares: squares)
       }
+      socraticCoach.bindMoveHandler { [weak self] uci, _ in
+        self?.applyVoiceCommandMove(uci)
+      }
       arView.automaticallyConfigureSession = false
       arView.environment.background = .cameraFeed()
       arView.renderOptions.insert(.disableMotionBlur)
@@ -11023,6 +11057,19 @@ private struct NativeARView: UIViewRepresentable {
       selectedSquare = nil
       selectedMoves = []
       refreshBoardPresentation()
+    }
+
+    private func applyVoiceCommandMove(_ uci: String) {
+      guard boardAnchor != nil,
+            pendingAnimatedMoves.isEmpty,
+            let move = gameState.move(forUCI: uci),
+            let piece = gameState.piece(at: move.from),
+            canControlPiece(piece, at: move.from) else {
+        return
+      }
+
+      clearSelection()
+      apply(move)
     }
 
     private func apply(_ move: ChessMove) {

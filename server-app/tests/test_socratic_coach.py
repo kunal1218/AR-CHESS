@@ -7,7 +7,7 @@ SERVER_APP_ROOT = Path(__file__).resolve().parents[1]
 if str(SERVER_APP_ROOT) not in sys.path:
     sys.path.insert(0, str(SERVER_APP_ROOT))
 
-from services.move_parser import parse_natural_move  # noqa: E402
+from services.move_parser import parse_direct_move_command, parse_natural_move  # noqa: E402
 from services.socratic_coach import (  # noqa: E402
     GameStateStore,
     SocraticCoachSession,
@@ -35,6 +35,30 @@ def test_parse_natural_move_returns_none_for_illegal_move() -> None:
     fen = "4k3/8/8/8/8/2N5/8/4K3 w - - 0 1"
 
     assert parse_natural_move("Knight to h8", fen) is None
+
+
+def test_parse_direct_move_command_accepts_square_only_pawn_push() -> None:
+    fen = "4k3/8/8/8/8/8/4P3/4K3 w - - 0 1"
+
+    assert parse_direct_move_command("e3", fen) == "e2e3"
+
+
+def test_parse_direct_move_command_accepts_spaced_square_tokens() -> None:
+    fen = "4k3/8/8/8/8/8/4P3/4K3 w - - 0 1"
+
+    assert parse_direct_move_command("e 3", fen) == "e2e3"
+
+
+def test_parse_direct_move_command_accepts_piece_and_destination() -> None:
+    fen = "4k3/8/8/8/8/2N5/8/4K3 w - - 0 1"
+
+    assert parse_direct_move_command("knight e4", fen) == "c3e4"
+
+
+def test_parse_direct_move_command_rejects_non_command_phrase() -> None:
+    fen = "4k3/8/8/8/8/2N5/8/4K3 w - - 0 1"
+
+    assert parse_direct_move_command("what about knight e4", fen) is None
 
 
 def test_game_state_store_apply_move_updates_fen_and_san_history() -> None:
@@ -139,6 +163,107 @@ def test_help_request_prompt_explicitly_skips_hypothetical_tool() -> None:
     asyncio.run(session._handle_frontend_message({"type": "help_request"}))
 
     assert "do not call analyze_hypothetical_move for this reply" in observed["text"]
+
+
+def test_audio_stream_end_emits_voice_move_for_direct_command() -> None:
+    session = SocraticCoachSession(
+        frontend_socket=object(),
+        stockfish_engine=object(),
+        api_key="test-key",
+    )
+    observed: list[dict[str, object]] = []
+    session._latest_input_transcription = "e4"
+    session._pending_direct_voice_move_uci = "e2e4"
+
+    async def fake_send_frontend(payload: dict[str, object]) -> None:
+        observed.append(payload)
+
+    async def fail_wait_until_ready() -> None:
+        raise AssertionError("Gemini should not be contacted for a direct voice move.")
+
+    session._send_frontend = fake_send_frontend  # type: ignore[method-assign]
+    session._wait_until_gemini_ready = fail_wait_until_ready  # type: ignore[method-assign]
+
+    asyncio.run(session._handle_frontend_message({"type": "audio_stream_end"}))
+
+    assert observed == [
+        {"type": "voice_move", "uci": "e2e4", "spoken": "e4"},
+        {"type": "turn_complete", "turn_complete": True},
+        {"type": "streaming", "active": False},
+    ]
+
+
+def test_late_input_transcription_still_emits_voice_move_and_suppresses_audio() -> None:
+    session = SocraticCoachSession(
+        frontend_socket=object(),
+        stockfish_engine=object(),
+        api_key="test-key",
+    )
+    observed: list[dict[str, object]] = []
+    session._response_in_flight = True
+    session._awaiting_direct_voice_move_after_end = True
+
+    async def fake_send_frontend(payload: dict[str, object]) -> None:
+        observed.append(payload)
+
+    session._send_frontend = fake_send_frontend  # type: ignore[method-assign]
+
+    asyncio.run(
+        session._handle_gemini_message(
+            {
+                "inputTranscription": {"text": "e4"},
+                "data": "should-not-be-forwarded",
+            }
+        )
+    )
+
+    assert observed == [
+        {"type": "input_transcription", "text": "e4"},
+        {"type": "voice_move", "uci": "e2e4", "spoken": "e4"},
+        {"type": "turn_complete", "turn_complete": True},
+        {"type": "streaming", "active": False},
+    ]
+
+
+def test_buffered_audio_is_discarded_when_late_transcription_resolves_to_voice_move() -> None:
+    session = SocraticCoachSession(
+        frontend_socket=object(),
+        stockfish_engine=object(),
+        api_key="test-key",
+    )
+    observed: list[dict[str, object]] = []
+    session._response_in_flight = True
+    session._awaiting_direct_voice_move_after_end = True
+
+    async def fake_send_frontend(payload: dict[str, object]) -> None:
+        observed.append(payload)
+
+    session._send_frontend = fake_send_frontend  # type: ignore[method-assign]
+
+    asyncio.run(
+        session._handle_gemini_message(
+            {
+                "data": "buffer-this-audio",
+            }
+        )
+    )
+
+    assert observed == []
+
+    asyncio.run(
+        session._handle_gemini_message(
+            {
+                "inputTranscription": {"text": "e 4"},
+            }
+        )
+    )
+
+    assert observed == [
+        {"type": "input_transcription", "text": "e 4"},
+        {"type": "voice_move", "uci": "e2e4", "spoken": "e 4"},
+        {"type": "turn_complete", "turn_complete": True},
+        {"type": "streaming", "active": False},
+    ]
 
 
 class FakeStockfishEngine:
