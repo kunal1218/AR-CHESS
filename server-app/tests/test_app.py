@@ -15,6 +15,7 @@ from main import (  # noqa: E402
     app,
     build_narrator_prompt,
     build_narrator_turn_addon,
+    build_piece_voice_line_query,
     get_postgres_dsn,
     is_placeholder_value,
     narrator_personality_addon,
@@ -22,6 +23,7 @@ from main import (  # noqa: E402
     parse_gemini_coach_response,
     sanitize_hint_text,
     sanitize_lesson_feedback_text,
+    sanitize_piece_voice_line_text,
 )
 
 
@@ -447,6 +449,17 @@ def test_sanitize_lesson_feedback_text_caps_to_two_sentences() -> None:
     )
 
 
+def test_sanitize_piece_voice_line_text_caps_word_count_and_strips_labels() -> None:
+    fallback = "Crush file."
+    raw_text = 'Knight: "A graceful leap toward glory and danger with far too many extra words for one short line indeed."'
+
+    sanitized = sanitize_piece_voice_line_text(raw_text, fallback)
+
+    assert not sanitized.startswith("Knight:")
+    assert '"' not in sanitized
+    assert len(sanitized.split()) <= 20
+
+
 def test_build_gemini_lesson_feedback_query_includes_narrator_addon() -> None:
     from main import GeminiLessonFeedbackRequest, build_gemini_lesson_feedback_query
 
@@ -463,6 +476,45 @@ def test_build_gemini_lesson_feedback_query_includes_narrator_addon() -> None:
     query = build_gemini_lesson_feedback_query(payload)
 
     assert build_narrator_turn_addon("fletcher") in query
+
+
+def test_build_piece_voice_line_query_includes_personality_and_context() -> None:
+    from main import GeminiPieceVoiceRequest
+
+    payload = GeminiPieceVoiceRequest(
+        fen="rnbqkbnr/pppppppp/8/8/4N3/8/PPPPPPPP/RNBQKB1R b KQkq - 1 1",
+        piece_type="knight",
+        piece_color="white",
+        from_square="g1",
+        to_square="e4",
+        is_capture=False,
+        is_check=False,
+        is_near_enemy_king=False,
+        is_attacked=True,
+        is_attacked_by_multiple=False,
+        is_defended=True,
+        is_well_defended=False,
+        is_hanging=False,
+        is_pinned=False,
+        is_retreat=False,
+        is_aggressive_advance=True,
+        is_fork_threat=True,
+        attacker_count=1,
+        defender_count=1,
+        eval_before=20,
+        eval_after=95,
+        eval_delta=75,
+        position_state="equal",
+        move_quality="tactical",
+    )
+
+    query = build_piece_voice_line_query(payload)
+
+    assert "Output exactly one short in-character line." in query
+    assert "Focused piece personality: Knight: fancy, chivalrous" in query
+    assert "Move: g1 to e4" in query
+    assert "Fork threat: yes" in query
+    assert "Move quality: tactical" in query
 
 
 def test_build_narrator_prompt_appends_selected_personality() -> None:
@@ -599,6 +651,52 @@ def test_create_gemini_commentary_returns_structured_json(monkeypatch) -> None:
             "Your knight on f3 is your hardest worker right now."
         ],
     }
+
+
+def test_create_gemini_piece_voice_line_returns_sanitized_line(monkeypatch) -> None:
+    async def fake_run_turn(prompt: str, *, metadata=None, timeout_seconds: float = 0.0) -> str:
+        assert "single short in-character voice line" in prompt
+        assert "Focused piece personality: Rook: brutish, ogre-like, blunt." in prompt
+        assert metadata["piece_type"] == "rook"
+        assert metadata["move_quality"] == "strong"
+        _ = timeout_seconds
+        return '"Rook: Break them now."'
+
+    monkeypatch.setattr("main.GEMINI_LIVE_CLIENT.run_turn", fake_run_turn)
+
+    client = TestClient(app)
+    response = client.post(
+        "/v1/gemini/piece-voice-line",
+        json={
+            "fen": "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBR1 w KQkq - 0 1",
+            "piece_type": "rook",
+            "piece_color": "white",
+            "from_square": "h1",
+            "to_square": "g1",
+            "is_capture": False,
+            "is_check": False,
+            "is_near_enemy_king": False,
+            "is_attacked": False,
+            "is_attacked_by_multiple": False,
+            "is_defended": True,
+            "is_well_defended": True,
+            "is_hanging": False,
+            "is_pinned": False,
+            "is_retreat": False,
+            "is_aggressive_advance": False,
+            "is_fork_threat": False,
+            "attacker_count": 0,
+            "defender_count": 2,
+            "eval_before": 40,
+            "eval_after": 120,
+            "eval_delta": 80,
+            "position_state": "winning",
+            "move_quality": "strong",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"line": "Break them now."}
 
 
 def test_get_postgres_dsn_prefers_railway_private_url(monkeypatch) -> None:

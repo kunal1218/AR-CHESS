@@ -529,6 +529,37 @@ private struct GeminiCoachCommentaryRequestPayload: Encodable {
   let narrator: String
 }
 
+private struct GeminiPieceVoiceLineRequestPayload: Encodable {
+  let fen: String
+  let piece_type: String
+  let piece_color: String
+  let from_square: String
+  let to_square: String
+  let is_capture: Bool
+  let is_check: Bool
+  let is_near_enemy_king: Bool
+  let is_attacked: Bool
+  let is_attacked_by_multiple: Bool
+  let is_defended: Bool
+  let is_well_defended: Bool
+  let is_hanging: Bool
+  let is_pinned: Bool
+  let is_retreat: Bool
+  let is_aggressive_advance: Bool
+  let is_fork_threat: Bool
+  let attacker_count: Int
+  let defender_count: Int
+  let eval_before: Int?
+  let eval_after: Int?
+  let eval_delta: Int?
+  let position_state: String
+  let move_quality: String
+}
+
+private struct GeminiPieceVoiceLineResponsePayload: Decodable {
+  let line: String
+}
+
 private struct GeminiPieceRole: Decodable, Equatable, Hashable {
   let piece: String
   let square: String
@@ -577,6 +608,49 @@ private struct GeminiHintContext {
 private struct GeminiCoachCommentaryContext: Equatable {
   let fen: String
   let narrator: NarratorType
+}
+
+private enum PieceVoicePositionState: String {
+  case winning
+  case equal
+  case losing
+}
+
+private enum PieceVoiceMoveQuality: String {
+  case strong
+  case tactical
+  case defensive
+  case desperate
+  case poor
+  case aggressive
+  case routine
+}
+
+private struct GeminiPieceVoiceLineContext {
+  let fen: String
+  let pieceType: ChessPieceKind
+  let pieceColor: ChessColor
+  let fromSquare: BoardSquare
+  let toSquare: BoardSquare
+  let isCapture: Bool
+  let isCheck: Bool
+  let isNearEnemyKing: Bool
+  let isAttacked: Bool
+  let isAttackedByMultiple: Bool
+  let isDefended: Bool
+  let isWellDefended: Bool
+  let isHanging: Bool
+  let isPinned: Bool
+  let isRetreat: Bool
+  let isAggressiveAdvance: Bool
+  let isForkThreat: Bool
+  let attackerCount: Int
+  let defenderCount: Int
+  let evalBefore: Int?
+  let evalAfter: Int?
+  let evalDelta: Int?
+  let positionState: PieceVoicePositionState
+  let moveQuality: PieceVoiceMoveQuality
 }
 
 private struct SocraticCoachContext: Equatable {
@@ -2059,6 +2133,89 @@ private final class GeminiHintService {
     let payload = try decoder.decode(GeminiCoachCommentary.self, from: data)
     Self.logger.info("Gemini coach commentary ready via backend duration_ms=\(durationMs, privacy: .public)")
     return payload
+  }
+
+  func fetchPieceVoiceLine(for context: GeminiPieceVoiceLineContext) async throws -> String {
+    guard let baseURL = apiBaseURL else {
+      throw NSError(
+        domain: "ARChess.GeminiHint",
+        code: -1009,
+        userInfo: [NSLocalizedDescriptionKey: "Gemini piece voice lines are disabled until ARChessAPIBaseURL is configured."]
+      )
+    }
+
+    var request = URLRequest(
+      url: baseURL
+        .appendingPathComponent("v1")
+        .appendingPathComponent("gemini")
+        .appendingPathComponent("piece-voice-line")
+    )
+    request.httpMethod = "POST"
+    request.timeoutInterval = 8.0
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.setValue("application/json", forHTTPHeaderField: "Accept")
+    request.httpBody = try JSONEncoder().encode(
+      GeminiPieceVoiceLineRequestPayload(
+        fen: context.fen,
+        piece_type: context.pieceType.displayName.lowercased(),
+        piece_color: context.pieceColor.displayName.lowercased(),
+        from_square: context.fromSquare.algebraic,
+        to_square: context.toSquare.algebraic,
+        is_capture: context.isCapture,
+        is_check: context.isCheck,
+        is_near_enemy_king: context.isNearEnemyKing,
+        is_attacked: context.isAttacked,
+        is_attacked_by_multiple: context.isAttackedByMultiple,
+        is_defended: context.isDefended,
+        is_well_defended: context.isWellDefended,
+        is_hanging: context.isHanging,
+        is_pinned: context.isPinned,
+        is_retreat: context.isRetreat,
+        is_aggressive_advance: context.isAggressiveAdvance,
+        is_fork_threat: context.isForkThreat,
+        attacker_count: context.attackerCount,
+        defender_count: context.defenderCount,
+        eval_before: context.evalBefore,
+        eval_after: context.evalAfter,
+        eval_delta: context.evalDelta,
+        position_state: context.positionState.rawValue,
+        move_quality: context.moveQuality.rawValue
+      )
+    )
+
+    let startedAt = Date()
+    let (data, response) = try await session.data(for: request)
+    let durationMs = Int(Date().timeIntervalSince(startedAt) * 1_000)
+    guard let httpResponse = response as? HTTPURLResponse else {
+      throw NSError(
+        domain: "ARChess.GeminiHint",
+        code: -1010,
+        userInfo: [NSLocalizedDescriptionKey: "Gemini piece voice endpoint did not return HTTP."]
+      )
+    }
+
+    guard (200..<300).contains(httpResponse.statusCode) else {
+      let message = String(data: data, encoding: .utf8) ?? "Unexpected Gemini piece voice response."
+      Self.logger.error("Gemini backend piece voice request failed status=\(httpResponse.statusCode, privacy: .public) duration_ms=\(durationMs, privacy: .public)")
+      throw NSError(
+        domain: "ARChess.GeminiHint",
+        code: httpResponse.statusCode,
+        userInfo: [NSLocalizedDescriptionKey: message]
+      )
+    }
+
+    let payload = try JSONDecoder().decode(GeminiPieceVoiceLineResponsePayload.self, from: data)
+    let line = payload.line.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !line.isEmpty else {
+      throw NSError(
+        domain: "ARChess.GeminiHint",
+        code: -1011,
+        userInfo: [NSLocalizedDescriptionKey: "Gemini backend returned no piece voice line."]
+      )
+    }
+
+    Self.logger.info("Gemini piece voice ready via backend duration_ms=\(durationMs, privacy: .public)")
+    return line
   }
 
   private func sanitize(_ raw: String, fallback: String) -> String {
@@ -5576,6 +5733,8 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   private static let kingCookedCooldownPly = 15
   private static let substantialGainThreshold = 120
   private static let substantialDropThreshold = -140
+  private static let pieceVoiceLineChance = 1.0 / 3.0
+  private static let pieceVoiceLineWordLimit = 20
 
   struct ReactionCue {
     enum Kind {
@@ -5608,9 +5767,14 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     }
   }
 
-  private struct PendingGeminiNarration {
+  private enum GeneratedNarrationStyle {
+    case gemini(title: String)
+    case pieceVoice(speaker: PersonalitySpeaker)
+  }
+
+  private struct PendingGeneratedNarration {
     let text: String
-    let title: String
+    let style: GeneratedNarrationStyle
   }
 
   @Published private(set) var caption: Caption?
@@ -5625,6 +5789,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   @Published private(set) var isHintLoading = false
   @Published private(set) var geminiDebugLines: [String] = []
   @Published private(set) var coachLines: [String] = []
+  @Published private(set) var pieceVoiceLines: [String] = []
   @Published private(set) var topWorkers: [GeminiPieceRole] = []
   @Published private(set) var topTraitors: [GeminiPieceRole] = []
   @Published private(set) var stockfishDebugStatusText = "Open Stockfish debug to inspect engine candidates."
@@ -5658,7 +5823,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   private var pendingHintReveal = false
   private var pendingHintNarration = false
   private var narratedHintKeys: Set<String> = []
-  private var pendingGeminiNarration: PendingGeminiNarration?
+  private var pendingGeneratedNarrations: [PendingGeneratedNarration] = []
   private var geminiNarrationRetryWorkItem: DispatchWorkItem?
   private var nextKingCookedAllowedPly: [ChessColor: Int] = [:]
   private var lastGeminiStatusSnapshot: GeminiLiveStatusPayload?
@@ -5761,7 +5926,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     utteranceCaptions.removeAll()
     geminiNarrationRetryWorkItem?.cancel()
     geminiNarrationRetryWorkItem = nil
-    pendingGeminiNarration = nil
+    pendingGeneratedNarrations.removeAll()
     caption = nil
     cachedAnalysis = nil
     stockfishDebugAnalysisCache.removeAll()
@@ -5783,6 +5948,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     lastGeminiStatusSnapshot = nil
     geminiDebugLines = []
     coachLines = []
+    pieceVoiceLines = []
     topWorkers = []
     topTraitors = []
     stockfishDebugStatusText = "Open Stockfish debug to inspect engine candidates."
@@ -5858,7 +6024,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     pieceAudioBusyDurationProvider = nil
     geminiNarrationRetryWorkItem?.cancel()
     geminiNarrationRetryWorkItem = nil
-    pendingGeminiNarration = nil
+    pendingGeneratedNarrations.removeAll()
   }
 
   func analyzeCurrentPosition() async {
@@ -6052,6 +6218,15 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
         : defaultHintStatus()
     }
 
+    maybeTriggerPieceVoiceLine(
+      move: move,
+      before: beforeState,
+      after: afterState,
+      beforeAnalysis: beforeAnalysis,
+      afterAnalysis: afterAnalysis,
+      evaluationDelta: evaluationDelta
+    )
+
     let assessment = classifyMove(
       before: beforeAnalysis,
       after: afterAnalysis,
@@ -6124,7 +6299,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     if !synthesizer.isSpeaking {
       AmbientMusicController.shared.setSpeechActive(false)
       caption = nil
-      flushPendingGeminiNarrationIfPossible()
+      flushPendingGeneratedNarrationIfPossible()
     }
   }
 
@@ -6133,7 +6308,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     if !synthesizer.isSpeaking {
       AmbientMusicController.shared.setSpeechActive(false)
       caption = nil
-      flushPendingGeminiNarrationIfPossible()
+      flushPendingGeneratedNarrationIfPossible()
     }
   }
 
@@ -6272,6 +6447,317 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
         return left.1.kind.forkThreatPriority > right.1.kind.forkThreatPriority
       }
       .map(\.0)
+  }
+
+  private func maybeTriggerPieceVoiceLine(
+    move: ChessMove,
+    before beforeState: ChessGameState,
+    after afterState: ChessGameState,
+    beforeAnalysis: StockfishAnalysis?,
+    afterAnalysis: StockfishAnalysis?,
+    evaluationDelta: MoveEvaluationDelta?
+  ) {
+    guard hintService.isConfigured, shouldTriggerPieceVoiceLine() else {
+      return
+    }
+
+    let context = buildPieceVoiceLineContext(
+      move: move,
+      before: beforeState,
+      after: afterState,
+      beforeAnalysis: beforeAnalysis,
+      afterAnalysis: afterAnalysis,
+      evaluationDelta: evaluationDelta
+    )
+    let speaker = personalitySpeaker(for: move.piece.kind)
+
+    appendGeminiDebug("Triggering Gemini piece voice for \(speaker.displayName.lowercased()) on \(move.to.algebraic).")
+
+    Task { @MainActor [weak self] in
+      guard let self else {
+        return
+      }
+
+      do {
+        let line = try await self.hintService.fetchPieceVoiceLine(for: context)
+        guard self.stateProvider?()?.fenString == afterState.fenString else {
+          self.appendGeminiDebug("Dropped stale Gemini piece voice line because the board already advanced.")
+          return
+        }
+
+        let sanitizedLine = self.cappedPieceVoiceLineText(line)
+        guard !sanitizedLine.isEmpty else {
+          self.appendGeminiDebug("Gemini piece voice line came back empty after sanitization.")
+          return
+        }
+
+        let debugLine = "\(speaker.displayName): \(sanitizedLine)"
+        self.recordPieceVoiceLine(debugLine)
+        _ = self.speakGeneratedPieceVoiceLine(text: sanitizedLine, speaker: speaker, priority: .normal)
+      } catch is CancellationError {
+        return
+      } catch {
+        self.appendGeminiDebug("Gemini piece voice request failed: \(error.localizedDescription)")
+      }
+    }
+  }
+
+  private func shouldTriggerPieceVoiceLine() -> Bool {
+    Double.random(in: 0..<1) < Self.pieceVoiceLineChance
+  }
+
+  private func buildPieceVoiceLineContext(
+    move: ChessMove,
+    before beforeState: ChessGameState,
+    after afterState: ChessGameState,
+    beforeAnalysis: StockfishAnalysis?,
+    afterAnalysis: StockfishAnalysis?,
+    evaluationDelta: MoveEvaluationDelta?
+  ) -> GeminiPieceVoiceLineContext {
+    let moverColor = move.piece.color
+    let opponent = moverColor.opponent
+    let enemyKingSquare = afterState.kingSquare(for: opponent)
+    let beforeEnemyKingSquare = beforeState.kingSquare(for: opponent)
+    let attackerOrigins = afterState.attackOrigins(on: move.to, by: opponent)
+    let defenderOrigins = afterState.attackOrigins(on: move.to, by: moverColor)
+    let beforeAttackerOrigins = beforeState.attackOrigins(on: move.from, by: opponent)
+    let movedPieceState = stateByReplacingTurn(in: afterState, with: moverColor)
+    let movedPieceLegalMoves = movedPieceState.legalMoves(from: move.to)
+    let movedPieceThreatTargets = Set(
+      movedPieceLegalMoves.compactMap { candidate -> BoardSquare? in
+        guard let target = afterState.piece(at: candidate.to),
+              target.color == opponent else {
+          return nil
+        }
+        return candidate.to
+      }
+    )
+
+    let beforeEnemyKingDistance = beforeEnemyKingSquare.map { chebyshevDistance(from: move.from, to: $0) } ?? 8
+    let afterEnemyKingDistance = enemyKingSquare.map { chebyshevDistance(from: move.to, to: $0) } ?? 8
+    let kingZoneThreat = enemyKingSquare.map { kingSquare in
+      movedPieceLegalMoves.contains { candidate in
+        max(abs(candidate.to.file - kingSquare.file), abs(candidate.to.rank - kingSquare.rank)) <= 1
+      }
+    } ?? false
+    let isNearEnemyKing = move.piece.kind != .king
+      && (afterEnemyKingDistance <= 2 || kingZoneThreat || afterState.isInCheck(for: opponent))
+    let defenderCount = defenderOrigins.filter { $0 != move.to }.count
+    let attackerCount = attackerOrigins.count
+    let isAttacked = attackerCount > 0
+    let isDefended = defenderCount > 0
+    let isHanging = isAttacked && !isDefended
+    let isPinned = afterState.isPiecePinned(at: move.to)
+    let isCapture = move.captured != nil || move.isEnPassant
+    let isCheck = afterState.isInCheck(for: opponent)
+    let isRetreat = !isCapture
+      && !isCheck
+      && !move.isEnPassant
+      && beforeAttackerOrigins.count > 0
+      && afterEnemyKingDistance > beforeEnemyKingDistance
+    let isAggressiveAdvance = isCheck
+      || isCapture
+      || afterEnemyKingDistance < beforeEnemyKingDistance
+      || movedDeeperIntoEnemyHalf(move)
+    let isForkThreat = threatensFork(
+      movedPiece: move.piece,
+      targetSquares: movedPieceThreatTargets,
+      in: afterState,
+      enemyKingSquare: enemyKingSquare
+    )
+    let evalBefore = evaluationDelta?.evalBefore ?? beforeAnalysis?.perspectiveScore(for: moverColor)
+    let evalAfter = evaluationDelta?.evalAfter ?? afterAnalysis?.perspectiveScore(for: moverColor)
+    let evalDelta = evaluationDelta?.deltaW
+      ?? (evalBefore != nil && evalAfter != nil ? (evalAfter! - evalBefore!) : nil)
+
+    return GeminiPieceVoiceLineContext(
+      fen: afterState.fenString,
+      pieceType: move.piece.kind,
+      pieceColor: moverColor,
+      fromSquare: move.from,
+      toSquare: move.to,
+      isCapture: isCapture,
+      isCheck: isCheck,
+      isNearEnemyKing: isNearEnemyKing,
+      isAttacked: isAttacked,
+      isAttackedByMultiple: attackerCount >= 2,
+      isDefended: isDefended,
+      isWellDefended: defenderCount >= 2,
+      isHanging: isHanging,
+      isPinned: isPinned,
+      isRetreat: isRetreat,
+      isAggressiveAdvance: isAggressiveAdvance,
+      isForkThreat: isForkThreat,
+      attackerCount: attackerCount,
+      defenderCount: defenderCount,
+      evalBefore: evalBefore,
+      evalAfter: evalAfter,
+      evalDelta: evalDelta,
+      positionState: pieceVoicePositionState(evalAfter),
+      moveQuality: pieceVoiceMoveQuality(
+        move: move,
+        evalDelta: evalDelta,
+        isCheck: isCheck,
+        isCapture: isCapture,
+        isAttacked: isAttacked,
+        isRetreat: isRetreat,
+        isForkThreat: isForkThreat
+      )
+    )
+  }
+
+  private func pieceVoicePositionState(_ evalAfter: Int?) -> PieceVoicePositionState {
+    guard let evalAfter else {
+      return .equal
+    }
+
+    switch evalAfter {
+    case 120...:
+      return .winning
+    case ...(-120):
+      return .losing
+    default:
+      return .equal
+    }
+  }
+
+  private func pieceVoiceMoveQuality(
+    move: ChessMove,
+    evalDelta: Int?,
+    isCheck: Bool,
+    isCapture: Bool,
+    isAttacked: Bool,
+    isRetreat: Bool,
+    isForkThreat: Bool
+  ) -> PieceVoiceMoveQuality {
+    if let evalDelta, evalDelta >= 140 {
+      return .strong
+    }
+    if isCheck || isForkThreat {
+      return .tactical
+    }
+    if let evalDelta, evalDelta <= -140 {
+      return .poor
+    }
+    if let evalDelta, evalDelta >= 60, isAttacked {
+      return .desperate
+    }
+    if isRetreat || (isAttacked && !isCapture) {
+      return .defensive
+    }
+    if isCapture || move.piece.kind == .pawn {
+      return .aggressive
+    }
+    return .routine
+  }
+
+  private func personalitySpeaker(for kind: ChessPieceKind) -> PersonalitySpeaker {
+    switch kind {
+    case .pawn:
+      return .pawn
+    case .rook:
+      return .rook
+    case .knight:
+      return .knight
+    case .bishop:
+      return .bishop
+    case .queen:
+      return .queen
+    case .king:
+      return .king
+    }
+  }
+
+  private func recordPieceVoiceLine(_ line: String) {
+    pieceVoiceLines.append(line)
+    if pieceVoiceLines.count > 8 {
+      pieceVoiceLines.removeFirst(pieceVoiceLines.count - 8)
+    }
+    appendGeminiDebug("Piece voice ready: \(line)")
+  }
+
+  private func cappedPieceVoiceLineText(_ text: String, maxCharacters: Int = 120) -> String {
+    let normalized = text
+      .replacingOccurrences(of: "[“”\"]", with: "", options: .regularExpression)
+      .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !normalized.isEmpty else {
+      return ""
+    }
+
+    let withoutLabel = normalized.replacingOccurrences(
+      of: #"^[A-Za-z ]{2,20}:\s*"#,
+      with: "",
+      options: .regularExpression
+    )
+    let cappedBySentence = cappedNarrationText(withoutLabel, maxSentences: 2, maxCharacters: maxCharacters).text
+    let words = cappedBySentence.split(separator: " ")
+    let limitedWords = words.prefix(Self.pieceVoiceLineWordLimit)
+    guard !limitedWords.isEmpty else {
+      return ""
+    }
+
+    var limited = limitedWords.map(String.init).joined(separator: " ")
+    if words.count > Self.pieceVoiceLineWordLimit {
+      limited = limited.trimmingCharacters(in: CharacterSet(charactersIn: " ,;:-"))
+      if !limited.hasSuffix(".") && !limited.hasSuffix("!") && !limited.hasSuffix("?") {
+        limited.append("...")
+      }
+    }
+    return limited
+  }
+
+  private func chebyshevDistance(from source: BoardSquare, to target: BoardSquare) -> Int {
+    max(abs(source.file - target.file), abs(source.rank - target.rank))
+  }
+
+  private func movedDeeperIntoEnemyHalf(_ move: ChessMove) -> Bool {
+    switch move.piece.color {
+    case .white:
+      return move.to.rank > move.from.rank
+    case .black:
+      return move.to.rank < move.from.rank
+    }
+  }
+
+  private func threatensFork(
+    movedPiece: ChessPieceState,
+    targetSquares: Set<BoardSquare>,
+    in state: ChessGameState,
+    enemyKingSquare: BoardSquare?
+  ) -> Bool {
+    guard !targetSquares.isEmpty else {
+      return false
+    }
+
+    var threatScore = 0
+    for square in targetSquares {
+      if square == enemyKingSquare {
+        threatScore += 1
+        continue
+      }
+
+      guard let target = state.piece(at: square) else {
+        continue
+      }
+
+      switch target.kind {
+      case .queen, .rook, .bishop, .knight:
+        threatScore += 1
+      case .king:
+        threatScore += 1
+      case .pawn:
+        if movedPiece.kind == .knight || movedPiece.kind == .queen {
+          threatScore += 1
+        }
+      }
+
+      if threatScore >= 2 {
+        return true
+      }
+    }
+
+    return false
   }
 
   private func classifyMove(
@@ -7107,68 +7593,116 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   }
 
   private func speakGeminiNarration(text: String, title: String, priority: SpeechPriority) -> Bool {
-    let capped = cappedNarrationText(text)
-    guard !capped.text.isEmpty else {
+    speakGeneratedNarration(
+      text: text,
+      style: .gemini(title: title),
+      priority: priority,
+      maxCharacters: geminiNarrationCharacterLimit
+    )
+  }
+
+  private func speakGeneratedPieceVoiceLine(
+    text: String,
+    speaker: PersonalitySpeaker,
+    priority: SpeechPriority
+  ) -> Bool {
+    speakGeneratedNarration(
+      text: text,
+      style: .pieceVoice(speaker: speaker),
+      priority: priority,
+      maxCharacters: 120
+    )
+  }
+
+  private func speakGeneratedNarration(
+    text: String,
+    style: GeneratedNarrationStyle,
+    priority: SpeechPriority,
+    maxCharacters: Int
+  ) -> Bool {
+    let sanitizedText: String
+    switch style {
+    case .gemini:
+      sanitizedText = cappedNarrationText(text, maxCharacters: maxCharacters).text
+    case .pieceVoice:
+      sanitizedText = cappedPieceVoiceLineText(text, maxCharacters: maxCharacters)
+    }
+
+    guard !sanitizedText.isEmpty else {
       return false
     }
 
     let pieceAudioBusyDuration = pieceAudioBusyDurationProvider?() ?? 0
     if synthesizer.isSpeaking || pieceAudioBusyDuration > 0.05 {
       let retryDelay = max(pieceAudioBusyDuration, priority == .urgent ? 0.14 : 0.08)
-      queuePendingGeminiNarration(text: capped.text, title: title, retryAfter: retryDelay)
+      queuePendingGeneratedNarration(text: sanitizedText, style: style, retryAfter: retryDelay)
       return true
     }
 
-    return startGeminiNarrationNow(text: capped.text, title: title)
+    return startGeneratedNarrationNow(text: sanitizedText, style: style)
   }
 
-  private func startGeminiNarrationNow(text: String, title: String) -> Bool {
+  private func startGeneratedNarrationNow(text: String, style: GeneratedNarrationStyle) -> Bool {
     let utterance = AVSpeechUtterance(string: text)
     utterance.voice = AVSpeechSynthesisVoice(language: "en-US")
-    utterance.pitchMultiplier = 1.02
-    utterance.rate = 0.47
-    utterance.volume = 0.92
+
+    switch style {
+    case .gemini(let title):
+      utterance.pitchMultiplier = 1.02
+      utterance.rate = 0.47
+      utterance.volume = 0.92
+      utteranceCaptions[ObjectIdentifier(utterance)] = Caption(
+        title: title,
+        line: text,
+        imageAssetName: "GeminiNarratorPortrait"
+      )
+    case .pieceVoice(let speaker):
+      utterance.pitchMultiplier = min(max(speaker.defaultPitch, 0.5), 2.0)
+      utterance.rate = min(max(speaker.defaultRate, 0.1), 0.65)
+      utterance.volume = min(max(speaker.defaultVolume, 0.0), 1.0)
+      utteranceCaptions[ObjectIdentifier(utterance)] = Caption(speaker: speaker, line: text)
+    }
+
     utterance.preUtteranceDelay = 0.02
-    utteranceCaptions[ObjectIdentifier(utterance)] = Caption(
-      title: title,
-      line: text,
-      imageAssetName: "GeminiNarratorPortrait"
-    )
     maybeHighlightNarrationFocus(text)
     synthesizer.speak(utterance)
     return true
   }
 
-  private func queuePendingGeminiNarration(text: String, title: String, retryAfter delay: TimeInterval) {
-    pendingGeminiNarration = PendingGeminiNarration(text: text, title: title)
+  private func queuePendingGeneratedNarration(
+    text: String,
+    style: GeneratedNarrationStyle,
+    retryAfter delay: TimeInterval
+  ) {
+    pendingGeneratedNarrations.append(PendingGeneratedNarration(text: text, style: style))
+    schedulePendingGeneratedNarrationFlush(after: delay)
+  }
+
+  private func schedulePendingGeneratedNarrationFlush(after delay: TimeInterval) {
     geminiNarrationRetryWorkItem?.cancel()
 
     let workItem = DispatchWorkItem { [weak self] in
-      self?.flushPendingGeminiNarrationIfPossible()
+      self?.flushPendingGeneratedNarrationIfPossible()
     }
     geminiNarrationRetryWorkItem = workItem
     DispatchQueue.main.asyncAfter(deadline: .now() + max(delay, 0.05), execute: workItem)
   }
 
-  private func flushPendingGeminiNarrationIfPossible() {
-    guard let pendingGeminiNarration else {
+  private func flushPendingGeneratedNarrationIfPossible() {
+    guard let pendingGeneratedNarration = pendingGeneratedNarrations.first else {
       return
     }
 
     let pieceAudioBusyDuration = pieceAudioBusyDurationProvider?() ?? 0
     guard !synthesizer.isSpeaking, pieceAudioBusyDuration <= 0.05 else {
-      queuePendingGeminiNarration(
-        text: pendingGeminiNarration.text,
-        title: pendingGeminiNarration.title,
-        retryAfter: max(pieceAudioBusyDuration, 0.08)
-      )
+      schedulePendingGeneratedNarrationFlush(after: max(pieceAudioBusyDuration, 0.08))
       return
     }
 
-    self.pendingGeminiNarration = nil
+    pendingGeneratedNarrations.removeFirst()
     geminiNarrationRetryWorkItem?.cancel()
     geminiNarrationRetryWorkItem = nil
-    _ = startGeminiNarrationNow(text: pendingGeminiNarration.text, title: pendingGeminiNarration.title)
+    _ = startGeneratedNarrationNow(text: pendingGeneratedNarration.text, style: pendingGeneratedNarration.style)
   }
 
   private func maybeHighlightNarrationFocus(_ text: String) {
@@ -9123,6 +9657,25 @@ private struct NativeARExperienceView: View {
           }
         }
 
+        VStack(alignment: .leading, spacing: 6) {
+          Text("Piece Voice Lines")
+            .font(.system(size: 12, weight: .bold, design: .rounded))
+            .foregroundStyle(Color.white.opacity(0.88))
+
+          if commentary.pieceVoiceLines.isEmpty {
+            Text("No piece voices yet.")
+              .font(.system(size: 13, weight: .medium, design: .rounded))
+              .foregroundStyle(Color.white.opacity(0.68))
+          } else {
+            ForEach(Array(commentary.pieceVoiceLines.enumerated()), id: \.offset) { _, line in
+              Text(line)
+                .font(.system(size: 12, weight: .semibold, design: .rounded))
+                .foregroundStyle(Color(red: 0.86, green: 0.94, blue: 0.88))
+                .lineSpacing(2)
+            }
+          }
+        }
+
         if commentary.geminiDebugLines.isEmpty {
           Text("No Gemini activity yet.")
             .font(.system(size: 13, weight: .medium, design: .rounded))
@@ -10007,11 +10560,119 @@ private struct ChessGameState {
   }
 
   func isInCheck(for color: ChessColor) -> Bool {
-    guard let kingSquare = board.first(where: { $0.value.color == color && $0.value.kind == .king })?.key else {
+    guard let kingSquare = kingSquare(for: color) else {
       return false
     }
 
     return isSquareAttacked(kingSquare, by: color.opponent)
+  }
+
+  func kingSquare(for color: ChessColor) -> BoardSquare? {
+    board.first(where: { $0.value.color == color && $0.value.kind == .king })?.key
+  }
+
+  func attackOrigins(on target: BoardSquare, by attacker: ChessColor) -> [BoardSquare] {
+    var origins: [BoardSquare] = []
+
+    for (origin, piece) in board where piece.color == attacker {
+      let attacksTarget: Bool
+      switch piece.kind {
+      case .pawn:
+        let direction = piece.color == .white ? 1 : -1
+        attacksTarget = origin.offset(file: -1, rank: direction) == target
+          || origin.offset(file: 1, rank: direction) == target
+      case .knight:
+        let offsets = [
+          (1, 2), (2, 1), (2, -1), (1, -2),
+          (-1, -2), (-2, -1), (-2, 1), (-1, 2),
+        ]
+        attacksTarget = offsets.contains { origin.offset(file: $0.0, rank: $0.1) == target }
+      case .bishop:
+        attacksTarget = attacksAlongDirections(
+          from: origin,
+          target: target,
+          directions: [(1, 1), (1, -1), (-1, -1), (-1, 1)]
+        )
+      case .rook:
+        attacksTarget = attacksAlongDirections(
+          from: origin,
+          target: target,
+          directions: [(1, 0), (-1, 0), (0, 1), (0, -1)]
+        )
+      case .queen:
+        attacksTarget = attacksAlongDirections(
+          from: origin,
+          target: target,
+          directions: [
+            (1, 1), (1, -1), (-1, -1), (-1, 1),
+            (1, 0), (-1, 0), (0, 1), (0, -1),
+          ]
+        )
+      case .king:
+        attacksTarget = abs(origin.file - target.file) <= 1 && abs(origin.rank - target.rank) <= 1
+      }
+
+      if attacksTarget {
+        origins.append(origin)
+      }
+    }
+
+    return origins
+  }
+
+  func isPiecePinned(at square: BoardSquare) -> Bool {
+    guard let piece = board[square],
+          piece.kind != .king,
+          let ownKing = kingSquare(for: piece.color) else {
+      return false
+    }
+
+    let deltaFile = square.file - ownKing.file
+    let deltaRank = square.rank - ownKing.rank
+    guard deltaFile == 0 || deltaRank == 0 || abs(deltaFile) == abs(deltaRank) else {
+      return false
+    }
+
+    let stepFile = deltaFile == 0 ? 0 : deltaFile / abs(deltaFile)
+    let stepRank = deltaRank == 0 ? 0 : deltaRank / abs(deltaRank)
+
+    var current = ownKing
+    while let next = current.offset(file: stepFile, rank: stepRank) {
+      current = next
+      if next == square {
+        break
+      }
+      if board[next] != nil {
+        return false
+      }
+    }
+
+    guard current == square else {
+      return false
+    }
+
+    while let next = current.offset(file: stepFile, rank: stepRank) {
+      current = next
+      guard let occupant = board[next] else {
+        continue
+      }
+      guard occupant.color == piece.color.opponent else {
+        return false
+      }
+
+      switch occupant.kind {
+      case .queen:
+        return true
+      case .rook:
+        return stepFile == 0 || stepRank == 0
+      case .bishop:
+        return abs(stepFile) == 1 && abs(stepRank) == 1
+      default:
+        return false
+      }
+    }
+
+    return false
   }
 
   private func legalMoves(from square: BoardSquare, for color: ChessColor) -> [ChessMove] {
@@ -10270,48 +10931,7 @@ private struct ChessGameState {
   }
 
   private func isSquareAttacked(_ target: BoardSquare, by attacker: ChessColor) -> Bool {
-    for (origin, piece) in board where piece.color == attacker {
-      switch piece.kind {
-      case .pawn:
-        let direction = piece.color == .white ? 1 : -1
-        if origin.offset(file: -1, rank: direction) == target || origin.offset(file: 1, rank: direction) == target {
-          return true
-        }
-      case .knight:
-        let offsets = [
-          (1, 2), (2, 1), (2, -1), (1, -2),
-          (-1, -2), (-2, -1), (-2, 1), (-1, 2),
-        ]
-        if offsets.contains(where: { origin.offset(file: $0.0, rank: $0.1) == target }) {
-          return true
-        }
-      case .bishop:
-        if attacksAlongDirections(from: origin, target: target, directions: [(1, 1), (1, -1), (-1, -1), (-1, 1)]) {
-          return true
-        }
-      case .rook:
-        if attacksAlongDirections(from: origin, target: target, directions: [(1, 0), (-1, 0), (0, 1), (0, -1)]) {
-          return true
-        }
-      case .queen:
-        if attacksAlongDirections(
-          from: origin,
-          target: target,
-          directions: [
-            (1, 1), (1, -1), (-1, -1), (-1, 1),
-            (1, 0), (-1, 0), (0, 1), (0, -1),
-          ]
-        ) {
-          return true
-        }
-      case .king:
-        if abs(origin.file - target.file) <= 1, abs(origin.rank - target.rank) <= 1 {
-          return true
-        }
-      }
-    }
-
-    return false
+    !attackOrigins(on: target, by: attacker).isEmpty
   }
 
   private func attacksAlongDirections(

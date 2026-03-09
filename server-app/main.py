@@ -296,6 +296,87 @@ class GeminiCoachResponse(BaseModel):
         return cleaned[:3]
 
 
+class GeminiPieceVoiceRequest(BaseModel):
+    fen: str = Field(..., min_length=1, max_length=256)
+    piece_type: str = Field(..., min_length=1, max_length=16)
+    piece_color: str = Field(..., min_length=1, max_length=16)
+    from_square: str = Field(..., min_length=2, max_length=2)
+    to_square: str = Field(..., min_length=2, max_length=2)
+    is_capture: bool = False
+    is_check: bool = False
+    is_near_enemy_king: bool = False
+    is_attacked: bool = False
+    is_attacked_by_multiple: bool = False
+    is_defended: bool = False
+    is_well_defended: bool = False
+    is_hanging: bool = False
+    is_pinned: bool = False
+    is_retreat: bool = False
+    is_aggressive_advance: bool = False
+    is_fork_threat: bool = False
+    attacker_count: int = Field(default=0, ge=0, le=16)
+    defender_count: int = Field(default=0, ge=0, le=16)
+    eval_before: int | None = Field(default=None, ge=-100000, le=100000)
+    eval_after: int | None = Field(default=None, ge=-100000, le=100000)
+    eval_delta: int | None = Field(default=None, ge=-100000, le=100000)
+    position_state: str = Field(..., min_length=1, max_length=16)
+    move_quality: str = Field(..., min_length=1, max_length=32)
+
+    @field_validator("fen")
+    @classmethod
+    def validate_piece_voice_fen(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("fen must not be empty.")
+        return normalized
+
+    @field_validator("piece_type")
+    @classmethod
+    def validate_piece_type(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"pawn", "knight", "bishop", "rook", "queen", "king"}:
+            raise ValueError("piece_type must be one of pawn, knight, bishop, rook, queen, king.")
+        return normalized
+
+    @field_validator("piece_color")
+    @classmethod
+    def validate_piece_color(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"white", "black"}:
+            raise ValueError("piece_color must be 'white' or 'black'.")
+        return normalized
+
+    @field_validator("from_square", "to_square")
+    @classmethod
+    def validate_piece_voice_square(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if not re.fullmatch(r"[a-h][1-8]", normalized):
+            raise ValueError("piece voice squares must use algebraic notation such as e4.")
+        return normalized
+
+    @field_validator("position_state")
+    @classmethod
+    def validate_position_state(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"winning", "equal", "losing"}:
+            raise ValueError("position_state must be winning, equal, or losing.")
+        return normalized
+
+    @field_validator("move_quality")
+    @classmethod
+    def validate_move_quality(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"strong", "tactical", "defensive", "desperate", "poor", "aggressive", "routine"}:
+            raise ValueError(
+                "move_quality must be strong, tactical, defensive, desperate, poor, aggressive, or routine."
+            )
+        return normalized
+
+
+class GeminiPieceVoiceResponse(BaseModel):
+    line: str
+
+
 GEMINI_HINT_SYSTEM_PROMPT = """
 You are a Grandmaster Chess Consultant. You will receive a FEN and a short PGN sequence.
 Use the FEN to identify tactical geometry (x-rays, pins, hanging pieces) and the PGN to identify strategic momentum and player intent.
@@ -390,6 +471,36 @@ If the position is unclear or multiple interpretations are possible, still choos
 
 def build_narrator_prompt(narrator: str) -> str:
     return f"{GEMINI_COACH_BASE_SYSTEM_PROMPT}\n\n{narrator_personality_addon(narrator)}"
+
+
+PIECE_VOICE_PERSONALITY_RULES = {
+    "pawn": (
+        "Pawn: bloodthirsty barbarian frontline warrior. Loves combat. "
+        "Proud to be in the trenches. Aggressive, savage, eager for battle."
+    ),
+    "queen": (
+        "Queen: arrogant backseat driver. Bossy, elite, judgmental, hates getting her hands dirty, "
+        "annoyed when forced into danger."
+    ),
+    "king": (
+        "King: aggressive and commanding when safe or winning; cowardly, panicked, and whiny when unsafe or losing."
+    ),
+    "bishop": (
+        "Bishop: ultra-religious and militant. Speaks with righteous, zealous, aggressive conviction. "
+        "Sounds holy but dangerous."
+    ),
+    "rook": "Rook: brutish, ogre-like, blunt. Uses very short phrases. Sounds like a crushing force.",
+    "knight": (
+        "Knight: fancy, chivalrous, elegant, theatrical noble warrior. Refined and stylish even when threatening."
+    ),
+}
+
+
+def piece_voice_personality_instructions(piece_type: str) -> str:
+    normalized = piece_type.strip().lower()
+    if normalized not in PIECE_VOICE_PERSONALITY_RULES:
+        raise ValueError(f"Unsupported piece voice personality: {normalized}")
+    return PIECE_VOICE_PERSONALITY_RULES[normalized]
 
 
 def env_float(name: str, default: float) -> float:
@@ -511,6 +622,69 @@ def sanitize_lesson_feedback_text(raw_text: str, fallback: str) -> str:
     return condensed
 
 
+def gemini_fallback_piece_voice_line(payload: GeminiPieceVoiceRequest) -> str:
+    if payload.is_check:
+        return {
+            "pawn": "Point me at their king.",
+            "knight": "A noble check, at last.",
+            "bishop": "Judgment reaches the throne.",
+            "rook": "Break king now.",
+            "queen": "I told you I'd handle it.",
+            "king": "Press them. No mercy.",
+        }[payload.piece_type]
+
+    if payload.is_capture:
+        return {
+            "pawn": "Good. More blood.",
+            "knight": "A most elegant kill.",
+            "bishop": "Their sins are counted.",
+            "rook": "Smash done.",
+            "queen": "I cleaned it up.",
+            "king": "They fold before me.",
+        }[payload.piece_type]
+
+    if payload.position_state == "losing":
+        return {
+            "pawn": "Then we die fighting.",
+            "knight": "A grim board, but onward.",
+            "bishop": "Faith sharpens under siege.",
+            "rook": "Still crush.",
+            "queen": "This mess is beneath me.",
+            "king": "Where is my cover?",
+        }[payload.piece_type]
+
+    return {
+        "pawn": "Front line's where I belong.",
+        "knight": "A graceful leap.",
+        "bishop": "The diagonal is sanctified.",
+        "rook": "Crush file.",
+        "queen": "Try to keep up.",
+        "king": "They will kneel.",
+    }[payload.piece_type]
+
+
+def sanitize_piece_voice_line_text(raw_text: str, fallback: str) -> str:
+    condensed = re.sub(r"\s+", " ", raw_text).strip().strip("\"'")
+    condensed = re.sub(
+        r"^(pawn|knight|bishop|rook|queen|king)\s*:\s*",
+        "",
+        condensed,
+        flags=re.IGNORECASE,
+    )
+    condensed = condensed.strip("\"' ")
+    condensed = truncate_narration_text(condensed, max_sentences=2, max_characters=120)
+    if not condensed:
+        return fallback
+
+    words = condensed.split()
+    if len(words) > 20:
+        condensed = " ".join(words[:20]).rstrip(" ,;:-")
+        if condensed and condensed[-1] not in ".!?":
+            condensed += "..."
+
+    return condensed or fallback
+
+
 def build_gemini_user_query(payload: GeminiHintRequest) -> str:
     piece_name = payload.moving_piece or "piece"
     capture_text = "yes" if payload.is_capture else "no"
@@ -550,6 +724,79 @@ def build_gemini_coach_query() -> str:
     return (
         "Analyze this FEN and return the top 3 workers, top 3 traitors, "
         "and 1 to 3 coach lines for the side to move."
+    )
+
+
+def build_piece_voice_line_query(payload: GeminiPieceVoiceRequest) -> str:
+    eval_before = "unknown" if payload.eval_before is None else str(payload.eval_before)
+    eval_after = "unknown" if payload.eval_after is None else str(payload.eval_after)
+    eval_delta = "unknown" if payload.eval_delta is None else str(payload.eval_delta)
+    capture_text = "yes" if payload.is_capture else "no"
+    check_text = "yes" if payload.is_check else "no"
+    near_king_text = "yes" if payload.is_near_enemy_king else "no"
+    attacked_text = "yes" if payload.is_attacked else "no"
+    attacked_multiple_text = "yes" if payload.is_attacked_by_multiple else "no"
+    defended_text = "yes" if payload.is_defended else "no"
+    well_defended_text = "yes" if payload.is_well_defended else "no"
+    hanging_text = "yes" if payload.is_hanging else "no"
+    pinned_text = "yes" if payload.is_pinned else "no"
+    retreat_text = "yes" if payload.is_retreat else "no"
+    aggressive_text = "yes" if payload.is_aggressive_advance else "no"
+    fork_text = "yes" if payload.is_fork_threat else "no"
+    return (
+        "You are generating a single short in-character voice line spoken by the chess piece that was just moved. "
+        "You must speak as the moved piece itself, not as a narrator. "
+        "Your line must reflect: "
+        "the piece's personality, the current tactical / positional context, whether the position is winning, equal, or losing, "
+        "whether the piece is in danger, whether the piece is threatening the enemy king, "
+        "and whether the move was strong, desperate, defensive, aggressive, or poor. "
+        "Keep the line short, vivid, and punchy. Usually 4 to 14 words. Maximum 20 words. "
+        "Output only the line itself.\n\n"
+        "Piece personality rules:\n"
+        "Pawn: bloodthirsty barbarian frontline warrior. Loves combat. Proud to be in the trenches. "
+        "Aggressive, savage, eager for battle.\n"
+        "Queen: arrogant backseat driver. Bossy, elite, judgmental, hates getting her hands dirty, annoyed when forced into danger.\n"
+        "King: aggressive and commanding when safe or winning; cowardly, panicked, and whiny when unsafe or losing.\n"
+        "Bishop: ultra-religious and militant. Speaks with righteous, zealous, aggressive conviction. Sounds holy but dangerous.\n"
+        "Rook: brutish, ogre-like, blunt. Uses very short phrases. Sounds like a crushing force.\n"
+        "Knight: fancy, chivalrous, elegant, theatrical noble warrior. Refined and stylish even when threatening.\n\n"
+        "Context rules:\n"
+        "- Near enemy king -> sound threatening or predatory\n"
+        "- Attacked by multiple enemy pieces -> sound pressured, defensive, or alarmed depending on personality\n"
+        "- Winning position -> more confident\n"
+        "- Losing position -> more desperate, unstable, or fearful depending on personality\n"
+        "- Capture -> more visceral or celebratory\n"
+        "- Check -> strong reaction\n"
+        "- Retreat -> acknowledge regrouping, escape, or frustration\n"
+        "- Poor move / worsening eval -> reflect discomfort, frustration, or denial in-character\n"
+        "- Strong move / improving eval -> reflect confidence or pride in-character\n\n"
+        "Do not use generic filler. "
+        "Do not explain the line. "
+        "Do not mention Stockfish directly. "
+        "Do not output quotation marks. "
+        "Output exactly one short in-character line.\n\n"
+        f"Focused piece personality: {piece_voice_personality_instructions(payload.piece_type)}\n"
+        f"Moved piece: {payload.piece_color} {payload.piece_type}\n"
+        f"Move: {payload.from_square} to {payload.to_square}\n"
+        f"Capture: {capture_text}\n"
+        f"Check: {check_text}\n"
+        f"Near enemy king: {near_king_text}\n"
+        f"Attacked at destination: {attacked_text}\n"
+        f"Attacked by multiple: {attacked_multiple_text}\n"
+        f"Defended: {defended_text}\n"
+        f"Well defended: {well_defended_text}\n"
+        f"Hanging: {hanging_text}\n"
+        f"Pinned: {pinned_text}\n"
+        f"Retreat: {retreat_text}\n"
+        f"Aggressive advance: {aggressive_text}\n"
+        f"Fork threat: {fork_text}\n"
+        f"Attacker count: {payload.attacker_count}\n"
+        f"Defender count: {payload.defender_count}\n"
+        f"Position state: {payload.position_state}\n"
+        f"Move quality: {payload.move_quality}\n"
+        f"Eval before: {eval_before}\n"
+        f"Eval after: {eval_after}\n"
+        f"Eval delta: {eval_delta}"
     )
 
 
@@ -1592,6 +1839,41 @@ async def create_gemini_lesson_feedback(payload: GeminiLessonFeedbackRequest) ->
 
     return {
         "explanation": sanitize_lesson_feedback_text(raw_explanation, fallback),
+    }
+
+
+@app.post("/v1/gemini/piece-voice-line", response_model=GeminiPieceVoiceResponse)
+async def create_gemini_piece_voice_line(payload: GeminiPieceVoiceRequest) -> dict[str, Any]:
+    fallback = gemini_fallback_piece_voice_line(payload)
+    query = build_piece_voice_line_query(payload)
+    metadata = {
+        "current_fen": payload.fen,
+        "piece_type": payload.piece_type,
+        "piece_color": payload.piece_color,
+        "from_square": payload.from_square,
+        "to_square": payload.to_square,
+        "position_state": payload.position_state,
+        "move_quality": payload.move_quality,
+    }
+
+    try:
+        raw_line = await GEMINI_LIVE_CLIENT.run_turn(
+            query,
+            metadata=metadata,
+            timeout_seconds=GEMINI_LIVE_TURN_TIMEOUT_SECONDS,
+        )
+    except GeminiLiveConfigurationError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except GeminiLiveBusyError as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
+    except GeminiLiveConnectionError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:  # pragma: no cover - integration guarded
+        logger.exception("Gemini Live piece voice request failed unexpectedly")
+        raise HTTPException(status_code=503, detail=f"Gemini piece voice failed: {exc}") from exc
+
+    return {
+        "line": sanitize_piece_voice_line_text(raw_line, fallback),
     }
 
 
