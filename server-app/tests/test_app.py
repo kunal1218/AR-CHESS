@@ -516,11 +516,11 @@ def test_build_piece_voice_line_query_includes_personality_and_context() -> None
     assert "Move: g1 to e4" in query
     assert "Fork threat: yes" in query
     assert "Move quality: tactical" in query
-    assert "Minimum 4 words." in query
+    assert "Minimum 3 words." in query
     assert "single word, single letter" in query
 
     retry_query = build_piece_voice_line_retry_query(payload, 'Knight: "Too long."')
-    assert "at least 4 words" in retry_query
+    assert "at least 3 words" in retry_query
     assert "Do not reuse the previous wording." in retry_query
     assert 'Previous invalid answer: Knight: "Too long."' in retry_query
 
@@ -843,7 +843,66 @@ def test_create_gemini_piece_voice_line_retries_too_short_response(monkeypatch) 
     assert response.status_code == 200
     assert response.json() == {"line": "Break their wall apart."}
     assert len(prompts) == 2
-    assert "at least 4 words" in prompts[1]
+    assert "at least 3 words" in prompts[1]
+
+
+def test_create_gemini_piece_voice_line_keeps_minimal_two_word_retry(monkeypatch) -> None:
+    responses = iter(["H.", "Break harder."])
+
+    async def fake_post(self, url: str, *, headers=None, json=None) -> httpx.Response:
+        current = next(responses)
+        _ = headers
+        return httpx.Response(
+            200,
+            json={
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [
+                                {"text": current}
+                            ]
+                        }
+                    }
+                ]
+            },
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+    client = TestClient(app)
+    response = client.post(
+        "/v1/gemini/piece-voice-line",
+        json={
+            "fen": "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBR1 w KQkq - 0 1",
+            "piece_type": "rook",
+            "piece_color": "white",
+            "from_square": "h1",
+            "to_square": "g1",
+            "is_capture": False,
+            "is_check": False,
+            "is_near_enemy_king": False,
+            "is_attacked": False,
+            "is_attacked_by_multiple": False,
+            "is_defended": True,
+            "is_well_defended": True,
+            "is_hanging": False,
+            "is_pinned": False,
+            "is_retreat": False,
+            "is_aggressive_advance": False,
+            "is_fork_threat": False,
+            "attacker_count": 0,
+            "defender_count": 2,
+            "eval_before": 10,
+            "eval_after": 40,
+            "eval_delta": 30,
+            "position_state": "equal",
+            "move_quality": "routine",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"line": "Break harder."}
 
 
 def test_get_postgres_dsn_prefers_railway_private_url(monkeypatch) -> None:
