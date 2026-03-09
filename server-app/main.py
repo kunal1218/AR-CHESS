@@ -641,11 +641,6 @@ def sanitize_piece_voice_line_text(raw_text: str) -> str:
     if first_sentence_match:
         condensed = first_sentence_match.group(1).strip()
 
-    if len(condensed) > 180:
-        shortened = condensed[:180].rsplit(" ", 1)[0].strip()
-        condensed = shortened or condensed[:180].strip()
-        condensed = condensed.rstrip(" ,;:-")
-
     return condensed
 
 

@@ -6654,7 +6654,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     _ text: String,
     maxCharacters: Int? = nil
   ) -> String {
-    let effectiveMaxCharacters = max(maxCharacters ?? Self.pieceVoiceLineCharacterLimit, Self.pieceVoiceLineCharacterLimit)
+    let _ = maxCharacters
     let normalized = text
       .replacingOccurrences(of: "[“”\"]", with: "", options: .regularExpression)
       .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
@@ -6668,19 +6668,19 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       with: "",
       options: .regularExpression
     )
-    let cappedBySentence = cappedNarrationText(
-      withoutLabel,
-      maxSentences: 1,
-      maxCharacters: effectiveMaxCharacters
-    ).text
-    guard !cappedBySentence.isEmpty else {
+    let firstSentence = withoutLabel.replacingOccurrences(
+      of: #"^(.+?[.!?])(?:\s.*)?$"#,
+      with: "$1",
+      options: .regularExpression
+    )
+    let trimmed = firstSentence.trimmingCharacters(in: CharacterSet(charactersIn: " \n\t,;:-"))
+    guard !trimmed.isEmpty else {
       return ""
     }
 
-    var capped = cappedBySentence.trimmingCharacters(in: CharacterSet(charactersIn: " \n\t,;:-"))
+    var capped = trimmed
     if capped.hasSuffix("...") {
-      capped.removeLast(3)
-      capped = capped.trimmingCharacters(in: CharacterSet(charactersIn: " \n\t,;:-"))
+      return ""
     }
     if !capped.isEmpty && !capped.hasSuffix(".") && !capped.hasSuffix("!") && !capped.hasSuffix("?") {
       capped.append(".")
