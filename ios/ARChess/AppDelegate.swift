@@ -5824,6 +5824,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   private var pendingHintNarration = false
   private var narratedHintKeys: Set<String> = []
   private var pendingGeneratedNarrations: [PendingGeneratedNarration] = []
+  private var narrationSessionID = 0
   private var geminiNarrationRetryWorkItem: DispatchWorkItem?
   private var nextKingCookedAllowedPly: [ChessColor: Int] = [:]
   private var lastGeminiStatusSnapshot: GeminiLiveStatusPayload?
@@ -5927,6 +5928,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     geminiNarrationRetryWorkItem?.cancel()
     geminiNarrationRetryWorkItem = nil
     pendingGeneratedNarrations.removeAll()
+    narrationSessionID += 1
     caption = nil
     cachedAnalysis = nil
     stockfishDebugAnalysisCache.removeAll()
@@ -6158,34 +6160,8 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     before beforeState: ChessGameState,
     after afterState: ChessGameState
   ) async -> MoveEvaluationDelta? {
-    completedPlyCount += 1
-    let reachedCommentaryWindow = completedPlyCount >= nextCommentaryPly
-
     if afterState.isCheckmate(for: afterState.turn) {
       latestAssessment = "Checkmate."
-      if speakRandomLine(from: checkmateLines(), priority: .urgent) {
-        scheduleNextCommentaryWindow()
-        try? await Task.sleep(nanoseconds: 180_000_000)
-      }
-    } else if reachedCommentaryWindow {
-      let dialogueLines: [SpokenLine]
-      let priority: SpeechPriority
-      if afterState.isInCheck(for: afterState.turn) {
-        latestAssessment = "Check."
-        dialogueLines = checkLines()
-        priority = .urgent
-      } else if let captured = move.captured {
-        dialogueLines = captureLines(for: captured.kind)
-        priority = .normal
-      } else {
-        dialogueLines = moveFlavorLines(for: move.piece.kind)
-        priority = .normal
-      }
-
-      if speakRandomLine(from: dialogueLines, priority: priority) {
-        scheduleNextCommentaryWindow()
-        try? await Task.sleep(nanoseconds: 180_000_000)
-      }
     }
 
     let beforeAnalysis = await analysisForCurrentTurn(state: beforeState)
@@ -6253,37 +6229,12 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
         reactionHandler?(ReactionCue(kind: .enemyKingPrays(color: beforeState.turn.opponent)))
       } else if swing <= Self.substantialDropThreshold {
         reactionHandler?(ReactionCue(kind: .currentKingCries(color: beforeState.turn)))
-        if canKingSayCooked(for: beforeState.turn),
-           speakRandomLine(
-             from: [
-               SpokenLine(
-                 speaker: .king,
-                 text: "I'm cooked.",
-                 pitch: 1.18,
-                 rate: 0.46,
-                 volume: 1.0
-               )
-             ],
-             priority: .urgent
-           ) {
-          noteKingCookedSpoken(for: beforeState.turn)
-          scheduleNextCommentaryWindow()
-          return evaluationDelta
-        }
       }
     }
 
     let knightForkTargets = knightForkTargets(after: move, in: afterState)
     if knightForkTargets.count >= 2 {
       reactionHandler?(ReactionCue(kind: .knightFork(targets: knightForkTargets)))
-    }
-
-    guard !reachedCommentaryWindow else {
-      return evaluationDelta
-    }
-
-    guard completedPlyCount >= nextCommentaryPly else {
-      return evaluationDelta
     }
 
     return evaluationDelta
@@ -6470,6 +6421,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       evaluationDelta: evaluationDelta
     )
     let speaker = personalitySpeaker(for: move.piece.kind)
+    let sessionID = narrationSessionID
 
     appendGeminiDebug("Triggering Gemini piece voice for \(speaker.displayName.lowercased()) on \(move.to.algebraic).")
 
@@ -6480,8 +6432,8 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
 
       do {
         let line = try await self.hintService.fetchPieceVoiceLine(for: context)
-        guard self.stateProvider?()?.fenString == afterState.fenString else {
-          self.appendGeminiDebug("Dropped stale Gemini piece voice line because the board already advanced.")
+        guard self.narrationSessionID == sessionID else {
+          self.appendGeminiDebug("Dropped stale Gemini piece voice line because the session reset.")
           return
         }
 
