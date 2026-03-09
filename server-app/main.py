@@ -40,10 +40,8 @@ DEFAULT_POSTGRES_PORT = 5432
 TICKET_TTL_SECONDS = int(os.getenv("MATCH_TICKET_TTL_SECONDS", "30"))
 UCI_MOVE_PATTERN = re.compile(r"^[a-h][1-8][a-h][1-8][qrbn]?$", re.IGNORECASE)
 ACTIVE_TICKET_STATUSES = ("queued", "matched")
-PIECE_VOICE_PREFERRED_MIN_WORDS = 3
-PIECE_VOICE_PREFERRED_MIN_CHARACTERS = 10
-PIECE_VOICE_HARD_MIN_WORDS = 2
-PIECE_VOICE_HARD_MIN_CHARACTERS = 8
+PIECE_VOICE_MIN_WORDS = 3
+PIECE_VOICE_MIN_CHARACTERS = 10
 
 app = FastAPI(title="AR Chess Server", version="0.3.0")
 
@@ -649,35 +647,33 @@ def sanitize_piece_voice_line_text(raw_text: str) -> str:
     return condensed
 
 
-def _meets_piece_voice_threshold(text: str, *, min_words: int, min_characters: int) -> bool:
+def normalize_piece_voice_line_text(text: str) -> str:
+    condensed = text.strip().strip("\"'")
+    if not condensed:
+        return ""
+
+    if condensed.endswith("..."):
+        return condensed
+
+    if condensed[-1] not in ".!?":
+        condensed += "."
+
+    return condensed
+
+
+def is_complete_piece_voice_line_text(text: str) -> bool:
     condensed = text.strip()
     if not condensed:
         return False
 
-    if len(condensed) < min_characters:
+    if len(condensed) < PIECE_VOICE_MIN_CHARACTERS:
         return False
 
     words = re.findall(r"[A-Za-z0-9']+", condensed)
-    if len(words) < min_words:
+    if len(words) < PIECE_VOICE_MIN_WORDS:
         return False
 
-    return True
-
-
-def is_preferred_piece_voice_line_text(text: str) -> bool:
-    return _meets_piece_voice_threshold(
-        text,
-        min_words=PIECE_VOICE_PREFERRED_MIN_WORDS,
-        min_characters=PIECE_VOICE_PREFERRED_MIN_CHARACTERS,
-    )
-
-
-def is_minimal_piece_voice_line_text(text: str) -> bool:
-    return _meets_piece_voice_threshold(
-        text,
-        min_words=PIECE_VOICE_HARD_MIN_WORDS,
-        min_characters=PIECE_VOICE_HARD_MIN_CHARACTERS,
-    )
+    return condensed.endswith((".", "!", "?")) and not condensed.endswith("...")
 
 
 def build_gemini_user_query(payload: GeminiHintRequest) -> str:
@@ -746,7 +742,8 @@ def build_piece_voice_line_query(payload: GeminiPieceVoiceRequest) -> str:
         "whether the piece is in danger, whether the piece is threatening the enemy king, "
         "and whether the move was strong, desperate, defensive, aggressive, or poor. "
         "Keep the line short, vivid, and punchy. Aim for 4 to 12 words. Minimum 3 words. Maximum 20 words. "
-        "Return a real sentence or clause, not a single word, single letter, grunt, or filler fragment. "
+        "Return exactly one complete sentence, not a fragment. End the sentence with a period, exclamation point, or question mark. "
+        "Do not return a single word, single letter, grunt, or filler fragment. "
         "Output only the line itself.\n\n"
         "Piece personality rules:\n"
         "Pawn: bloodthirsty barbarian frontline warrior. Loves combat. Proud to be in the trenches. "
@@ -805,10 +802,24 @@ def build_piece_voice_line_retry_query(payload: GeminiPieceVoiceRequest, previou
         + "Your previous answer was unusable for the app. "
         + "Return exactly one fresh in-character line right now. "
         + "It must be vivid and specific, with at least 3 words. "
+        + "It must be one complete sentence ending with punctuation. "
         + "Do not return a single word, single letter, grunt, or generic filler. "
         + "Do not reuse the previous wording. "
         + "Do not return labels, quotes, headings, or explanations. "
         + f"Previous invalid answer: {trimmed_previous or '(empty)'}"
+    )
+
+
+def build_piece_voice_line_repair_query(payload: GeminiPieceVoiceRequest, previous_response: str) -> str:
+    trimmed_previous = re.sub(r"\s+", " ", previous_response).strip()
+    return (
+        build_piece_voice_line_query(payload)
+        + "\n\n"
+        + "The last answer came back as an incomplete fragment. Rewrite it into exactly one finished in-character sentence. "
+        + "Keep the same piece personality and board context, but make it feel complete and speakable. "
+        + "Use 4 to 12 words when possible. End with punctuation. "
+        + "Do not output labels, quotes, headings, or explanations. "
+        + f"Incomplete fragment to repair: {trimmed_previous or '(empty)'}"
     )
 
 
@@ -1060,7 +1071,7 @@ async def fetch_gemini_coach_commentary(payload: GeminiCoachRequest) -> GeminiCo
     return parse_gemini_coach_response(repaired_text)
 
 
-async def fetch_gemini_piece_voice_line_text(prompt_text: str) -> str:
+async def fetch_gemini_piece_voice_line_text(prompt_text: str, *, temperature: float | None = None) -> str:
     validate_gemini_piece_voice_configuration()
 
     request_payload: dict[str, Any] = {
@@ -1084,10 +1095,10 @@ async def fetch_gemini_piece_voice_line_text(prompt_text: str) -> str:
             }
         ],
         "generationConfig": {
-            "temperature": env_float("GEMINI_PIECE_VOICE_TEMPERATURE", 1.05),
+            "temperature": temperature if temperature is not None else env_float("GEMINI_PIECE_VOICE_TEMPERATURE", 0.85),
             "topP": env_float("GEMINI_PIECE_VOICE_TOP_P", 0.95),
             "topK": env_int("GEMINI_PIECE_VOICE_TOP_K", 40),
-            "maxOutputTokens": env_int("GEMINI_PIECE_VOICE_MAX_OUTPUT_TOKENS", 48),
+            "maxOutputTokens": env_int("GEMINI_PIECE_VOICE_MAX_OUTPUT_TOKENS", 80),
         },
     }
 
@@ -1930,22 +1941,20 @@ async def create_gemini_lesson_feedback(payload: GeminiLessonFeedbackRequest) ->
 @app.post("/v1/gemini/piece-voice-line", response_model=GeminiPieceVoiceResponse)
 async def create_gemini_piece_voice_line(payload: GeminiPieceVoiceRequest) -> dict[str, Any]:
     query = build_piece_voice_line_query(payload)
-    best_line = ""
 
     try:
         raw_line = await fetch_gemini_piece_voice_line_text(query)
-        line = sanitize_piece_voice_line_text(raw_line)
+        line = normalize_piece_voice_line_text(sanitize_piece_voice_line_text(raw_line))
 
-        if is_minimal_piece_voice_line_text(line):
-            best_line = line
-
-        if not is_preferred_piece_voice_line_text(line):
+        if not is_complete_piece_voice_line_text(line):
             retry_query = build_piece_voice_line_retry_query(payload, raw_line)
-            raw_line = await fetch_gemini_piece_voice_line_text(retry_query)
-            line = sanitize_piece_voice_line_text(raw_line)
+            raw_line = await fetch_gemini_piece_voice_line_text(retry_query, temperature=0.75)
+            line = normalize_piece_voice_line_text(sanitize_piece_voice_line_text(raw_line))
 
-            if is_minimal_piece_voice_line_text(line):
-                best_line = line
+        if not is_complete_piece_voice_line_text(line):
+            repair_query = build_piece_voice_line_repair_query(payload, raw_line)
+            raw_line = await fetch_gemini_piece_voice_line_text(repair_query, temperature=0.55)
+            line = normalize_piece_voice_line_text(sanitize_piece_voice_line_text(raw_line))
     except GeminiLiveConfigurationError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except GeminiLiveBusyError as exc:
@@ -1956,13 +1965,7 @@ async def create_gemini_piece_voice_line(payload: GeminiPieceVoiceRequest) -> di
         logger.exception("Gemini Live piece voice request failed unexpectedly")
         raise HTTPException(status_code=503, detail=f"Gemini piece voice failed: {exc}") from exc
 
-    if is_preferred_piece_voice_line_text(line):
-        return {"line": line}
-
-    if best_line:
-        return {"line": best_line}
-
-    if not is_minimal_piece_voice_line_text(line):
+    if not is_complete_piece_voice_line_text(line):
         raise HTTPException(status_code=503, detail="Gemini piece voice returned no usable line.")
 
     return {"line": line}
