@@ -1024,6 +1024,7 @@ GEMINI_LIVE_CLIENT = GeminiLiveClient(
     },
     ws_url=os.getenv("GEMINI_LIVE_WS_URL") or None,
     logger=logging.getLogger("archess.server.gemini_live"),
+    prefer_audio_output=True,
 )
 GEMINI_PIECE_VOICE_CLIENT = GeminiLiveClient(
     api_key=os.getenv("GEMINI_API_KEY"),
@@ -1037,6 +1038,7 @@ GEMINI_PIECE_VOICE_CLIENT = GeminiLiveClient(
     },
     ws_url=os.getenv("GEMINI_LIVE_WS_URL") or None,
     logger=logging.getLogger("archess.server.gemini_piece_voice"),
+    prefer_audio_output=False,
 )
 GEMINI_LIVE_TURN_TIMEOUT_SECONDS = env_float("GEMINI_LIVE_TURN_TIMEOUT_SECONDS", 12.0)
 GEMINI_COACH_MODEL = os.getenv("GEMINI_COACH_MODEL", "gemini-2.5-flash")

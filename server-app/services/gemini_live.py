@@ -65,6 +65,7 @@ class GeminiLiveClient:
         ws_url: str | None = None,
         logger: logging.Logger | None = None,
         max_queued_turns: int = 2,
+        prefer_audio_output: bool | None = None,
     ) -> None:
         self._api_key = (api_key or "").strip()
         self._model = model.strip()
@@ -78,6 +79,7 @@ class GeminiLiveClient:
         self._ws_url = ws_url or self.DEFAULT_WS_URL
         self._logger = logger or logging.getLogger("archess.gemini.live")
         self._max_queued_turns = max_queued_turns
+        self._prefer_audio_output = prefer_audio_output
 
         self._connect_lock = asyncio.Lock()
         self._turn_lock = asyncio.Lock()
@@ -641,4 +643,6 @@ class GeminiLiveClient:
         return normalized
 
     def _requires_audio_output(self) -> bool:
+        if self._prefer_audio_output is not None:
+            return self._prefer_audio_output
         return "native-audio" in self._normalized_model_name(self._model)
