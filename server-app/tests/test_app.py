@@ -521,7 +521,7 @@ def test_build_piece_voice_line_query_includes_personality_and_context() -> None
     assert "single word, single letter" in query
 
     retry_query = build_piece_voice_line_retry_query(payload, 'Knight: "Too long."')
-    assert "at least 3 words" in retry_query
+    assert "3 to 12 words" in retry_query
     assert "complete sentence ending with punctuation" in retry_query
     assert "Do not reuse the previous wording." in retry_query
     assert 'Previous invalid answer: Knight: "Too long."' in retry_query

@@ -5735,6 +5735,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   private static let substantialDropThreshold = -140
   private static let pieceVoiceLineChance = 1.0
   private static let pieceVoiceLineCharacterLimit = 180
+  private static let speechPrewarmDelayNanoseconds: UInt64 = 250_000_000
 
   struct ReactionCue {
     enum Kind {
@@ -5836,6 +5837,8 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   private var latestCommentaryRequestID = 0
   private var commentaryRequestTask: Task<Void, Never>?
   private var stockfishDebugVisible = false
+  private var speechPrewarmTask: Task<Void, Never>?
+  private var hasPrewarmedSpeechPath = false
 
   init(narrator: NarratorType = .silky) {
     self.narrator = narrator
@@ -5846,6 +5849,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
 
   func attachEngineHost(to view: UIView) {
     analyzer.attach(to: view)
+    prepareSpeechPathIfNeeded()
   }
 
   func prepareEngineIfNeeded() {
@@ -5876,6 +5880,31 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
         }
         self.analysisStatus = "Stockfish will wake when needed."
         self.latestAssessment = "Board ready."
+      }
+    }
+  }
+
+  private func prepareSpeechPathIfNeeded() {
+    guard speechPrewarmTask == nil, !hasPrewarmedSpeechPath else {
+      return
+    }
+
+    speechPrewarmTask = Task { @MainActor [weak self] in
+      guard let self else {
+        return
+      }
+
+      defer {
+        self.speechPrewarmTask = nil
+      }
+
+      try? await Task.sleep(nanoseconds: Self.speechPrewarmDelayNanoseconds)
+      do {
+        try AudioSessionCoordinator.shared.activatePlaybackSession()
+        _ = AVSpeechSynthesisVoice(language: "en-US")
+        self.hasPrewarmedSpeechPath = true
+      } catch {
+        return
       }
     }
   }
@@ -7632,6 +7661,12 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   }
 
   private func startGeneratedNarrationNow(text: String, style: GeneratedNarrationStyle) -> Bool {
+    do {
+      try AudioSessionCoordinator.shared.activatePlaybackSession()
+    } catch {
+      appendGeminiDebug("Failed to activate playback session for \(generatedNarrationDebugLabel(style)): \(error.localizedDescription)")
+    }
+
     let utterance = AVSpeechUtterance(string: text)
     utterance.voice = AVSpeechSynthesisVoice(language: "en-US")
 

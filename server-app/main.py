@@ -42,6 +42,7 @@ UCI_MOVE_PATTERN = re.compile(r"^[a-h][1-8][a-h][1-8][qrbn]?$", re.IGNORECASE)
 ACTIVE_TICKET_STATUSES = ("queued", "matched")
 PIECE_VOICE_MIN_WORDS = 3
 PIECE_VOICE_MIN_CHARACTERS = 10
+PIECE_VOICE_MAX_WORDS = 12
 
 app = FastAPI(title="AR Chess Server", version="0.3.0")
 
@@ -669,6 +670,8 @@ def is_complete_piece_voice_line_text(text: str) -> bool:
     words = re.findall(r"[A-Za-z0-9']+", condensed)
     if len(words) < PIECE_VOICE_MIN_WORDS:
         return False
+    if len(words) > PIECE_VOICE_MAX_WORDS:
+        return False
 
     return condensed.endswith((".", "!", "?")) and not condensed.endswith("...")
 
@@ -738,7 +741,7 @@ def build_piece_voice_line_query(payload: GeminiPieceVoiceRequest) -> str:
         "the piece's personality, the current tactical / positional context, whether the position is winning, equal, or losing, "
         "whether the piece is in danger, whether the piece is threatening the enemy king, "
         "and whether the move was strong, desperate, defensive, aggressive, or poor. "
-        "Keep the line short, vivid, and punchy. Aim for 4 to 12 words. Minimum 3 words. Maximum 20 words. "
+        "Keep the line short, vivid, and punchy. Aim for 4 to 8 words. Minimum 3 words. Maximum 12 words. "
         "Return exactly one complete sentence, not a fragment. End the sentence with a period, exclamation point, or question mark. "
         "Do not return a single word, single letter, grunt, or filler fragment. "
         "Output only the line itself.\n\n"
@@ -798,7 +801,7 @@ def build_piece_voice_line_retry_query(payload: GeminiPieceVoiceRequest, previou
         + "\n\n"
         + "Your previous answer was unusable for the app. "
         + "Return exactly one fresh in-character line right now. "
-        + "It must be vivid and specific, with at least 3 words. "
+        + "It must be vivid and specific, with 3 to 12 words. "
         + "It must be one complete sentence ending with punctuation. "
         + "Do not return a single word, single letter, grunt, or generic filler. "
         + "Do not reuse the previous wording. "
@@ -814,7 +817,7 @@ def build_piece_voice_line_repair_query(payload: GeminiPieceVoiceRequest, previo
         + "\n\n"
         + "The last answer came back as an incomplete fragment. Rewrite it into exactly one finished in-character sentence. "
         + "Keep the same piece personality and board context, but make it feel complete and speakable. "
-        + "Use 4 to 12 words when possible. End with punctuation. "
+        + "Use 4 to 8 words when possible, and never exceed 12. End with punctuation. "
         + "Do not output labels, quotes, headings, or explanations. "
         + f"Incomplete fragment to repair: {trimmed_previous or '(empty)'}"
     )
