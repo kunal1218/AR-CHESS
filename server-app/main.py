@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import os
@@ -1828,21 +1829,29 @@ async def create_gemini_piece_voice_line(payload: GeminiPieceVoiceRequest) -> di
     }
 
     try:
-        raw_line = await GEMINI_LIVE_CLIENT.run_turn(
-            query,
-            metadata=metadata,
-            timeout_seconds=GEMINI_LIVE_TURN_TIMEOUT_SECONDS,
-        )
+        async def run_piece_voice_turn(turn_query: str, turn_metadata: dict[str, Any]) -> str:
+            busy_delays = (0.18, 0.32)
+            for attempt, delay in enumerate(busy_delays, start=1):
+                try:
+                    return await GEMINI_LIVE_CLIENT.run_turn(
+                        turn_query,
+                        metadata=turn_metadata,
+                        timeout_seconds=GEMINI_LIVE_TURN_TIMEOUT_SECONDS,
+                    )
+                except GeminiLiveBusyError:
+                    if attempt == len(busy_delays):
+                        raise
+                    await asyncio.sleep(delay)
+
+            raise GeminiLiveBusyError("Gemini piece voice request is rate limited. Try again in a moment.")
+
+        raw_line = await run_piece_voice_turn(query, metadata)
         line = sanitize_piece_voice_line_text(raw_line)
         if not line:
             retry_query = build_piece_voice_line_retry_query(payload, raw_line)
             retry_metadata = dict(metadata)
             retry_metadata["retry_reason"] = "empty_or_invalid_piece_voice_line"
-            raw_line = await GEMINI_LIVE_CLIENT.run_turn(
-                retry_query,
-                metadata=retry_metadata,
-                timeout_seconds=GEMINI_LIVE_TURN_TIMEOUT_SECONDS,
-            )
+            raw_line = await run_piece_voice_turn(retry_query, retry_metadata)
             line = sanitize_piece_voice_line_text(raw_line)
     except GeminiLiveConfigurationError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc

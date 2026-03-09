@@ -6172,6 +6172,15 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       moverColor: beforeState.turn
     )
 
+    maybeTriggerPieceVoiceLine(
+      move: move,
+      before: beforeState,
+      after: afterState,
+      beforeAnalysis: beforeAnalysis,
+      afterAnalysis: afterAnalysis,
+      evaluationDelta: evaluationDelta
+    )
+
     if let afterAnalysis {
       cachedAnalysis = CachedAnalysis(fen: afterState.fenString, analysis: afterAnalysis)
       updateAnalysisPresentation(afterAnalysis)
@@ -6193,15 +6202,6 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
         ? "Hint unavailable until Stockfish finishes."
         : defaultHintStatus()
     }
-
-    maybeTriggerPieceVoiceLine(
-      move: move,
-      before: beforeState,
-      after: afterState,
-      beforeAnalysis: beforeAnalysis,
-      afterAnalysis: afterAnalysis,
-      evaluationDelta: evaluationDelta
-    )
 
     let assessment = classifyMove(
       before: beforeAnalysis,
@@ -11981,7 +11981,16 @@ private struct NativeARView: UIViewRepresentable {
           beforeState: beforeState,
           afterState: afterState,
           postApply: { [weak self] in
-            await self?.scheduleReviewEngineReplyIfNeeded(after: afterState)
+            guard let self else {
+              return
+            }
+            let evaluationDelta = await self.commentary.handleMove(move: move, before: beforeState, after: afterState)
+            self.recordReviewCheckpointIfNeeded(
+              for: move,
+              before: beforeState,
+              evaluationDelta: evaluationDelta
+            )
+            await self.scheduleReviewEngineReplyIfNeeded(after: afterState)
           }
         )
       )
@@ -12043,6 +12052,8 @@ private struct NativeARView: UIViewRepresentable {
             guard let self else {
               return
             }
+
+            _ = await self.commentary.handleMove(move: move, before: beforeState, after: afterState)
 
             let lessonCompleted = self.lessonStore.advanceAfterCorrectMove() != nil
             if lessonCompleted {
@@ -12136,6 +12147,8 @@ private struct NativeARView: UIViewRepresentable {
               guard let self else {
                 return
               }
+
+              _ = await self.commentary.handleMove(move: confirmedMove, before: beforeState, after: afterState)
 
               if self.lessonStore.advanceAfterCorrectMove() != nil {
                 self.commentary.noteExternalStatus("\(lesson.title) complete.")
@@ -12448,7 +12461,13 @@ private struct NativeARView: UIViewRepresentable {
             move: replyMove,
             beforeState: state,
             afterState: afterState,
-            postApply: nil
+            postApply: { [weak self] in
+              guard let self else {
+                return
+              }
+
+              _ = await self.commentary.handleMove(move: replyMove, before: state, after: afterState)
+            }
           )
         )
       }
