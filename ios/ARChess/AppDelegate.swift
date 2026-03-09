@@ -5733,7 +5733,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   private static let kingCookedCooldownPly = 15
   private static let substantialGainThreshold = 120
   private static let substantialDropThreshold = -140
-  private static let pieceVoiceLineChance = 1.0 / 3.0
+  private static let pieceVoiceLineChance = 1.0
   private static let pieceVoiceLineWordLimit = 20
 
   struct ReactionCue {
@@ -7626,7 +7626,13 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     style: GeneratedNarrationStyle,
     retryAfter delay: TimeInterval
   ) {
-    pendingGeneratedNarrations.append(PendingGeneratedNarration(text: text, style: style))
+    let pending = PendingGeneratedNarration(text: text, style: style)
+    switch style {
+    case .pieceVoice:
+      pendingGeneratedNarrations.insert(pending, at: 0)
+    case .gemini:
+      pendingGeneratedNarrations.append(pending)
+    }
     schedulePendingGeneratedNarrationFlush(after: delay)
   }
 
