@@ -7581,7 +7581,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     priority: SpeechPriority
   ) -> Bool {
     appendGeminiDebug("Preparing piece voice speech for \(speaker.displayName.lowercased()).")
-    speakGeneratedNarration(
+    return speakGeneratedNarration(
       text: text,
       style: .pieceVoice(speaker: speaker),
       priority: priority,
