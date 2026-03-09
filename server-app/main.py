@@ -40,6 +40,8 @@ DEFAULT_POSTGRES_PORT = 5432
 TICKET_TTL_SECONDS = int(os.getenv("MATCH_TICKET_TTL_SECONDS", "30"))
 UCI_MOVE_PATTERN = re.compile(r"^[a-h][1-8][a-h][1-8][qrbn]?$", re.IGNORECASE)
 ACTIVE_TICKET_STATUSES = ("queued", "matched")
+PIECE_VOICE_MIN_WORDS = 3
+PIECE_VOICE_MIN_CHARACTERS = 12
 
 app = FastAPI(title="AR Chess Server", version="0.3.0")
 
@@ -645,6 +647,21 @@ def sanitize_piece_voice_line_text(raw_text: str) -> str:
     return condensed
 
 
+def is_usable_piece_voice_line_text(text: str) -> bool:
+    condensed = text.strip()
+    if not condensed:
+        return False
+
+    if len(condensed) < PIECE_VOICE_MIN_CHARACTERS:
+        return False
+
+    words = re.findall(r"[A-Za-z0-9']+", condensed)
+    if len(words) < PIECE_VOICE_MIN_WORDS:
+        return False
+
+    return True
+
+
 def build_gemini_user_query(payload: GeminiHintRequest) -> str:
     piece_name = payload.moving_piece or "piece"
     capture_text = "yes" if payload.is_capture else "no"
@@ -710,7 +727,8 @@ def build_piece_voice_line_query(payload: GeminiPieceVoiceRequest) -> str:
         "the piece's personality, the current tactical / positional context, whether the position is winning, equal, or losing, "
         "whether the piece is in danger, whether the piece is threatening the enemy king, "
         "and whether the move was strong, desperate, defensive, aggressive, or poor. "
-        "Keep the line short, vivid, and punchy. Usually 4 to 14 words. Maximum 20 words. "
+        "Keep the line short, vivid, and punchy. Aim for 5 to 14 words. Minimum 4 words. Maximum 20 words. "
+        "Return a real sentence or clause, not a single word, single letter, grunt, or filler fragment. "
         "Output only the line itself.\n\n"
         "Piece personality rules:\n"
         "Pawn: bloodthirsty barbarian frontline warrior. Loves combat. Proud to be in the trenches. "
@@ -718,7 +736,7 @@ def build_piece_voice_line_query(payload: GeminiPieceVoiceRequest) -> str:
         "Queen: arrogant backseat driver. Bossy, elite, judgmental, hates getting her hands dirty, annoyed when forced into danger.\n"
         "King: aggressive and commanding when safe or winning; cowardly, panicked, and whiny when unsafe or losing.\n"
         "Bishop: ultra-religious and militant. Speaks with righteous, zealous, aggressive conviction. Sounds holy but dangerous.\n"
-        "Rook: brutish, ogre-like, blunt. Uses very short phrases. Sounds like a crushing force.\n"
+        "Rook: brutish, ogre-like, blunt. Uses short blunt sentences, not one-word grunts. Sounds like a crushing force.\n"
         "Knight: fancy, chivalrous, elegant, theatrical noble warrior. Refined and stylish even when threatening.\n\n"
         "Context rules:\n"
         "- Near enemy king -> sound threatening or predatory\n"
@@ -731,6 +749,7 @@ def build_piece_voice_line_query(payload: GeminiPieceVoiceRequest) -> str:
         "- Poor move / worsening eval -> reflect discomfort, frustration, or denial in-character\n"
         "- Strong move / improving eval -> reflect confidence or pride in-character\n\n"
         "Do not use generic filler. "
+        "Do not answer with things like 'Ha', 'Mine', 'Good', or any other throwaway fragment. "
         "Do not explain the line. "
         "Do not mention Stockfish directly. "
         "Do not output quotation marks. "
@@ -767,6 +786,8 @@ def build_piece_voice_line_retry_query(payload: GeminiPieceVoiceRequest, previou
         + "\n\n"
         + "Your previous answer was unusable for the app. "
         + "Return exactly one fresh in-character line right now. "
+        + "It must be vivid and specific, with at least 4 words. "
+        + "Do not return a single word, single letter, grunt, or generic filler. "
         + "Do not reuse the previous wording. "
         + "Do not return labels, quotes, headings, or explanations. "
         + f"Previous invalid answer: {trimmed_previous or '(empty)'}"
@@ -1895,7 +1916,7 @@ async def create_gemini_piece_voice_line(payload: GeminiPieceVoiceRequest) -> di
     try:
         raw_line = await fetch_gemini_piece_voice_line_text(query)
         line = sanitize_piece_voice_line_text(raw_line)
-        if not line:
+        if not is_usable_piece_voice_line_text(line):
             retry_query = build_piece_voice_line_retry_query(payload, raw_line)
             raw_line = await fetch_gemini_piece_voice_line_text(retry_query)
             line = sanitize_piece_voice_line_text(raw_line)
@@ -1909,7 +1930,7 @@ async def create_gemini_piece_voice_line(payload: GeminiPieceVoiceRequest) -> di
         logger.exception("Gemini Live piece voice request failed unexpectedly")
         raise HTTPException(status_code=503, detail=f"Gemini piece voice failed: {exc}") from exc
 
-    if not line:
+    if not is_usable_piece_voice_line_text(line):
         raise HTTPException(status_code=503, detail="Gemini piece voice returned no usable line.")
 
     return {"line": line}
