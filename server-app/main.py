@@ -922,6 +922,15 @@ def validate_gemini_coach_configuration() -> None:
         raise GeminiLiveConfigurationError("GEMINI_COACH_MODEL is empty.")
 
 
+def validate_gemini_piece_voice_configuration() -> None:
+    api_key = (os.getenv("GEMINI_API_KEY") or "").strip()
+    if not api_key:
+        raise GeminiLiveConfigurationError("GEMINI_API_KEY is not configured on the backend.")
+
+    if not GEMINI_PIECE_VOICE_TEXT_MODEL.strip():
+        raise GeminiLiveConfigurationError("GEMINI_PIECE_VOICE_TEXT_MODEL is empty.")
+
+
 async def fetch_gemini_coach_commentary(payload: GeminiCoachRequest) -> GeminiCoachResponse:
     validate_gemini_coach_configuration()
 
@@ -1012,6 +1021,67 @@ async def fetch_gemini_coach_commentary(payload: GeminiCoachRequest) -> GeminiCo
     return parse_gemini_coach_response(repaired_text)
 
 
+async def fetch_gemini_piece_voice_line_text(prompt_text: str) -> str:
+    validate_gemini_piece_voice_configuration()
+
+    request_payload: dict[str, Any] = {
+        "systemInstruction": {
+            "parts": [
+                {
+                    "text": (
+                        os.getenv(
+                            "GEMINI_PIECE_VOICE_SYSTEM_PROMPT",
+                            "You generate one short in-character chess piece voice line. "
+                            "Output only the line itself.",
+                        ).strip()
+                    )
+                }
+            ],
+        },
+        "contents": [
+            {
+                "role": "user",
+                "parts": [{"text": prompt_text}],
+            }
+        ],
+        "generationConfig": {
+            "temperature": env_float("GEMINI_PIECE_VOICE_TEMPERATURE", 1.05),
+            "topP": env_float("GEMINI_PIECE_VOICE_TOP_P", 0.95),
+            "topK": env_int("GEMINI_PIECE_VOICE_TOP_K", 40),
+            "maxOutputTokens": env_int("GEMINI_PIECE_VOICE_MAX_OUTPUT_TOKENS", 48),
+        },
+    }
+
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{GEMINI_PIECE_VOICE_TEXT_MODEL}:generateContent"
+    )
+
+    async with httpx.AsyncClient(timeout=GEMINI_PIECE_VOICE_TIMEOUT_SECONDS) as client:
+        response = await client.post(
+            url,
+            headers={
+                "Content-Type": "application/json",
+                "x-goog-api-key": os.getenv("GEMINI_API_KEY", "").strip(),
+            },
+            json=request_payload,
+        )
+
+    if response.status_code == 429:
+        raise GeminiLiveBusyError("Gemini piece voice request is rate limited. Try again in a moment.")
+
+    if response.status_code in {400, 401, 403}:
+        raise GeminiLiveConfigurationError(response.text)
+
+    if response.status_code >= 500:
+        raise GeminiLiveConnectionError(response.text)
+
+    response.raise_for_status()
+    with suppress(ValueError):
+        return extract_generate_content_text(response.json())
+    return ""
+
+
 GEMINI_LIVE_CLIENT = GeminiLiveClient(
     api_key=os.getenv("GEMINI_API_KEY"),
     model=os.getenv("GEMINI_LIVE_MODEL", GeminiLiveClient.DEFAULT_MODEL),
@@ -1026,23 +1096,11 @@ GEMINI_LIVE_CLIENT = GeminiLiveClient(
     logger=logging.getLogger("archess.server.gemini_live"),
     prefer_audio_output=True,
 )
-GEMINI_PIECE_VOICE_CLIENT = GeminiLiveClient(
-    api_key=os.getenv("GEMINI_API_KEY"),
-    model=os.getenv("GEMINI_PIECE_VOICE_MODEL", os.getenv("GEMINI_LIVE_MODEL", GeminiLiveClient.DEFAULT_MODEL)),
-    system_prompt=os.getenv("GEMINI_PIECE_VOICE_SYSTEM_PROMPT", GEMINI_HINT_SYSTEM_PROMPT).strip(),
-    generation_config={
-        "temperature": env_float("GEMINI_PIECE_VOICE_TEMPERATURE", 1.05),
-        "top_p": env_float("GEMINI_PIECE_VOICE_TOP_P", 0.95),
-        "top_k": env_int("GEMINI_PIECE_VOICE_TOP_K", 40),
-        "max_output_tokens": env_int("GEMINI_PIECE_VOICE_MAX_OUTPUT_TOKENS", 48),
-    },
-    ws_url=os.getenv("GEMINI_LIVE_WS_URL") or None,
-    logger=logging.getLogger("archess.server.gemini_piece_voice"),
-    prefer_audio_output=False,
-)
 GEMINI_LIVE_TURN_TIMEOUT_SECONDS = env_float("GEMINI_LIVE_TURN_TIMEOUT_SECONDS", 12.0)
 GEMINI_COACH_MODEL = os.getenv("GEMINI_COACH_MODEL", "gemini-2.5-flash")
 GEMINI_COACH_TIMEOUT_SECONDS = env_float("GEMINI_COACH_TIMEOUT_SECONDS", 12.0)
+GEMINI_PIECE_VOICE_TEXT_MODEL = os.getenv("GEMINI_PIECE_VOICE_TEXT_MODEL", GEMINI_COACH_MODEL)
+GEMINI_PIECE_VOICE_TIMEOUT_SECONDS = env_float("GEMINI_PIECE_VOICE_TIMEOUT_SECONDS", 8.0)
 SOCRATIC_STOCKFISH_ENGINE = StockfishEngine(
     executable_path=os.getenv("STOCKFISH_PATH"),
     max_depth=env_int("MAX_STOCKFISH_DEPTH", 18),
@@ -1711,13 +1769,11 @@ def get_queue_match_moves(
 @app.on_event("startup")
 async def startup_gemini_live() -> None:
     GEMINI_LIVE_CLIENT.ensure_connection_background()
-    GEMINI_PIECE_VOICE_CLIENT.ensure_connection_background()
 
 
 @app.on_event("shutdown")
 async def shutdown_gemini_live() -> None:
     await GEMINI_LIVE_CLIENT.disconnect()
-    await GEMINI_PIECE_VOICE_CLIENT.disconnect()
 
 
 @app.get("/health/ping")
@@ -1835,40 +1891,13 @@ async def create_gemini_lesson_feedback(payload: GeminiLessonFeedbackRequest) ->
 @app.post("/v1/gemini/piece-voice-line", response_model=GeminiPieceVoiceResponse)
 async def create_gemini_piece_voice_line(payload: GeminiPieceVoiceRequest) -> dict[str, Any]:
     query = build_piece_voice_line_query(payload)
-    metadata = {
-        "current_fen": payload.fen,
-        "piece_type": payload.piece_type,
-        "piece_color": payload.piece_color,
-        "from_square": payload.from_square,
-        "to_square": payload.to_square,
-        "position_state": payload.position_state,
-        "move_quality": payload.move_quality,
-    }
 
     try:
-        async def run_piece_voice_turn(turn_query: str, turn_metadata: dict[str, Any]) -> str:
-            busy_delays = (0.18, 0.32)
-            for attempt, delay in enumerate(busy_delays, start=1):
-                try:
-                    return await GEMINI_PIECE_VOICE_CLIENT.run_turn(
-                        turn_query,
-                        metadata=turn_metadata,
-                        timeout_seconds=GEMINI_LIVE_TURN_TIMEOUT_SECONDS,
-                    )
-                except GeminiLiveBusyError:
-                    if attempt == len(busy_delays):
-                        raise
-                    await asyncio.sleep(delay)
-
-            raise GeminiLiveBusyError("Gemini piece voice request is rate limited. Try again in a moment.")
-
-        raw_line = await run_piece_voice_turn(query, metadata)
+        raw_line = await fetch_gemini_piece_voice_line_text(query)
         line = sanitize_piece_voice_line_text(raw_line)
         if not line:
             retry_query = build_piece_voice_line_retry_query(payload, raw_line)
-            retry_metadata = dict(metadata)
-            retry_metadata["retry_reason"] = "empty_or_invalid_piece_voice_line"
-            raw_line = await run_piece_voice_turn(retry_query, retry_metadata)
+            raw_line = await fetch_gemini_piece_voice_line_text(retry_query)
             line = sanitize_piece_voice_line_text(raw_line)
     except GeminiLiveConfigurationError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc

@@ -3,6 +3,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+import httpx
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
@@ -658,15 +659,28 @@ def test_create_gemini_commentary_returns_structured_json(monkeypatch) -> None:
 
 
 def test_create_gemini_piece_voice_line_returns_sanitized_line(monkeypatch) -> None:
-    async def fake_run_turn(prompt: str, *, metadata=None, timeout_seconds: float = 0.0) -> str:
-        assert "single short in-character voice line" in prompt
-        assert "Focused piece personality: Rook: brutish, ogre-like, blunt." in prompt
-        assert metadata["piece_type"] == "rook"
-        assert metadata["move_quality"] == "strong"
-        _ = timeout_seconds
-        return '"Rook: Break them now."'
+    async def fake_post(self, url: str, *, headers=None, json=None) -> httpx.Response:
+        assert "generateContent" in url
+        assert "single short in-character voice line" in json["contents"][0]["parts"][0]["text"]
+        assert "Focused piece personality: Rook: brutish, ogre-like, blunt." in json["contents"][0]["parts"][0]["text"]
+        _ = headers
+        return httpx.Response(
+            200,
+            json={
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [
+                                {"text": '"Rook: Break them now."'}
+                            ]
+                        }
+                    }
+                ]
+            },
+            request=httpx.Request("POST", url),
+        )
 
-    monkeypatch.setattr("main.GEMINI_PIECE_VOICE_CLIENT.run_turn", fake_run_turn)
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
 
     client = TestClient(app)
     response = client.post(
@@ -705,16 +719,29 @@ def test_create_gemini_piece_voice_line_returns_sanitized_line(monkeypatch) -> N
 
 def test_create_gemini_piece_voice_line_retries_empty_response(monkeypatch) -> None:
     responses = iter(["   ", "A sanctified strike through the dark."])
+    prompts: list[str] = []
 
-    async def fake_run_turn(prompt: str, *, metadata=None, timeout_seconds: float = 0.0) -> str:
+    async def fake_post(self, url: str, *, headers=None, json=None) -> httpx.Response:
         current = next(responses)
-        if current.strip():
-            assert metadata["retry_reason"] == "empty_or_invalid_piece_voice_line"
-            assert "Do not reuse the previous wording." in prompt
-        _ = timeout_seconds
-        return current
+        prompts.append(json["contents"][0]["parts"][0]["text"])
+        _ = headers
+        return httpx.Response(
+            200,
+            json={
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [
+                                {"text": current}
+                            ]
+                        }
+                    }
+                ]
+            },
+            request=httpx.Request("POST", url),
+        )
 
-    monkeypatch.setattr("main.GEMINI_PIECE_VOICE_CLIENT.run_turn", fake_run_turn)
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
 
     client = TestClient(app)
     response = client.post(
@@ -749,6 +776,8 @@ def test_create_gemini_piece_voice_line_retries_empty_response(monkeypatch) -> N
 
     assert response.status_code == 200
     assert response.json() == {"line": "A sanctified strike through the dark."}
+    assert len(prompts) == 2
+    assert "Do not reuse the previous wording." in prompts[1]
 
 
 def test_get_postgres_dsn_prefers_railway_private_url(monkeypatch) -> None:
