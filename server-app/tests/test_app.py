@@ -666,7 +666,7 @@ def test_create_gemini_piece_voice_line_returns_sanitized_line(monkeypatch) -> N
         _ = timeout_seconds
         return '"Rook: Break them now."'
 
-    monkeypatch.setattr("main.GEMINI_LIVE_CLIENT.run_turn", fake_run_turn)
+    monkeypatch.setattr("main.GEMINI_PIECE_VOICE_CLIENT.run_turn", fake_run_turn)
 
     client = TestClient(app)
     response = client.post(
@@ -714,7 +714,7 @@ def test_create_gemini_piece_voice_line_retries_empty_response(monkeypatch) -> N
         _ = timeout_seconds
         return current
 
-    monkeypatch.setattr("main.GEMINI_LIVE_CLIENT.run_turn", fake_run_turn)
+    monkeypatch.setattr("main.GEMINI_PIECE_VOICE_CLIENT.run_turn", fake_run_turn)
 
     client = TestClient(app)
     response = client.post(

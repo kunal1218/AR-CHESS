@@ -1025,6 +1025,19 @@ GEMINI_LIVE_CLIENT = GeminiLiveClient(
     ws_url=os.getenv("GEMINI_LIVE_WS_URL") or None,
     logger=logging.getLogger("archess.server.gemini_live"),
 )
+GEMINI_PIECE_VOICE_CLIENT = GeminiLiveClient(
+    api_key=os.getenv("GEMINI_API_KEY"),
+    model=os.getenv("GEMINI_PIECE_VOICE_MODEL", os.getenv("GEMINI_LIVE_MODEL", GeminiLiveClient.DEFAULT_MODEL)),
+    system_prompt=os.getenv("GEMINI_PIECE_VOICE_SYSTEM_PROMPT", GEMINI_HINT_SYSTEM_PROMPT).strip(),
+    generation_config={
+        "temperature": env_float("GEMINI_PIECE_VOICE_TEMPERATURE", 1.05),
+        "top_p": env_float("GEMINI_PIECE_VOICE_TOP_P", 0.95),
+        "top_k": env_int("GEMINI_PIECE_VOICE_TOP_K", 40),
+        "max_output_tokens": env_int("GEMINI_PIECE_VOICE_MAX_OUTPUT_TOKENS", 48),
+    },
+    ws_url=os.getenv("GEMINI_LIVE_WS_URL") or None,
+    logger=logging.getLogger("archess.server.gemini_piece_voice"),
+)
 GEMINI_LIVE_TURN_TIMEOUT_SECONDS = env_float("GEMINI_LIVE_TURN_TIMEOUT_SECONDS", 12.0)
 GEMINI_COACH_MODEL = os.getenv("GEMINI_COACH_MODEL", "gemini-2.5-flash")
 GEMINI_COACH_TIMEOUT_SECONDS = env_float("GEMINI_COACH_TIMEOUT_SECONDS", 12.0)
@@ -1696,11 +1709,13 @@ def get_queue_match_moves(
 @app.on_event("startup")
 async def startup_gemini_live() -> None:
     GEMINI_LIVE_CLIENT.ensure_connection_background()
+    GEMINI_PIECE_VOICE_CLIENT.ensure_connection_background()
 
 
 @app.on_event("shutdown")
 async def shutdown_gemini_live() -> None:
     await GEMINI_LIVE_CLIENT.disconnect()
+    await GEMINI_PIECE_VOICE_CLIENT.disconnect()
 
 
 @app.get("/health/ping")
@@ -1833,7 +1848,7 @@ async def create_gemini_piece_voice_line(payload: GeminiPieceVoiceRequest) -> di
             busy_delays = (0.18, 0.32)
             for attempt, delay in enumerate(busy_delays, start=1):
                 try:
-                    return await GEMINI_LIVE_CLIENT.run_turn(
+                    return await GEMINI_PIECE_VOICE_CLIENT.run_turn(
                         turn_query,
                         metadata=turn_metadata,
                         timeout_seconds=GEMINI_LIVE_TURN_TIMEOUT_SECONDS,
