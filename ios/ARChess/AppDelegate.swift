@@ -6652,8 +6652,9 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
 
   private func cappedPieceVoiceLineText(
     _ text: String,
-    maxCharacters: Int = Self.pieceVoiceLineCharacterLimit
+    maxCharacters: Int? = nil
   ) -> String {
+    let effectiveMaxCharacters = max(maxCharacters ?? Self.pieceVoiceLineCharacterLimit, Self.pieceVoiceLineCharacterLimit)
     let normalized = text
       .replacingOccurrences(of: "[“”\"]", with: "", options: .regularExpression)
       .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
@@ -6670,7 +6671,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     let cappedBySentence = cappedNarrationText(
       withoutLabel,
       maxSentences: 1,
-      maxCharacters: max(maxCharacters, Self.pieceVoiceLineCharacterLimit)
+      maxCharacters: effectiveMaxCharacters
     ).text
     guard !cappedBySentence.isEmpty else {
       return ""
