@@ -5790,6 +5790,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   @Published private(set) var geminiDebugLines: [String] = []
   @Published private(set) var coachLines: [String] = []
   @Published private(set) var pieceVoiceLines: [String] = []
+  @Published private(set) var pieceVoiceStatusText = "Waiting for a move."
   @Published private(set) var topWorkers: [GeminiPieceRole] = []
   @Published private(set) var topTraitors: [GeminiPieceRole] = []
   @Published private(set) var stockfishDebugStatusText = "Open Stockfish debug to inspect engine candidates."
@@ -5951,6 +5952,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     geminiDebugLines = []
     coachLines = []
     pieceVoiceLines = []
+    pieceVoiceStatusText = "Waiting for a move."
     topWorkers = []
     topTraitors = []
     stockfishDebugStatusText = "Open Stockfish debug to inspect engine candidates."
@@ -6409,6 +6411,9 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     evaluationDelta: MoveEvaluationDelta?
   ) {
     guard hintService.isConfigured, shouldTriggerPieceVoiceLine() else {
+      pieceVoiceStatusText = hintService.isConfigured
+        ? "Skipped before request."
+        : "Piece voice disabled: ARChessAPIBaseURL missing."
       return
     }
 
@@ -6423,7 +6428,14 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     let speaker = personalitySpeaker(for: move.piece.kind)
     let sessionID = narrationSessionID
 
+    pieceVoiceStatusText = "Requesting \(speaker.displayName) \(move.from.algebraic)-\(move.to.algebraic)..."
     appendGeminiDebug("Triggering Gemini piece voice for \(speaker.displayName.lowercased()) on \(move.to.algebraic).")
+    appendGeminiDebug(
+      "Piece voice context piece=\(speaker.displayName.lowercased()) move=\(move.from.algebraic)->\(move.to.algebraic) " +
+        "capture=\(context.isCapture) check=\(context.isCheck) nearKing=\(context.isNearEnemyKing) " +
+        "attacked=\(context.attackerCount) defended=\(context.defenderCount) " +
+        "state=\(context.positionState.rawValue) quality=\(context.moveQuality.rawValue)"
+    )
 
     Task { @MainActor [weak self] in
       guard let self else {
@@ -6433,22 +6445,32 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       do {
         let line = try await self.hintService.fetchPieceVoiceLine(for: context)
         guard self.narrationSessionID == sessionID else {
+          self.pieceVoiceStatusText = "Dropped after session reset."
           self.appendGeminiDebug("Dropped stale Gemini piece voice line because the session reset.")
           return
         }
 
         let sanitizedLine = self.cappedPieceVoiceLineText(line)
         guard !sanitizedLine.isEmpty else {
+          self.pieceVoiceStatusText = "Gemini returned an empty piece line."
           self.appendGeminiDebug("Gemini piece voice line came back empty after sanitization.")
           return
         }
 
         let debugLine = "\(speaker.displayName): \(sanitizedLine)"
+        self.pieceVoiceStatusText = "Generated: \(debugLine)"
         self.recordPieceVoiceLine(debugLine)
-        _ = self.speakGeneratedPieceVoiceLine(text: sanitizedLine, speaker: speaker, priority: .normal)
+        let spokeImmediately = self.speakGeneratedPieceVoiceLine(text: sanitizedLine, speaker: speaker, priority: .normal)
+        self.appendGeminiDebug(
+          spokeImmediately
+            ? "Piece voice handed to speech engine for \(speaker.displayName.lowercased())."
+            : "Piece voice did not reach speech engine for \(speaker.displayName.lowercased())."
+        )
       } catch is CancellationError {
+        self.pieceVoiceStatusText = "Piece voice request cancelled."
         return
       } catch {
+        self.pieceVoiceStatusText = "Piece voice failed: \(error.localizedDescription)"
         self.appendGeminiDebug("Gemini piece voice request failed: \(error.localizedDescription)")
       }
     }
@@ -7131,8 +7153,8 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     formatter.dateFormat = "HH:mm:ss"
     let stamped = "[\(formatter.string(from: Date()))] \(message)"
     geminiDebugLines.append(stamped)
-    if geminiDebugLines.count > 18 {
-      geminiDebugLines.removeFirst(geminiDebugLines.count - 18)
+    if geminiDebugLines.count > 36 {
+      geminiDebugLines.removeFirst(geminiDebugLines.count - 36)
     }
   }
 
@@ -7558,6 +7580,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     speaker: PersonalitySpeaker,
     priority: SpeechPriority
   ) -> Bool {
+    appendGeminiDebug("Preparing piece voice speech for \(speaker.displayName.lowercased()).")
     speakGeneratedNarration(
       text: text,
       style: .pieceVoice(speaker: speaker),
@@ -7587,10 +7610,17 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     let pieceAudioBusyDuration = pieceAudioBusyDurationProvider?() ?? 0
     if synthesizer.isSpeaking || pieceAudioBusyDuration > 0.05 {
       let retryDelay = max(pieceAudioBusyDuration, priority == .urgent ? 0.14 : 0.08)
+      if case .pieceVoice(let speaker) = style {
+        pieceVoiceStatusText = "Queued \(speaker.displayName) voice behind speech/SFX."
+      }
+      appendGeminiDebug(
+        "Queued \(generatedNarrationDebugLabel(style)) speech. synthesizer=\(synthesizer.isSpeaking) sfx_busy=\(String(format: "%.2f", pieceAudioBusyDuration)) retry=\(String(format: "%.2f", retryDelay))"
+      )
       queuePendingGeneratedNarration(text: sanitizedText, style: style, retryAfter: retryDelay)
       return true
     }
 
+    appendGeminiDebug("Starting \(generatedNarrationDebugLabel(style)) speech immediately.")
     return startGeneratedNarrationNow(text: sanitizedText, style: style)
   }
 
@@ -7616,6 +7646,10 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     }
 
     utterance.preUtteranceDelay = 0.02
+    if case .pieceVoice(let speaker) = style {
+      pieceVoiceStatusText = "Speaking \(speaker.displayName) voice."
+    }
+    appendGeminiDebug("Speech start: \(generatedNarrationDebugLabel(style)) -> \(text)")
     maybeHighlightNarrationFocus(text)
     synthesizer.speak(utterance)
     return true
@@ -7653,6 +7687,9 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
 
     let pieceAudioBusyDuration = pieceAudioBusyDurationProvider?() ?? 0
     guard !synthesizer.isSpeaking, pieceAudioBusyDuration <= 0.05 else {
+      appendGeminiDebug(
+        "Pending speech blocked for \(generatedNarrationDebugLabel(pendingGeneratedNarration.style)). synthesizer=\(synthesizer.isSpeaking) sfx_busy=\(String(format: "%.2f", pieceAudioBusyDuration))"
+      )
       schedulePendingGeneratedNarrationFlush(after: max(pieceAudioBusyDuration, 0.08))
       return
     }
@@ -7660,7 +7697,17 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     pendingGeneratedNarrations.removeFirst()
     geminiNarrationRetryWorkItem?.cancel()
     geminiNarrationRetryWorkItem = nil
+    appendGeminiDebug("Flushing queued \(generatedNarrationDebugLabel(pendingGeneratedNarration.style)) speech.")
     _ = startGeneratedNarrationNow(text: pendingGeneratedNarration.text, style: pendingGeneratedNarration.style)
+  }
+
+  private func generatedNarrationDebugLabel(_ style: GeneratedNarrationStyle) -> String {
+    switch style {
+    case .gemini(let title):
+      return title
+    case .pieceVoice(let speaker):
+      return "\(speaker.displayName) piece voice"
+    }
   }
 
   private func maybeHighlightNarrationFocus(_ text: String) {
@@ -9619,6 +9666,11 @@ private struct NativeARExperienceView: View {
           Text("Piece Voice Lines")
             .font(.system(size: 12, weight: .bold, design: .rounded))
             .foregroundStyle(Color.white.opacity(0.88))
+
+          Text(commentary.pieceVoiceStatusText)
+            .font(.system(size: 11, weight: .medium, design: .monospaced))
+            .foregroundStyle(Color(red: 0.80, green: 0.88, blue: 0.95))
+            .lineSpacing(2)
 
           if commentary.pieceVoiceLines.isEmpty {
             Text("No piece voices yet.")
