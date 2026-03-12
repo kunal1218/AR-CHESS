@@ -6501,7 +6501,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
         let spokeImmediately = self.speakGeneratedPieceVoiceLine(
           text: sanitizedLine,
           speaker: plan.speaker,
-          priority: .normal
+          priority: .urgent
         )
         self.appendGeminiDebug(
           spokeImmediately
