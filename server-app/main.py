@@ -659,12 +659,6 @@ def normalize_piece_voice_line_text(text: str) -> str:
     if not condensed:
         return ""
 
-    if condensed.endswith("..."):
-        return condensed
-
-    if condensed[-1] not in ".!?":
-        condensed += "."
-
     return condensed
 
 
@@ -1150,7 +1144,19 @@ async def fetch_gemini_piece_voice_line_text(prompt_text: str, *, temperature: f
 
     response.raise_for_status()
     with suppress(ValueError):
-        return extract_generate_content_text(response.json())
+        body = response.json()
+        candidates = body.get("candidates") or []
+        if candidates and isinstance(candidates[0], dict):
+            finish_reason = str(
+                candidates[0].get("finishReason") or candidates[0].get("finish_reason") or ""
+            ).strip().upper()
+            if finish_reason and finish_reason not in {"STOP", "FINISH_REASON_UNSPECIFIED"}:
+                logger.warning(
+                    "Gemini piece voice response finished with %s; forcing retry.",
+                    finish_reason,
+                )
+                return ""
+        return extract_generate_content_text(body)
     return ""
 
 
