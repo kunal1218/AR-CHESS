@@ -40,9 +40,9 @@ DEFAULT_POSTGRES_PORT = 5432
 TICKET_TTL_SECONDS = int(os.getenv("MATCH_TICKET_TTL_SECONDS", "30"))
 UCI_MOVE_PATTERN = re.compile(r"^[a-h][1-8][a-h][1-8][qrbn]?$", re.IGNORECASE)
 ACTIVE_TICKET_STATUSES = ("queued", "matched")
-PIECE_VOICE_MIN_WORDS = 5
-PIECE_VOICE_MIN_CHARACTERS = 18
-PIECE_VOICE_MAX_WORDS = 18
+PIECE_VOICE_MIN_WORDS = 3
+PIECE_VOICE_MIN_CHARACTERS = 10
+PIECE_VOICE_MAX_WORDS = 12
 
 app = FastAPI(title="AR Chess Server", version="0.3.0")
 
@@ -647,15 +647,6 @@ def sanitize_piece_voice_line_text(raw_text: str) -> str:
     if not condensed:
         return ""
 
-    sentence_candidates = [
-        sentence.strip().strip("\"' ")
-        for sentence in re.findall(r"[^.!?]+[.!?]+|[^.!?]+$", condensed)
-        if sentence.strip()
-    ]
-    for candidate in sentence_candidates:
-        if is_complete_piece_voice_line_text(candidate):
-            return candidate
-
     first_sentence_match = re.match(r"^(.+?[.!?])(?:\s|$)", condensed)
     if first_sentence_match:
         condensed = first_sentence_match.group(1).strip()
@@ -667,6 +658,12 @@ def normalize_piece_voice_line_text(text: str) -> str:
     condensed = text.strip().strip("\"'")
     if not condensed:
         return ""
+
+    if condensed.endswith("..."):
+        return condensed
+
+    if condensed[-1] not in ".!?":
+        condensed += "."
 
     return condensed
 
@@ -765,10 +762,8 @@ def build_piece_voice_line_query(payload: GeminiPieceVoiceRequest) -> str:
         "whether the piece is in danger, whether the piece is threatening the enemy king, "
         "and whether the move was strong, desperate, defensive, aggressive, or poor. "
         f"{context_instruction} "
-        "Keep the line vivid, punchy, and naturally speakable in real time. "
-        "Aim for 7 to 14 words. Minimum 5 words. Maximum 18 words. "
+        "Keep the line short, vivid, and punchy. Aim for 4 to 8 words. Minimum 3 words. Maximum 12 words. "
         "Return exactly one complete sentence, not a fragment. End the sentence with a period, exclamation point, or question mark. "
-        "It must sound like a full spoken thought, not a clipped slogan or half-finished fragment. "
         "Do not return a single word, single letter, grunt, or filler fragment. "
         "Output only the line itself.\n\n"
         "Piece personality rules:\n"
@@ -828,9 +823,8 @@ def build_piece_voice_line_retry_query(payload: GeminiPieceVoiceRequest, previou
         + "\n\n"
         + "Your previous answer was unusable for the app. "
         + "Return exactly one fresh in-character line right now. "
-        + "It must be vivid and specific, with 5 to 18 words. "
+        + "It must be vivid and specific, with 3 to 12 words. "
         + "It must be one complete sentence ending with punctuation. "
-        + "It must sound natural when spoken aloud, not clipped or slogan-like. "
         + "Do not return a single word, single letter, grunt, or generic filler. "
         + "Do not reuse the previous wording. "
         + "Do not return labels, quotes, headings, or explanations. "
@@ -845,8 +839,7 @@ def build_piece_voice_line_repair_query(payload: GeminiPieceVoiceRequest, previo
         + "\n\n"
         + "The last answer came back as an incomplete fragment. Rewrite it into exactly one finished in-character sentence. "
         + "Keep the same piece personality and board context, but make it feel complete and speakable. "
-        + "Finish the thought naturally so it sounds complete when spoken aloud. "
-        + "Use 7 to 14 words when possible, and never exceed 18. End with punctuation. "
+        + "Use 4 to 8 words when possible, and never exceed 12. End with punctuation. "
         + "Do not output labels, quotes, headings, or explanations. "
         + f"Incomplete fragment to repair: {trimmed_previous or '(empty)'}"
     )
@@ -1110,8 +1103,8 @@ async def fetch_gemini_piece_voice_line_text(prompt_text: str, *, temperature: f
                     "text": (
                         os.getenv(
                             "GEMINI_PIECE_VOICE_SYSTEM_PROMPT",
-                            "You generate one complete in-character chess piece voice line. "
-                            "Output only one natural spoken sentence.",
+                            "You generate one short in-character chess piece voice line. "
+                            "Output only the line itself.",
                         ).strip()
                     )
                 }
@@ -1157,19 +1150,7 @@ async def fetch_gemini_piece_voice_line_text(prompt_text: str, *, temperature: f
 
     response.raise_for_status()
     with suppress(ValueError):
-        body = response.json()
-        candidates = body.get("candidates") or []
-        if candidates and isinstance(candidates[0], dict):
-            finish_reason = str(
-                candidates[0].get("finishReason") or candidates[0].get("finish_reason") or ""
-            ).strip().upper()
-            if finish_reason and finish_reason not in {"STOP", "FINISH_REASON_UNSPECIFIED"}:
-                logger.warning(
-                    "Gemini piece voice response finished with %s; forcing retry.",
-                    finish_reason,
-                )
-                return ""
-        return extract_generate_content_text(body)
+        return extract_generate_content_text(response.json())
     return ""
 
 

@@ -6501,7 +6501,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
         let spokeImmediately = self.speakGeneratedPieceVoiceLine(
           text: sanitizedLine,
           speaker: plan.speaker,
-          priority: .normal
+          priority: .urgent
         )
         self.appendGeminiDebug(
           spokeImmediately
@@ -7287,7 +7287,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
         ? "Narrating Gemini hint because the hint button was pressed."
         : "Narrating Gemini hint because the side to move just lost eval."
     )
-    _ = speakHintNarration(text: text, priority: allowRepeat ? .urgent : .normal)
+    _ = speakHintNarration(text: text, priority: .urgent)
   }
 
   private func startGeminiStatusMonitoring() {
