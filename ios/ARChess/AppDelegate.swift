@@ -533,6 +533,7 @@ private struct GeminiPieceVoiceLineRequestPayload: Encodable {
   let fen: String
   let piece_type: String
   let piece_color: String
+  let context_mode: String
   let from_square: String
   let to_square: String
   let is_capture: Bool
@@ -616,6 +617,11 @@ private enum PieceVoicePositionState: String {
   case losing
 }
 
+private enum PieceVoiceContextMode: String {
+  case moved
+  case ambient
+}
+
 private enum PieceVoiceMoveQuality: String {
   case strong
   case tactical
@@ -630,6 +636,7 @@ private struct GeminiPieceVoiceLineContext {
   let fen: String
   let pieceType: ChessPieceKind
   let pieceColor: ChessColor
+  let contextMode: PieceVoiceContextMode
   let fromSquare: BoardSquare
   let toSquare: BoardSquare
   let isCapture: Bool
@@ -2159,6 +2166,7 @@ private final class GeminiHintService {
         fen: context.fen,
         piece_type: context.pieceType.displayName.lowercased(),
         piece_color: context.pieceColor.displayName.lowercased(),
+        context_mode: context.contextMode.rawValue,
         from_square: context.fromSquare.algebraic,
         to_square: context.toSquare.algebraic,
         is_capture: context.isCapture,
@@ -5733,7 +5741,8 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   private static let kingCookedCooldownPly = 15
   private static let substantialGainThreshold = 120
   private static let substantialDropThreshold = -140
-  private static let pieceVoiceLineChance = 1.0
+  private static let movedPieceVoiceLineChance = 0.5
+  private static let ambientPieceVoiceLineChance = 0.5
   private static let pieceVoiceLineCharacterLimit = 180
   private static let speechPrewarmDelayNanoseconds: UInt64 = 250_000_000
 
@@ -5771,6 +5780,12 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   private enum GeneratedNarrationStyle {
     case gemini(title: String)
     case pieceVoice(speaker: PersonalitySpeaker)
+  }
+
+  private struct PieceVoiceRequestPlan {
+    let speaker: PersonalitySpeaker
+    let context: GeminiPieceVoiceLineContext
+    let label: String
   }
 
   private struct PendingGeneratedNarration {
@@ -6195,21 +6210,18 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       latestAssessment = "Checkmate."
     }
 
+    maybeTriggerPieceVoiceLine(
+      move: move,
+      before: beforeState,
+      after: afterState
+    )
+
     let beforeAnalysis = await analysisForCurrentTurn(state: beforeState)
     let afterAnalysis = await analysisForCurrentTurn(state: afterState)
     let evaluationDelta = moveEvaluationDelta(
       before: beforeAnalysis,
       after: afterAnalysis,
       moverColor: beforeState.turn
-    )
-
-    maybeTriggerPieceVoiceLine(
-      move: move,
-      before: beforeState,
-      after: afterState,
-      beforeAnalysis: beforeAnalysis,
-      afterAnalysis: afterAnalysis,
-      evaluationDelta: evaluationDelta
     )
 
     if let afterAnalysis {
@@ -6434,36 +6446,33 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   private func maybeTriggerPieceVoiceLine(
     move: ChessMove,
     before beforeState: ChessGameState,
-    after afterState: ChessGameState,
-    beforeAnalysis: StockfishAnalysis?,
-    afterAnalysis: StockfishAnalysis?,
-    evaluationDelta: MoveEvaluationDelta?
+    after afterState: ChessGameState
   ) {
-    guard hintService.isConfigured, shouldTriggerPieceVoiceLine() else {
-      pieceVoiceStatusText = hintService.isConfigured
-        ? "Skipped before request."
-        : "Piece voice disabled: ARChessAPIBaseURL missing."
+    guard hintService.isConfigured else {
+      pieceVoiceStatusText = "Piece voice disabled: ARChessAPIBaseURL missing."
       return
     }
 
-    let context = buildPieceVoiceLineContext(
+    guard let plan = makePieceVoiceRequestPlan(
       move: move,
       before: beforeState,
-      after: afterState,
-      beforeAnalysis: beforeAnalysis,
-      afterAnalysis: afterAnalysis,
-      evaluationDelta: evaluationDelta
-    )
-    let speaker = personalitySpeaker(for: move.piece.kind)
+      after: afterState
+    ) else {
+      pieceVoiceStatusText = "Skipped after moved/ambient roll."
+      appendGeminiDebug("Skipped piece voice after 50/50 moved and ambient rolls.")
+      return
+    }
+
     let sessionID = narrationSessionID
 
-    pieceVoiceStatusText = "Requesting \(speaker.displayName) \(move.from.algebraic)-\(move.to.algebraic)..."
-    appendGeminiDebug("Triggering Gemini piece voice for \(speaker.displayName.lowercased()) on \(move.to.algebraic).")
+    pieceVoiceStatusText = "Requesting \(plan.label)..."
+    appendGeminiDebug("Triggering Gemini piece voice for \(plan.label).")
     appendGeminiDebug(
-      "Piece voice context piece=\(speaker.displayName.lowercased()) move=\(move.from.algebraic)->\(move.to.algebraic) " +
-        "capture=\(context.isCapture) check=\(context.isCheck) nearKing=\(context.isNearEnemyKing) " +
-        "attacked=\(context.attackerCount) defended=\(context.defenderCount) " +
-        "state=\(context.positionState.rawValue) quality=\(context.moveQuality.rawValue)"
+      "Piece voice context piece=\(plan.speaker.displayName.lowercased()) mode=\(plan.context.contextMode.rawValue) " +
+        "move=\(plan.context.fromSquare.algebraic)->\(plan.context.toSquare.algebraic) " +
+        "capture=\(plan.context.isCapture) check=\(plan.context.isCheck) nearKing=\(plan.context.isNearEnemyKing) " +
+        "attacked=\(plan.context.attackerCount) defended=\(plan.context.defenderCount) " +
+        "state=\(plan.context.positionState.rawValue) quality=\(plan.context.moveQuality.rawValue)"
     )
 
     Task { @MainActor [weak self] in
@@ -6472,7 +6481,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       }
 
       do {
-        let line = try await self.hintService.fetchPieceVoiceLine(for: context)
+        let line = try await self.hintService.fetchPieceVoiceLine(for: plan.context)
         guard self.narrationSessionID == sessionID else {
           self.pieceVoiceStatusText = "Dropped after session reset."
           self.appendGeminiDebug("Dropped stale Gemini piece voice line because the session reset.")
@@ -6486,14 +6495,18 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
           return
         }
 
-        let debugLine = "\(speaker.displayName): \(sanitizedLine)"
+        let debugLine = "\(plan.speaker.displayName): \(sanitizedLine)"
         self.pieceVoiceStatusText = "Generated: \(debugLine)"
         self.recordPieceVoiceLine(debugLine)
-        let spokeImmediately = self.speakGeneratedPieceVoiceLine(text: sanitizedLine, speaker: speaker, priority: .normal)
+        let spokeImmediately = self.speakGeneratedPieceVoiceLine(
+          text: sanitizedLine,
+          speaker: plan.speaker,
+          priority: .normal
+        )
         self.appendGeminiDebug(
           spokeImmediately
-            ? "Piece voice handed to speech engine for \(speaker.displayName.lowercased())."
-            : "Piece voice did not reach speech engine for \(speaker.displayName.lowercased())."
+            ? "Piece voice handed to speech engine for \(plan.speaker.displayName.lowercased())."
+            : "Piece voice did not reach speech engine for \(plan.speaker.displayName.lowercased())."
         )
       } catch is CancellationError {
         self.pieceVoiceStatusText = "Piece voice request cancelled."
@@ -6505,27 +6518,159 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     }
   }
 
-  private func shouldTriggerPieceVoiceLine() -> Bool {
-    Double.random(in: 0..<1) < Self.pieceVoiceLineChance
+  private func makePieceVoiceRequestPlan(
+    move: ChessMove,
+    before beforeState: ChessGameState,
+    after afterState: ChessGameState
+  ) -> PieceVoiceRequestPlan? {
+    if shouldTriggerMovedPieceVoiceLine() {
+      let speaker = personalitySpeaker(for: move.piece.kind)
+      let context = buildPieceVoiceLineContext(
+        speakingSquare: move.to,
+        piece: move.piece,
+        contextMode: .moved,
+        before: beforeState,
+        after: afterState,
+        referenceMove: move
+      )
+      return PieceVoiceRequestPlan(
+        speaker: speaker,
+        context: context,
+        label: "\(speaker.displayName.lowercased()) moved \(move.from.algebraic)-\(move.to.algebraic)"
+      )
+    }
+
+    guard shouldTriggerAmbientPieceVoiceLine(),
+          let ambientSpeaker = selectAmbientPieceVoiceSpeaker(
+            in: afterState,
+            excluding: move.to
+          ) else {
+      return nil
+    }
+
+    let speaker = personalitySpeaker(for: ambientSpeaker.piece.kind)
+    let context = buildPieceVoiceLineContext(
+      speakingSquare: ambientSpeaker.square,
+      piece: ambientSpeaker.piece,
+      contextMode: .ambient,
+      before: beforeState,
+      after: afterState,
+      referenceMove: move
+    )
+    return PieceVoiceRequestPlan(
+      speaker: speaker,
+      context: context,
+      label: "\(speaker.displayName.lowercased()) observing from \(ambientSpeaker.square.algebraic)"
+    )
+  }
+
+  private func shouldTriggerMovedPieceVoiceLine() -> Bool {
+    Double.random(in: 0..<1) < Self.movedPieceVoiceLineChance
+  }
+
+  private func shouldTriggerAmbientPieceVoiceLine() -> Bool {
+    Double.random(in: 0..<1) < Self.ambientPieceVoiceLineChance
+  }
+
+  private func selectAmbientPieceVoiceSpeaker(
+    in state: ChessGameState,
+    excluding movedSquare: BoardSquare
+  ) -> (square: BoardSquare, piece: ChessPieceState)? {
+    let pieces = state.board
+      .filter { entry in
+        let isMovedPiece = entry.key == movedSquare
+        return !isMovedPiece || state.board.count == 1
+      }
+      .map { (square: $0.key, piece: $0.value) }
+
+    guard !pieces.isEmpty else {
+      return nil
+    }
+
+    let weightedPieces = pieces.map { candidate in
+      (
+        candidate: candidate,
+        weight: ambientPieceVoiceWeight(
+          for: candidate.square,
+          piece: candidate.piece,
+          in: state
+        )
+      )
+    }
+    let totalWeight = weightedPieces.reduce(0) { $0 + $1.weight }
+    guard totalWeight > 0 else {
+      return weightedPieces.randomElement()?.candidate
+    }
+
+    var roll = Int.random(in: 0..<totalWeight)
+    for weightedPiece in weightedPieces {
+      if roll < weightedPiece.weight {
+        return weightedPiece.candidate
+      }
+      roll -= weightedPiece.weight
+    }
+
+    return weightedPieces.last?.candidate
+  }
+
+  private func ambientPieceVoiceWeight(
+    for square: BoardSquare,
+    piece: ChessPieceState,
+    in state: ChessGameState
+  ) -> Int {
+    let opponent = piece.color.opponent
+    let attackerCount = state.attackOrigins(on: square, by: opponent).count
+    let defenderCount = max(
+      0,
+      state.attackOrigins(on: square, by: piece.color).filter { $0 != square }.count
+    )
+    let activeState = stateByReplacingTurn(in: state, with: piece.color)
+    let legalMoves = activeState.legalMoves(from: square)
+    let enemyKingSquare = state.kingSquare(for: opponent)
+    let nearEnemyKing = enemyKingSquare.map { chebyshevDistance(from: square, to: $0) <= 2 } ?? false
+    let attacksEnemyKing = enemyKingSquare.map { state.attackOrigins(on: $0, by: piece.color).contains(square) } ?? false
+    let isPinned = state.isPiecePinned(at: square)
+    let threatensEnemyMaterial = legalMoves.contains { candidate in
+      guard let target = state.piece(at: candidate.to) else {
+        return false
+      }
+      return target.color == opponent
+    }
+
+    var weight = 1
+    weight += min(attackerCount, 3)
+    weight += min(defenderCount, 2)
+    weight += nearEnemyKing ? 3 : 0
+    weight += attacksEnemyKing ? 3 : 0
+    weight += threatensEnemyMaterial ? 2 : 0
+    weight += isPinned ? 2 : 0
+    weight += legalMoves.isEmpty ? 1 : 2
+    if piece.kind != .pawn {
+      weight += 1
+    }
+    return max(weight, 1)
   }
 
   private func buildPieceVoiceLineContext(
-    move: ChessMove,
+    speakingSquare: BoardSquare,
+    piece: ChessPieceState,
+    contextMode: PieceVoiceContextMode,
     before beforeState: ChessGameState,
     after afterState: ChessGameState,
-    beforeAnalysis: StockfishAnalysis?,
-    afterAnalysis: StockfishAnalysis?,
-    evaluationDelta: MoveEvaluationDelta?
+    referenceMove: ChessMove? = nil,
+    beforeAnalysis: StockfishAnalysis? = nil,
+    afterAnalysis: StockfishAnalysis? = nil
   ) -> GeminiPieceVoiceLineContext {
-    let moverColor = move.piece.color
+    let moverColor = piece.color
     let opponent = moverColor.opponent
     let enemyKingSquare = afterState.kingSquare(for: opponent)
     let beforeEnemyKingSquare = beforeState.kingSquare(for: opponent)
-    let attackerOrigins = afterState.attackOrigins(on: move.to, by: opponent)
-    let defenderOrigins = afterState.attackOrigins(on: move.to, by: moverColor)
-    let beforeAttackerOrigins = beforeState.attackOrigins(on: move.from, by: opponent)
+    let fromSquare = contextMode == .moved ? (referenceMove?.from ?? speakingSquare) : speakingSquare
+    let attackerOrigins = afterState.attackOrigins(on: speakingSquare, by: opponent)
+    let defenderOrigins = afterState.attackOrigins(on: speakingSquare, by: moverColor)
+    let beforeAttackerOrigins = beforeState.attackOrigins(on: fromSquare, by: opponent)
     let movedPieceState = stateByReplacingTurn(in: afterState, with: moverColor)
-    let movedPieceLegalMoves = movedPieceState.legalMoves(from: move.to)
+    let movedPieceLegalMoves = movedPieceState.legalMoves(from: speakingSquare)
     let movedPieceThreatTargets = Set(
       movedPieceLegalMoves.compactMap { candidate -> BoardSquare? in
         guard let target = afterState.piece(at: candidate.to),
@@ -6536,49 +6681,57 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       }
     )
 
-    let beforeEnemyKingDistance = beforeEnemyKingSquare.map { chebyshevDistance(from: move.from, to: $0) } ?? 8
-    let afterEnemyKingDistance = enemyKingSquare.map { chebyshevDistance(from: move.to, to: $0) } ?? 8
+    let beforeEnemyKingDistance = beforeEnemyKingSquare.map { chebyshevDistance(from: fromSquare, to: $0) } ?? 8
+    let afterEnemyKingDistance = enemyKingSquare.map { chebyshevDistance(from: speakingSquare, to: $0) } ?? 8
     let kingZoneThreat = enemyKingSquare.map { kingSquare in
       movedPieceLegalMoves.contains { candidate in
         max(abs(candidate.to.file - kingSquare.file), abs(candidate.to.rank - kingSquare.rank)) <= 1
       }
     } ?? false
-    let isNearEnemyKing = move.piece.kind != .king
-      && (afterEnemyKingDistance <= 2 || kingZoneThreat || afterState.isInCheck(for: opponent))
-    let defenderCount = defenderOrigins.filter { $0 != move.to }.count
+    let attacksEnemyKing = enemyKingSquare.map {
+      afterState.attackOrigins(on: $0, by: moverColor).contains(speakingSquare)
+    } ?? false
+    let isNearEnemyKing = piece.kind != .king
+      && (afterEnemyKingDistance <= 2 || kingZoneThreat || attacksEnemyKing)
+    let defenderCount = defenderOrigins.filter { $0 != speakingSquare }.count
     let attackerCount = attackerOrigins.count
     let isAttacked = attackerCount > 0
     let isDefended = defenderCount > 0
     let isHanging = isAttacked && !isDefended
-    let isPinned = afterState.isPiecePinned(at: move.to)
-    let isCapture = move.captured != nil || move.isEnPassant
-    let isCheck = afterState.isInCheck(for: opponent)
-    let isRetreat = !isCapture
+    let isPinned = afterState.isPiecePinned(at: speakingSquare)
+    let isCapture = contextMode == .moved ? (referenceMove?.captured != nil || referenceMove?.isEnPassant == true) : false
+    let isCheck = afterState.isInCheck(for: opponent) && attacksEnemyKing
+    let isRetreat = contextMode == .moved
+      && !isCapture
       && !isCheck
-      && !move.isEnPassant
+      && referenceMove?.isEnPassant != true
       && beforeAttackerOrigins.count > 0
       && afterEnemyKingDistance > beforeEnemyKingDistance
-    let isAggressiveAdvance = isCheck
-      || isCapture
-      || afterEnemyKingDistance < beforeEnemyKingDistance
-      || movedDeeperIntoEnemyHalf(move)
+    let isAggressiveAdvance = contextMode == .moved
+      ? (
+        isCheck
+          || isCapture
+          || afterEnemyKingDistance < beforeEnemyKingDistance
+          || (referenceMove.map { movedDeeperIntoEnemyHalf($0) } ?? false)
+      )
+      : (isCheck || isNearEnemyKing || !movedPieceThreatTargets.isEmpty)
     let isForkThreat = threatensFork(
-      movedPiece: move.piece,
+      movedPiece: piece,
       targetSquares: movedPieceThreatTargets,
       in: afterState,
       enemyKingSquare: enemyKingSquare
     )
-    let evalBefore = evaluationDelta?.evalBefore ?? beforeAnalysis?.perspectiveScore(for: moverColor)
-    let evalAfter = evaluationDelta?.evalAfter ?? afterAnalysis?.perspectiveScore(for: moverColor)
-    let evalDelta = evaluationDelta?.deltaW
-      ?? (evalBefore != nil && evalAfter != nil ? (evalAfter! - evalBefore!) : nil)
+    let evalBefore = beforeAnalysis?.perspectiveScore(for: moverColor) ?? fastPieceVoiceEvaluation(for: moverColor, in: beforeState)
+    let evalAfter = afterAnalysis?.perspectiveScore(for: moverColor) ?? fastPieceVoiceEvaluation(for: moverColor, in: afterState)
+    let evalDelta = evalAfter - evalBefore
 
     return GeminiPieceVoiceLineContext(
       fen: afterState.fenString,
-      pieceType: move.piece.kind,
+      pieceType: piece.kind,
       pieceColor: moverColor,
-      fromSquare: move.from,
-      toSquare: move.to,
+      contextMode: contextMode,
+      fromSquare: fromSquare,
+      toSquare: speakingSquare,
       isCapture: isCapture,
       isCheck: isCheck,
       isNearEnemyKing: isNearEnemyKing,
@@ -6598,7 +6751,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       evalDelta: evalDelta,
       positionState: pieceVoicePositionState(evalAfter),
       moveQuality: pieceVoiceMoveQuality(
-        move: move,
+        piece: piece,
         evalDelta: evalDelta,
         isCheck: isCheck,
         isCapture: isCapture,
@@ -6625,7 +6778,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   }
 
   private func pieceVoiceMoveQuality(
-    move: ChessMove,
+    piece: ChessPieceState,
     evalDelta: Int?,
     isCheck: Bool,
     isCapture: Bool,
@@ -6648,10 +6801,37 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     if isRetreat || (isAttacked && !isCapture) {
       return .defensive
     }
-    if isCapture || move.piece.kind == .pawn {
+    if isCapture || piece.kind == .pawn {
       return .aggressive
     }
     return .routine
+  }
+
+  private func fastPieceVoiceEvaluation(
+    for color: ChessColor,
+    in state: ChessGameState
+  ) -> Int {
+    var score = 0
+    for piece in state.board.values {
+      let value: Int
+      switch piece.kind {
+      case .pawn:
+        value = 100
+      case .knight:
+        value = 320
+      case .bishop:
+        value = 330
+      case .rook:
+        value = 500
+      case .queen:
+        value = 900
+      case .king:
+        value = 0
+      }
+
+      score += piece.color == color ? value : -value
+    }
+    return score
   }
 
   private func personalitySpeaker(for kind: ChessPieceKind) -> PersonalitySpeaker {
@@ -7107,7 +7287,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
         ? "Narrating Gemini hint because the hint button was pressed."
         : "Narrating Gemini hint because the side to move just lost eval."
     )
-    _ = speakHintNarration(text: text, priority: .urgent)
+    _ = speakHintNarration(text: text, priority: allowRepeat ? .urgent : .normal)
   }
 
   private func startGeminiStatusMonitoring() {
@@ -7643,9 +7823,15 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       return false
     }
 
+    if priority == .urgent, synthesizer.isSpeaking {
+      appendGeminiDebug("Interrupting current speech so \(generatedNarrationDebugLabel(style)) can land on the move.")
+      _ = synthesizer.stopSpeaking(at: .immediate)
+      utteranceCaptions.removeAll()
+    }
+
     let pieceAudioBusyDuration = pieceAudioBusyDurationProvider?() ?? 0
     if synthesizer.isSpeaking || pieceAudioBusyDuration > 0.05 {
-      let retryDelay = max(pieceAudioBusyDuration, priority == .urgent ? 0.14 : 0.08)
+      let retryDelay = max(pieceAudioBusyDuration, priority == .urgent ? 0.05 : 0.08)
       if case .pieceVoice(let speaker) = style {
         pieceVoiceStatusText = "Queued \(speaker.displayName) voice behind speech/SFX."
       }

@@ -461,6 +461,16 @@ def test_sanitize_piece_voice_line_text_caps_word_count_and_strips_labels() -> N
     assert len(sanitized.split()) <= 20
 
 
+def test_sanitize_piece_voice_line_text_prefers_first_complete_sentence() -> None:
+    raw_text = 'Rook: "Ha. I crush their line and keep marching."'
+
+    assert sanitize_piece_voice_line_text(raw_text) == "I crush their line and keep marching."
+
+
+def test_normalize_piece_voice_line_text_does_not_add_terminal_punctuation() -> None:
+    assert normalize_piece_voice_line_text("I crush their line and keep") == "I crush their line and keep"
+
+
 def test_build_gemini_lesson_feedback_query_includes_narrator_addon() -> None:
     from main import GeminiLessonFeedbackRequest, build_gemini_lesson_feedback_query
 
@@ -516,12 +526,12 @@ def test_build_piece_voice_line_query_includes_personality_and_context() -> None
     assert "Move: g1 to e4" in query
     assert "Fork threat: yes" in query
     assert "Move quality: tactical" in query
-    assert "Minimum 3 words." in query
+    assert "Minimum 5 words." in query
     assert "Return exactly one complete sentence" in query
     assert "single word, single letter" in query
 
     retry_query = build_piece_voice_line_retry_query(payload, 'Knight: "Too long."')
-    assert "3 to 12 words" in retry_query
+    assert "5 to 18 words" in retry_query
     assert "complete sentence ending with punctuation" in retry_query
     assert "Do not reuse the previous wording." in retry_query
     assert 'Previous invalid answer: Knight: "Too long."' in retry_query
@@ -531,6 +541,44 @@ def test_build_piece_voice_line_query_includes_personality_and_context() -> None
     repair_query = build_piece_voice_line_repair_query(payload, "By holy")
     assert "incomplete fragment" in repair_query
     assert "finished in-character sentence" in repair_query
+
+
+def test_build_piece_voice_line_query_supports_ambient_piece_context() -> None:
+    from main import GeminiPieceVoiceRequest
+
+    payload = GeminiPieceVoiceRequest(
+        fen="rnbqkbnr/pppppppp/8/8/4N3/8/PPPPPPPP/RNBQKB1R b KQkq - 1 1",
+        piece_type="queen",
+        piece_color="black",
+        context_mode="ambient",
+        from_square="d8",
+        to_square="d8",
+        is_capture=False,
+        is_check=False,
+        is_near_enemy_king=False,
+        is_attacked=False,
+        is_attacked_by_multiple=False,
+        is_defended=True,
+        is_well_defended=True,
+        is_hanging=False,
+        is_pinned=False,
+        is_retreat=False,
+        is_aggressive_advance=False,
+        is_fork_threat=False,
+        attacker_count=0,
+        defender_count=2,
+        eval_before=0,
+        eval_after=-80,
+        eval_delta=-80,
+        position_state="losing",
+        move_quality="defensive",
+    )
+
+    query = build_piece_voice_line_query(payload)
+
+    assert "Context mode: ambient" in query
+    assert "did not just move" in query
+    assert "Current square: d8" in query
 
 
 def test_build_narrator_prompt_appends_selected_personality() -> None:
@@ -682,7 +730,7 @@ def test_create_gemini_piece_voice_line_returns_sanitized_line(monkeypatch) -> N
                     {
                         "content": {
                             "parts": [
-                                {"text": '"Rook: Break them now."'}
+                                {"text": '"Rook: I crush their line without mercy."'}
                             ]
                         }
                     }
@@ -725,7 +773,213 @@ def test_create_gemini_piece_voice_line_returns_sanitized_line(monkeypatch) -> N
     )
 
     assert response.status_code == 200
-    assert response.json() == {"line": "Break them now."}
+    assert response.json() == {"line": "I crush their line without mercy."}
+
+
+def test_create_gemini_piece_voice_line_retries_short_clipped_response(monkeypatch) -> None:
+    responses = iter(["Break them now.", "I crush their line and keep marching."])
+    prompts: list[str] = []
+
+    async def fake_post(self, url: str, *, headers=None, json=None) -> httpx.Response:
+        current = next(responses)
+        prompts.append(json["contents"][0]["parts"][0]["text"])
+        _ = headers
+        return httpx.Response(
+            200,
+            json={
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [
+                                {"text": current}
+                            ]
+                        }
+                    }
+                ]
+            },
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+    client = TestClient(app)
+    response = client.post(
+        "/v1/gemini/piece-voice-line",
+        json={
+            "fen": "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBR1 w KQkq - 0 1",
+            "piece_type": "rook",
+            "piece_color": "white",
+            "from_square": "h1",
+            "to_square": "g1",
+            "is_capture": False,
+            "is_check": False,
+            "is_near_enemy_king": False,
+            "is_attacked": False,
+            "is_attacked_by_multiple": False,
+            "is_defended": True,
+            "is_well_defended": True,
+            "is_hanging": False,
+            "is_pinned": False,
+            "is_retreat": False,
+            "is_aggressive_advance": False,
+            "is_fork_threat": False,
+            "attacker_count": 0,
+            "defender_count": 2,
+            "eval_before": 40,
+            "eval_after": 120,
+            "eval_delta": 80,
+            "position_state": "winning",
+            "move_quality": "strong",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"line": "I crush their line and keep marching."}
+    assert len(prompts) == 2
+    assert "Do not reuse the previous wording." in prompts[1]
+
+
+def test_create_gemini_piece_voice_line_retries_truncated_sentence_without_punctuation(monkeypatch) -> None:
+    responses = iter(["I crush their line and keep", "I crush their line and keep marching."])
+    prompts: list[str] = []
+
+    async def fake_post(self, url: str, *, headers=None, json=None) -> httpx.Response:
+        current = next(responses)
+        prompts.append(json["contents"][0]["parts"][0]["text"])
+        _ = headers
+        return httpx.Response(
+            200,
+            json={
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [
+                                {"text": current}
+                            ]
+                        }
+                    }
+                ]
+            },
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+    client = TestClient(app)
+    response = client.post(
+        "/v1/gemini/piece-voice-line",
+        json={
+            "fen": "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBR1 w KQkq - 0 1",
+            "piece_type": "rook",
+            "piece_color": "white",
+            "from_square": "h1",
+            "to_square": "g1",
+            "is_capture": False,
+            "is_check": False,
+            "is_near_enemy_king": False,
+            "is_attacked": False,
+            "is_attacked_by_multiple": False,
+            "is_defended": True,
+            "is_well_defended": True,
+            "is_hanging": False,
+            "is_pinned": False,
+            "is_retreat": False,
+            "is_aggressive_advance": False,
+            "is_fork_threat": False,
+            "attacker_count": 0,
+            "defender_count": 2,
+            "eval_before": 40,
+            "eval_after": 120,
+            "eval_delta": 80,
+            "position_state": "winning",
+            "move_quality": "strong",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"line": "I crush their line and keep marching."}
+    assert len(prompts) == 2
+    assert "Do not reuse the previous wording." in prompts[1]
+
+
+def test_create_gemini_piece_voice_line_retries_max_tokens_finish_reason(monkeypatch) -> None:
+    responses = iter(
+        [
+            {
+                "candidates": [
+                    {
+                        "finishReason": "MAX_TOKENS",
+                        "content": {
+                            "parts": [
+                                {"text": "I crush their line and"}
+                            ]
+                        },
+                    }
+                ]
+            },
+            {
+                "candidates": [
+                    {
+                        "finishReason": "STOP",
+                        "content": {
+                            "parts": [
+                                {"text": "I crush their line and keep marching."}
+                            ]
+                        },
+                    }
+                ]
+            },
+        ]
+    )
+    prompts: list[str] = []
+
+    async def fake_post(self, url: str, *, headers=None, json=None) -> httpx.Response:
+        current = next(responses)
+        prompts.append(json["contents"][0]["parts"][0]["text"])
+        _ = headers
+        return httpx.Response(
+            200,
+            json=current,
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+    client = TestClient(app)
+    response = client.post(
+        "/v1/gemini/piece-voice-line",
+        json={
+            "fen": "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBR1 w KQkq - 0 1",
+            "piece_type": "rook",
+            "piece_color": "white",
+            "from_square": "h1",
+            "to_square": "g1",
+            "is_capture": False,
+            "is_check": False,
+            "is_near_enemy_king": False,
+            "is_attacked": False,
+            "is_attacked_by_multiple": False,
+            "is_defended": True,
+            "is_well_defended": True,
+            "is_hanging": False,
+            "is_pinned": False,
+            "is_retreat": False,
+            "is_aggressive_advance": False,
+            "is_fork_threat": False,
+            "attacker_count": 0,
+            "defender_count": 2,
+            "eval_before": 40,
+            "eval_after": 120,
+            "eval_delta": 80,
+            "position_state": "winning",
+            "move_quality": "strong",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"line": "I crush their line and keep marching."}
+    assert len(prompts) == 2
+    assert "Do not reuse the previous wording." in prompts[1]
 
 
 def test_create_gemini_piece_voice_line_retries_empty_response(monkeypatch) -> None:
@@ -792,7 +1046,7 @@ def test_create_gemini_piece_voice_line_retries_empty_response(monkeypatch) -> N
 
 
 def test_create_gemini_piece_voice_line_repairs_fragment_response(monkeypatch) -> None:
-    responses = iter(["By holy", "Judgment", "Judgment falls now."])
+    responses = iter(["By holy", "Judgment", "Judgment falls upon them now."])
     prompts: list[str] = []
 
     async def fake_post(self, url: str, *, headers=None, json=None) -> httpx.Response:
@@ -849,7 +1103,7 @@ def test_create_gemini_piece_voice_line_repairs_fragment_response(monkeypatch) -
     )
 
     assert response.status_code == 200
-    assert response.json() == {"line": "Judgment falls now."}
+    assert response.json() == {"line": "Judgment falls upon them now."}
     assert len(prompts) == 3
     assert "Do not reuse the previous wording." in prompts[1]
     assert "finished in-character sentence" in prompts[2]
