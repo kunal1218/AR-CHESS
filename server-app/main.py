@@ -304,6 +304,7 @@ class GeminiPieceVoiceRequest(BaseModel):
     fen: str = Field(..., min_length=1, max_length=256)
     piece_type: str = Field(..., min_length=1, max_length=16)
     piece_color: str = Field(..., min_length=1, max_length=16)
+    recent_lines: list[str] = Field(default_factory=list, max_length=6)
     context_mode: str = Field(default="moved", min_length=1, max_length=16)
     from_square: str = Field(..., min_length=2, max_length=2)
     to_square: str = Field(..., min_length=2, max_length=2)
@@ -350,6 +351,19 @@ class GeminiPieceVoiceRequest(BaseModel):
         if normalized not in {"white", "black"}:
             raise ValueError("piece_color must be 'white' or 'black'.")
         return normalized
+
+    @field_validator("recent_lines")
+    @classmethod
+    def validate_recent_lines(cls, value: list[str]) -> list[str]:
+        normalized_lines: list[str] = []
+        for line in value:
+            normalized = re.sub(r"\s+", " ", line).strip()
+            if not normalized:
+                continue
+            normalized_lines.append(normalized[:180])
+            if len(normalized_lines) >= 6:
+                break
+        return normalized_lines
 
     @field_validator("context_mode")
     @classmethod
@@ -679,6 +693,23 @@ def is_complete_piece_voice_line_text(text: str) -> bool:
     return condensed.endswith((".", "!", "?")) and not condensed.endswith("...")
 
 
+def piece_voice_repetition_key(text: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9\s]", " ", text.lower())).strip()
+
+
+def is_piece_voice_line_repetitive(text: str, recent_lines: list[str]) -> bool:
+    candidate_key = piece_voice_repetition_key(text)
+    if not candidate_key:
+        return False
+
+    recent_keys = {
+        piece_voice_repetition_key(line)
+        for line in recent_lines
+        if piece_voice_repetition_key(line)
+    }
+    return candidate_key in recent_keys
+
+
 def build_gemini_user_query(payload: GeminiHintRequest) -> str:
     piece_name = payload.moving_piece or "piece"
     capture_text = "yes" if payload.is_capture else "no"
@@ -748,6 +779,14 @@ def build_piece_voice_line_query(payload: GeminiPieceVoiceRequest) -> str:
         if context_mode == "moved"
         else f"Current square: {payload.to_square}"
     )
+    recent_lines_text = ""
+    if payload.recent_lines:
+        formatted_recent_lines = "\n".join(f"- {line}" for line in payload.recent_lines)
+        recent_lines_text = (
+            "\nRecent lines to avoid repeating:\n"
+            f"{formatted_recent_lines}\n"
+            "Do not reuse these exact lines or their core phrasing.\n"
+        )
     return (
         "You are generating a single short in-character voice line spoken by a selected chess piece. "
         "You must speak as the selected piece itself, not as a narrator. "
@@ -756,9 +795,10 @@ def build_piece_voice_line_query(payload: GeminiPieceVoiceRequest) -> str:
         "whether the piece is in danger, whether the piece is threatening the enemy king, "
         "and whether the move was strong, desperate, defensive, aggressive, or poor. "
         f"{context_instruction} "
-        "Keep the line short, vivid, and punchy. Aim for 4 to 8 words. Minimum 3 words. Maximum 12 words. "
+        "Keep the line short, vivid, punchy, and freshly phrased. Aim for 5 to 10 words. Minimum 3 words. Maximum 12 words. "
         "Return exactly one complete sentence, not a fragment. End the sentence with a period, exclamation point, or question mark. "
         "Do not return a single word, single letter, grunt, or filler fragment. "
+        "Prefer novel wording over signature catchphrases. "
         "Output only the line itself.\n\n"
         "Piece personality rules:\n"
         "Pawn: bloodthirsty barbarian frontline warrior. Loves combat. Proud to be in the trenches. "
@@ -807,6 +847,7 @@ def build_piece_voice_line_query(payload: GeminiPieceVoiceRequest) -> str:
         f"Eval before: {eval_before}\n"
         f"Eval after: {eval_after}\n"
         f"Eval delta: {eval_delta}"
+        f"{recent_lines_text}"
     )
 
 
@@ -823,6 +864,20 @@ def build_piece_voice_line_retry_query(payload: GeminiPieceVoiceRequest, previou
         + "Do not reuse the previous wording. "
         + "Do not return labels, quotes, headings, or explanations. "
         + f"Previous invalid answer: {trimmed_previous or '(empty)'}"
+    )
+
+
+def build_piece_voice_line_duplicate_retry_query(payload: GeminiPieceVoiceRequest, previous_response: str) -> str:
+    trimmed_previous = re.sub(r"\s+", " ", previous_response).strip()
+    return (
+        build_piece_voice_line_query(payload)
+        + "\n\n"
+        + "Your previous answer repeated recent wording. "
+        + "Return a fresh alternative with noticeably different phrasing right now. "
+        + "Keep it in character, complete, and punchy. "
+        + "Do not echo the same stock slogan, opening words, or core phrase. "
+        + "Do not return labels, quotes, headings, or explanations. "
+        + f"Repeated answer to replace: {trimmed_previous or '(empty)'}"
     )
 
 
@@ -1111,9 +1166,9 @@ async def fetch_gemini_piece_voice_line_text(prompt_text: str, *, temperature: f
             }
         ],
         "generationConfig": {
-            "temperature": temperature if temperature is not None else env_float("GEMINI_PIECE_VOICE_TEMPERATURE", 0.85),
-            "topP": env_float("GEMINI_PIECE_VOICE_TOP_P", 0.95),
-            "topK": env_int("GEMINI_PIECE_VOICE_TOP_K", 40),
+            "temperature": temperature if temperature is not None else env_float("GEMINI_PIECE_VOICE_TEMPERATURE", 1.05),
+            "topP": env_float("GEMINI_PIECE_VOICE_TOP_P", 0.98),
+            "topK": env_int("GEMINI_PIECE_VOICE_TOP_K", 64),
             "maxOutputTokens": env_int("GEMINI_PIECE_VOICE_MAX_OUTPUT_TOKENS", 80),
         },
     }
@@ -1974,14 +2029,19 @@ async def create_gemini_piece_voice_line(payload: GeminiPieceVoiceRequest) -> di
         raw_line = await fetch_gemini_piece_voice_line_text(query)
         line = normalize_piece_voice_line_text(sanitize_piece_voice_line_text(raw_line))
 
+        if is_piece_voice_line_repetitive(line, payload.recent_lines):
+            duplicate_retry_query = build_piece_voice_line_duplicate_retry_query(payload, raw_line)
+            raw_line = await fetch_gemini_piece_voice_line_text(duplicate_retry_query, temperature=1.2)
+            line = normalize_piece_voice_line_text(sanitize_piece_voice_line_text(raw_line))
+
         if not is_complete_piece_voice_line_text(line):
             retry_query = build_piece_voice_line_retry_query(payload, raw_line)
-            raw_line = await fetch_gemini_piece_voice_line_text(retry_query, temperature=0.75)
+            raw_line = await fetch_gemini_piece_voice_line_text(retry_query, temperature=1.0)
             line = normalize_piece_voice_line_text(sanitize_piece_voice_line_text(raw_line))
 
         if not is_complete_piece_voice_line_text(line):
             repair_query = build_piece_voice_line_repair_query(payload, raw_line)
-            raw_line = await fetch_gemini_piece_voice_line_text(repair_query, temperature=0.55)
+            raw_line = await fetch_gemini_piece_voice_line_text(repair_query, temperature=0.7)
             line = normalize_piece_voice_line_text(sanitize_piece_voice_line_text(raw_line))
     except GeminiLiveConfigurationError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
@@ -1995,6 +2055,8 @@ async def create_gemini_piece_voice_line(payload: GeminiPieceVoiceRequest) -> di
 
     if not is_complete_piece_voice_line_text(line):
         raise HTTPException(status_code=503, detail="Gemini piece voice returned no usable line.")
+    if is_piece_voice_line_repetitive(line, payload.recent_lines):
+        raise HTTPException(status_code=503, detail="Gemini piece voice repeated a recent line.")
 
     return {"line": line}
 

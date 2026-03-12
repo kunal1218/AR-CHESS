@@ -533,6 +533,7 @@ private struct GeminiPieceVoiceLineRequestPayload: Encodable {
   let fen: String
   let piece_type: String
   let piece_color: String
+  let recent_lines: [String]
   let context_mode: String
   let from_square: String
   let to_square: String
@@ -636,6 +637,7 @@ private struct GeminiPieceVoiceLineContext {
   let fen: String
   let pieceType: ChessPieceKind
   let pieceColor: ChessColor
+  let recentLines: [String]
   let contextMode: PieceVoiceContextMode
   let fromSquare: BoardSquare
   let toSquare: BoardSquare
@@ -1964,6 +1966,7 @@ private final class SocraticCoachStore: ObservableObject {
 
 private final class GeminiHintService {
   private static let logger = Logger(subsystem: "ARChess", category: "GeminiHint")
+  private static let pieceVoiceTimeoutSeconds: TimeInterval = 2.4
 
   private let apiBaseURL: URL?
   private let session: URLSession
@@ -2158,7 +2161,7 @@ private final class GeminiHintService {
         .appendingPathComponent("piece-voice-line")
     )
     request.httpMethod = "POST"
-    request.timeoutInterval = 8.0
+    request.timeoutInterval = Self.pieceVoiceTimeoutSeconds
     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
     request.setValue("application/json", forHTTPHeaderField: "Accept")
     request.httpBody = try JSONEncoder().encode(
@@ -2166,6 +2169,7 @@ private final class GeminiHintService {
         fen: context.fen,
         piece_type: context.pieceType.displayName.lowercased(),
         piece_color: context.pieceColor.displayName.lowercased(),
+        recent_lines: context.recentLines,
         context_mode: context.contextMode.rawValue,
         from_square: context.fromSquare.algebraic,
         to_square: context.toSquare.algebraic,
@@ -4181,6 +4185,22 @@ private final class CaptureSoundEffectEngine {
     mixer.outputVolume = 0.95
   }
 
+  func prewarmIfNeeded() {
+    queue.async { [weak self] in
+      guard let self else {
+        return
+      }
+
+      do {
+        try self.ensureRunning()
+        _ = self.moveBuffers.count
+        _ = self.buffers.count
+      } catch {
+        Self.logger.debug("Capture SFX prewarm skipped: \(error.localizedDescription, privacy: .public)")
+      }
+    }
+  }
+
   func play(_ effect: CaptureImpactSound) {
     if effect == .pawnSword {
       playFileResource(named: "pawnSword", extension: "mp3", volume: 0.88)
@@ -5744,6 +5764,36 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   private static let ambientPieceVoiceLineChance = 0.35
   private static let pieceVoiceLineCharacterLimit = 180
   private static let speechPrewarmDelayNanoseconds: UInt64 = 250_000_000
+  private static let pieceVoicePrewarmDelayNanoseconds: UInt64 = experienceStartupRemoteWorkDelayNanoseconds
+  private static let urgentPieceVoiceSFXOverlapAllowance: TimeInterval = 0.16
+  private static let pieceVoiceWarmupContext = GeminiPieceVoiceLineContext(
+    fen: ChessGameState.initial().fenString,
+    pieceType: .pawn,
+    pieceColor: .white,
+    recentLines: [],
+    contextMode: .moved,
+    fromSquare: BoardSquare(file: 4, rank: 1),
+    toSquare: BoardSquare(file: 4, rank: 3),
+    isCapture: false,
+    isCheck: false,
+    isNearEnemyKing: false,
+    isAttacked: false,
+    isAttackedByMultiple: false,
+    isDefended: true,
+    isWellDefended: false,
+    isHanging: false,
+    isPinned: false,
+    isRetreat: false,
+    isAggressiveAdvance: true,
+    isForkThreat: false,
+    attackerCount: 0,
+    defenderCount: 1,
+    evalBefore: 0,
+    evalAfter: 18,
+    evalDelta: 18,
+    positionState: .equal,
+    moveQuality: .aggressive
+  )
 
   struct ReactionCue {
     enum Kind {
@@ -5852,7 +5902,12 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   private var commentaryRequestTask: Task<Void, Never>?
   private var stockfishDebugVisible = false
   private var speechPrewarmTask: Task<Void, Never>?
+  private var pieceVoicePrewarmTask: Task<Void, Never>?
+  private var pieceVoiceRequestTask: Task<Void, Never>?
   private var hasPrewarmedSpeechPath = false
+  private var hasPrewarmedPieceVoicePath = false
+  private var silentSpeechWarmupUtteranceIDs: Set<ObjectIdentifier> = []
+  private var latestPieceVoiceRequestID = 0
 
   init(narrator: NarratorType = .silky) {
     self.narrator = narrator
@@ -5864,6 +5919,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   func attachEngineHost(to view: UIView) {
     analyzer.attach(to: view)
     prepareSpeechPathIfNeeded()
+    preparePieceVoicePathIfNeeded()
   }
 
   func prepareEngineIfNeeded() {
@@ -5916,11 +5972,62 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       do {
         try AudioSessionCoordinator.shared.activatePlaybackSession()
         _ = AVSpeechSynthesisVoice(language: "en-US")
+        self.prewarmSpeechSynthesizerIfNeeded()
         self.hasPrewarmedSpeechPath = true
       } catch {
         return
       }
     }
+  }
+
+  private func preparePieceVoicePathIfNeeded() {
+    guard hintService.isConfigured,
+          pieceVoicePrewarmTask == nil,
+          !hasPrewarmedPieceVoicePath else {
+      return
+    }
+
+    pieceVoicePrewarmTask = Task { @MainActor [weak self] in
+      guard let self else {
+        return
+      }
+
+      defer {
+        self.pieceVoicePrewarmTask = nil
+      }
+
+      try? await Task.sleep(nanoseconds: Self.pieceVoicePrewarmDelayNanoseconds)
+      guard !Task.isCancelled else {
+        return
+      }
+
+      do {
+        _ = try await self.hintService.fetchPieceVoiceLine(for: Self.pieceVoiceWarmupContext)
+        self.hasPrewarmedPieceVoicePath = true
+        self.appendGeminiDebug("Prewarmed Gemini piece voice path during startup.")
+      } catch is CancellationError {
+        return
+      } catch {
+        self.appendGeminiDebug("Gemini piece voice prewarm skipped: \(error.localizedDescription)")
+      }
+    }
+  }
+
+  private func prewarmSpeechSynthesizerIfNeeded() {
+    guard !synthesizer.isSpeaking else {
+      return
+    }
+
+    let utterance = AVSpeechUtterance(string: "Voice systems ready.")
+    utterance.voice = AVSpeechSynthesisVoice(language: "en-US")
+    utterance.pitchMultiplier = 1.0
+    utterance.rate = 0.47
+    utterance.volume = 0.0
+    utterance.preUtteranceDelay = 0
+
+    let utteranceID = ObjectIdentifier(utterance)
+    silentSpeechWarmupUtteranceIDs.insert(utteranceID)
+    synthesizer.speak(utterance)
   }
 
   func prepare(with state: ChessGameState, force: Bool = false) async {
@@ -5980,6 +6087,8 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     hintTask = nil
     commentaryRequestTask?.cancel()
     commentaryRequestTask = nil
+    pieceVoiceRequestTask?.cancel()
+    pieceVoiceRequestTask = nil
     geminiStatusTask?.cancel()
     geminiStatusTask = nil
     engineWarmupTask?.cancel()
@@ -5996,6 +6105,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     coachLines = []
     pieceVoiceLines = []
     pieceVoiceStatusText = "Waiting for a move."
+    latestPieceVoiceRequestID = 0
     topWorkers = []
     topTraitors = []
     stockfishDebugStatusText = "Open Stockfish debug to inspect engine candidates."
@@ -6200,6 +6310,18 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     narrationHighlightHandler = nil
   }
 
+  func startPieceVoiceLineRequest(
+    move: ChessMove,
+    before beforeState: ChessGameState,
+    after afterState: ChessGameState
+  ) {
+    maybeTriggerPieceVoiceLine(
+      move: move,
+      before: beforeState,
+      after: afterState
+    )
+  }
+
   func handleMove(
     move: ChessMove,
     before beforeState: ChessGameState,
@@ -6208,12 +6330,6 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     if afterState.isCheckmate(for: afterState.turn) {
       latestAssessment = "Checkmate."
     }
-
-    maybeTriggerPieceVoiceLine(
-      move: move,
-      before: beforeState,
-      after: afterState
-    )
 
     let beforeAnalysis = await analysisForCurrentTurn(state: beforeState)
     let afterAnalysis = await analysisForCurrentTurn(state: afterState)
@@ -6283,12 +6399,25 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   }
 
   func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didStart utterance: AVSpeechUtterance) {
+    let utteranceID = ObjectIdentifier(utterance)
+    guard !silentSpeechWarmupUtteranceIDs.contains(utteranceID) else {
+      return
+    }
+
     AmbientMusicController.shared.setSpeechActive(true)
-    caption = utteranceCaptions[ObjectIdentifier(utterance)]
+    caption = utteranceCaptions[utteranceID]
   }
 
   func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
-    utteranceCaptions[ObjectIdentifier(utterance)] = nil
+    let utteranceID = ObjectIdentifier(utterance)
+    if silentSpeechWarmupUtteranceIDs.remove(utteranceID) != nil {
+      if !synthesizer.isSpeaking {
+        flushPendingGeneratedNarrationIfPossible()
+      }
+      return
+    }
+
+    utteranceCaptions[utteranceID] = nil
     if !synthesizer.isSpeaking {
       AmbientMusicController.shared.setSpeechActive(false)
       caption = nil
@@ -6297,7 +6426,15 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   }
 
   func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
-    utteranceCaptions[ObjectIdentifier(utterance)] = nil
+    let utteranceID = ObjectIdentifier(utterance)
+    if silentSpeechWarmupUtteranceIDs.remove(utteranceID) != nil {
+      if !synthesizer.isSpeaking {
+        flushPendingGeneratedNarrationIfPossible()
+      }
+      return
+    }
+
+    utteranceCaptions[utteranceID] = nil
     if !synthesizer.isSpeaking {
       AmbientMusicController.shared.setSpeechActive(false)
       caption = nil
@@ -6459,6 +6596,11 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     )
 
     let sessionID = narrationSessionID
+    latestPieceVoiceRequestID += 1
+    let requestID = latestPieceVoiceRequestID
+    pieceVoiceRequestTask?.cancel()
+    pieceVoiceRequestTask = nil
+    discardPendingPieceVoiceNarrations()
 
     pieceVoiceStatusText = "Requesting \(plan.label)..."
     appendGeminiDebug("Triggering Gemini piece voice for \(plan.label).")
@@ -6470,9 +6612,15 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
         "state=\(plan.context.positionState.rawValue) quality=\(plan.context.moveQuality.rawValue)"
     )
 
-    Task { @MainActor [weak self] in
+    pieceVoiceRequestTask = Task { @MainActor [weak self] in
       guard let self else {
         return
+      }
+
+      defer {
+        if self.latestPieceVoiceRequestID == requestID {
+          self.pieceVoiceRequestTask = nil
+        }
       }
 
       do {
@@ -6480,6 +6628,10 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
         guard self.narrationSessionID == sessionID else {
           self.pieceVoiceStatusText = "Dropped after session reset."
           self.appendGeminiDebug("Dropped stale Gemini piece voice line because the session reset.")
+          return
+        }
+        guard self.latestPieceVoiceRequestID == requestID else {
+          self.appendGeminiDebug("Dropped stale Gemini piece voice line because a newer move requested speech.")
           return
         }
 
@@ -6496,12 +6648,19 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
 
         self.emitPieceVoiceLine(sanitizedLine, for: plan, statusPrefix: "Generated")
       } catch is CancellationError {
+        guard self.latestPieceVoiceRequestID == requestID else {
+          return
+        }
         self.pieceVoiceStatusText = "Piece voice request cancelled."
         return
       } catch {
         guard self.narrationSessionID == sessionID else {
           self.pieceVoiceStatusText = "Dropped after session reset."
           self.appendGeminiDebug("Dropped stale fallback piece voice line because the session reset.")
+          return
+        }
+        guard self.latestPieceVoiceRequestID == requestID else {
+          self.appendGeminiDebug("Dropped stale fallback piece voice line because a newer move requested speech.")
           return
         }
         self.appendGeminiDebug("Gemini piece voice request failed: \(error.localizedDescription). Using local fallback.")
@@ -6525,13 +6684,15 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
         excluding: move.to
        ) {
       let speaker = personalitySpeaker(for: ambientSpeaker.piece.kind)
+      let recentLines = recentPieceVoiceLines(for: speaker)
       let context = buildPieceVoiceLineContext(
         speakingSquare: ambientSpeaker.square,
         piece: ambientSpeaker.piece,
         contextMode: .ambient,
         before: beforeState,
         after: afterState,
-        referenceMove: move
+        referenceMove: move,
+        recentLines: recentLines
       )
       return PieceVoiceRequestPlan(
         speaker: speaker,
@@ -6541,13 +6702,15 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     }
 
     let speaker = personalitySpeaker(for: move.piece.kind)
+    let recentLines = recentPieceVoiceLines(for: speaker)
     let context = buildPieceVoiceLineContext(
       speakingSquare: move.to,
       piece: move.piece,
       contextMode: .moved,
       before: beforeState,
       after: afterState,
-      referenceMove: move
+      referenceMove: move,
+      recentLines: recentLines
     )
     return PieceVoiceRequestPlan(
       speaker: speaker,
@@ -6647,7 +6810,8 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     after afterState: ChessGameState,
     referenceMove: ChessMove? = nil,
     beforeAnalysis: StockfishAnalysis? = nil,
-    afterAnalysis: StockfishAnalysis? = nil
+    afterAnalysis: StockfishAnalysis? = nil,
+    recentLines: [String] = []
   ) -> GeminiPieceVoiceLineContext {
     let moverColor = piece.color
     let opponent = moverColor.opponent
@@ -6717,6 +6881,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       fen: afterState.fenString,
       pieceType: piece.kind,
       pieceColor: moverColor,
+      recentLines: recentLines,
       contextMode: contextMode,
       fromSquare: fromSquare,
       toSquare: speakingSquare,
@@ -6839,6 +7004,89 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     }
   }
 
+  private func pieceVoiceFingerprint(_ text: String) -> String {
+    text
+      .lowercased()
+      .replacingOccurrences(of: #"[^a-z0-9\s]"#, with: " ", options: .regularExpression)
+      .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+  }
+
+  private func recentPieceVoiceLines(
+    for speaker: PersonalitySpeaker,
+    limit: Int = 4
+  ) -> [String] {
+    let prefix = "\(speaker.displayName): "
+    return Array(
+      pieceVoiceLines
+        .reversed()
+        .compactMap { line -> String? in
+          guard line.hasPrefix(prefix) else {
+            return nil
+          }
+          let body = String(line.dropFirst(prefix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+          return body.isEmpty ? nil : body
+        }
+        .prefix(limit)
+    )
+  }
+
+  private func hasRecentPieceVoiceLine(
+    _ text: String,
+    for speaker: PersonalitySpeaker,
+    limit: Int = 4
+  ) -> Bool {
+    let fingerprint = pieceVoiceFingerprint(text)
+    guard !fingerprint.isEmpty else {
+      return false
+    }
+
+    return recentPieceVoiceLines(for: speaker, limit: limit).contains {
+      pieceVoiceFingerprint($0) == fingerprint
+    }
+  }
+
+  private func discardPendingPieceVoiceNarrations() {
+    let originalCount = pendingGeneratedNarrations.count
+    pendingGeneratedNarrations.removeAll { pending in
+      if case .pieceVoice = pending.style {
+        return true
+      }
+      return false
+    }
+
+    let droppedCount = originalCount - pendingGeneratedNarrations.count
+    guard droppedCount > 0 else {
+      return
+    }
+
+    appendGeminiDebug("Dropped \(droppedCount) queued stale piece voice line(s).")
+    if pendingGeneratedNarrations.isEmpty {
+      geminiNarrationRetryWorkItem?.cancel()
+      geminiNarrationRetryWorkItem = nil
+    }
+  }
+
+  private func pickDistinctPieceVoiceOption(
+    _ options: [String],
+    for speaker: PersonalitySpeaker,
+    extraAvoiding additionalLines: [String] = []
+  ) -> String {
+    let avoidFingerprints = Set(
+      recentPieceVoiceLines(for: speaker, limit: 6)
+        .map { pieceVoiceFingerprint($0) }
+        .filter { !$0.isEmpty }
+        + additionalLines.map { pieceVoiceFingerprint($0) }.filter { !$0.isEmpty }
+    )
+    let shuffledOptions = options.shuffled()
+
+    if let distinctOption = shuffledOptions.first(where: { !avoidFingerprints.contains(pieceVoiceFingerprint($0)) }) {
+      return distinctOption
+    }
+
+    return shuffledOptions.first ?? options.first ?? ""
+  }
+
   private func recordPieceVoiceLine(_ line: String) {
     pieceVoiceLines.append(line)
     if pieceVoiceLines.count > 8 {
@@ -6852,11 +7100,21 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     for plan: PieceVoiceRequestPlan,
     statusPrefix: String
   ) {
-    let debugLine = "\(plan.speaker.displayName): \(text)"
-    pieceVoiceStatusText = "\(statusPrefix): \(debugLine)"
+    var resolvedText = text
+    var resolvedStatusPrefix = statusPrefix
+    if hasRecentPieceVoiceLine(resolvedText, for: plan.speaker) {
+      appendGeminiDebug(
+        "Piece voice line repeated recent wording for \(plan.speaker.displayName.lowercased()); using a varied local fallback."
+      )
+      resolvedText = fallbackPieceVoiceLine(for: plan, avoiding: [resolvedText])
+      resolvedStatusPrefix = "Fallback"
+    }
+
+    let debugLine = "\(plan.speaker.displayName): \(resolvedText)"
+    pieceVoiceStatusText = "\(resolvedStatusPrefix): \(debugLine)"
     recordPieceVoiceLine(debugLine)
     let spokeImmediately = speakGeneratedPieceVoiceLine(
-      text: text,
+      text: resolvedText,
       speaker: plan.speaker,
       priority: .urgent
     )
@@ -6867,85 +7125,297 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     )
   }
 
-  private func fallbackPieceVoiceLine(for plan: PieceVoiceRequestPlan) -> String {
+  private func fallbackPieceVoiceLine(
+    for plan: PieceVoiceRequestPlan,
+    avoiding additionalLines: [String] = []
+  ) -> String {
     let context = plan.context
 
     switch plan.speaker {
     case .pawn:
       if context.isCapture {
-        return "Another body falls in the mud."
+        return pickDistinctPieceVoiceOption(
+          [
+            "Another body falls in the mud.",
+            "The mud takes one more.",
+            "One more fool sinks under my boots.",
+          ],
+          for: plan.speaker,
+          extraAvoiding: additionalLines
+        )
       }
       if context.isCheck {
-        return "Press on. Their king can smell me."
+        return pickDistinctPieceVoiceOption(
+          [
+            "Press on. Their king can smell me.",
+            "Good. Their king finally smells the trench.",
+            "Closer now. Let their king taste the mud.",
+          ],
+          for: plan.speaker,
+          extraAvoiding: additionalLines
+        )
       }
       if context.isRetreat {
-        return "Back a step. Then back into blood."
+        return pickDistinctPieceVoiceOption(
+          [
+            "Back a step. Then back into blood.",
+            "One pace back. Then straight into slaughter.",
+            "I yield a step, not the fight.",
+          ],
+          for: plan.speaker,
+          extraAvoiding: additionalLines
+        )
       }
-      return context.contextMode == .ambient
-        ? "I am ready for the next brawl."
-        : "Forward. The trench still wants bodies."
+      return pickDistinctPieceVoiceOption(
+        context.contextMode == .ambient
+          ? [
+            "I am ready for the next brawl.",
+            "Say the word. I will wade in again.",
+            "The trench is quiet. I do not trust it.",
+          ]
+          : [
+            "Forward. The trench still wants bodies.",
+            "Forward again. Mud first, glory second.",
+            "Boots forward. The killing field is hungry.",
+            "Another square taken. The trench opens wider.",
+          ],
+        for: plan.speaker,
+        extraAvoiding: additionalLines
+      )
     case .rook:
       if context.isCapture {
-        return "I break their line and keep rolling."
+        return pickDistinctPieceVoiceOption(
+          [
+            "I break their line and keep rolling.",
+            "One wall down. I keep coming.",
+            "Their line buckles under me.",
+          ],
+          for: plan.speaker,
+          extraAvoiding: additionalLines
+        )
       }
       if context.isCheck {
-        return "Their king hears the tower coming."
+        return pickDistinctPieceVoiceOption(
+          [
+            "Their king hears the tower coming.",
+            "The tower is at their king's door.",
+            "Let their king hear the stones grind.",
+          ],
+          for: plan.speaker,
+          extraAvoiding: additionalLines
+        )
       }
       if context.isPinned || context.isAttackedByMultiple {
-        return "Let them crowd me. I crush through crowds."
+        return pickDistinctPieceVoiceOption(
+          [
+            "Let them crowd me. I crush through crowds.",
+            "Crowds are softer than stone.",
+            "Pile them up. I flatten piles.",
+          ],
+          for: plan.speaker,
+          extraAvoiding: additionalLines
+        )
       }
-      return context.contextMode == .ambient
-        ? "Hold the file. I am not done here."
-        : "I move once. The whole file shudders."
+      return pickDistinctPieceVoiceOption(
+        context.contextMode == .ambient
+          ? [
+            "Hold the file. I am not done here.",
+            "This file stays mine until it splinters.",
+            "I hold this lane and dare them closer.",
+          ]
+          : [
+            "I move once. The whole file shudders.",
+            "One shove from me shifts the board.",
+            "The file groans when I advance.",
+          ],
+        for: plan.speaker,
+        extraAvoiding: additionalLines
+      )
     case .knight:
       if context.isForkThreat {
-        return "A graceful fork is already in motion."
+        return pickDistinctPieceVoiceOption(
+          [
+            "A graceful fork is already in motion.",
+            "Two throats already fit this angle.",
+            "I have prepared a very elegant fork.",
+          ],
+          for: plan.speaker,
+          extraAvoiding: additionalLines
+        )
       }
       if context.isCapture {
-        return "A neat cut. The dance continues."
+        return pickDistinctPieceVoiceOption(
+          [
+            "A neat cut. The dance continues.",
+            "A lovely cut. The dance improves.",
+            "A tidy little kill. Onward.",
+          ],
+          for: plan.speaker,
+          extraAvoiding: additionalLines
+        )
       }
       if context.isRetreat {
-        return "A measured retreat sharpens the next strike."
+        return pickDistinctPieceVoiceOption(
+          [
+            "A measured retreat sharpens the next strike.",
+            "One courteous retreat, then mischief.",
+            "I withdraw only to improve the angle.",
+          ],
+          for: plan.speaker,
+          extraAvoiding: additionalLines
+        )
       }
-      return context.contextMode == .ambient
-        ? "I circle quietly before the next flourish."
-        : "A stylish leap was overdue."
+      return pickDistinctPieceVoiceOption(
+        context.contextMode == .ambient
+          ? [
+            "I circle quietly before the next flourish.",
+            "Patience. The next leap should be prettier.",
+            "I am merely choosing the most dramatic route.",
+          ]
+          : [
+            "A stylish leap was overdue.",
+            "At last, a square with some flair.",
+            "I do prefer an entrance with shape.",
+          ],
+        for: plan.speaker,
+        extraAvoiding: additionalLines
+      )
     case .bishop:
       if context.isCheck {
-        return "Judgment reaches their king at last."
+        return pickDistinctPieceVoiceOption(
+          [
+            "Judgment reaches their king at last.",
+            "At last, judgment touches their king.",
+            "Their king stands inside the sermon now.",
+          ],
+          for: plan.speaker,
+          extraAvoiding: additionalLines
+        )
       }
       if context.isCapture {
-        return "Another sinner falls under holy fire."
+        return pickDistinctPieceVoiceOption(
+          [
+            "Another sinner falls under holy fire.",
+            "One more sinner burns on the diagonal.",
+            "Holy fire claims another unbeliever.",
+          ],
+          for: plan.speaker,
+          extraAvoiding: additionalLines
+        )
       }
       if context.isPinned {
-        return "Even pinned, I keep my faith and aim."
+        return pickDistinctPieceVoiceOption(
+          [
+            "Even pinned, I keep my faith and aim.",
+            "My body is pinned. My judgment is not.",
+            "Pin the flesh if you like. The faith still fires.",
+          ],
+          for: plan.speaker,
+          extraAvoiding: additionalLines
+        )
       }
-      return context.contextMode == .ambient
-        ? "I watch the diagonal and wait for sin."
-        : "This diagonal now belongs to judgment."
+      return pickDistinctPieceVoiceOption(
+        context.contextMode == .ambient
+          ? [
+            "I watch the diagonal and wait for sin.",
+            "The diagonal is quiet. Sin rarely stays quiet.",
+            "I keep the diagonal clean for judgment.",
+          ]
+          : [
+            "This diagonal now belongs to judgment.",
+            "I have claimed this diagonal in righteous fire.",
+            "The diagonal bends toward judgment now.",
+          ],
+        for: plan.speaker,
+        extraAvoiding: additionalLines
+      )
     case .queen:
       if context.isCheck {
-        return "There. The king finally notices me."
+        return pickDistinctPieceVoiceOption(
+          [
+            "There. The king finally notices me.",
+            "Good. Their king has learned my name.",
+            "At last, their king pays attention.",
+          ],
+          for: plan.speaker,
+          extraAvoiding: additionalLines
+        )
       }
       if context.isCapture {
-        return "Cleanup, again. You are welcome."
+        return pickDistinctPieceVoiceOption(
+          [
+            "Cleanup, again. You are welcome.",
+            "I clean up. As usual.",
+            "Another mess fixed by the only competent piece.",
+          ],
+          for: plan.speaker,
+          extraAvoiding: additionalLines
+        )
       }
       if context.isAttacked {
-        return "Honestly, this square had better be worth it."
+        return pickDistinctPieceVoiceOption(
+          [
+            "Honestly, this square had better be worth it.",
+            "If I am taking fire, this had better matter.",
+            "Charming. They finally noticed quality.",
+          ],
+          for: plan.speaker,
+          extraAvoiding: additionalLines
+        )
       }
-      return context.contextMode == .ambient
-        ? "I remain the only adult on this board."
-        : "Try to keep up with my standards."
+      return pickDistinctPieceVoiceOption(
+        context.contextMode == .ambient
+          ? [
+            "I remain the only adult on this board.",
+            "Someone on this board must stay competent.",
+            "I supervise because clearly no one else can.",
+          ]
+          : [
+            "Try to keep up with my standards.",
+            "Do keep pace. I dislike waiting.",
+            "I moved. The rest of you may now catch up.",
+          ],
+        for: plan.speaker,
+        extraAvoiding: additionalLines
+      )
     case .king:
       if context.positionState == .losing || context.isAttacked {
-        return "Keep them off me and we survive this."
+        return pickDistinctPieceVoiceOption(
+          [
+            "Keep them off me and we survive this.",
+            "Hold them back and I may keep the crown.",
+            "Stand between me and disaster, immediately.",
+          ],
+          for: plan.speaker,
+          extraAvoiding: additionalLines
+        )
       }
       if context.isCheck {
-        return "Good. Let them feel the crown advance."
+        return pickDistinctPieceVoiceOption(
+          [
+            "Good. Let them feel the crown advance.",
+            "Yes. Let them learn what the crown can do.",
+            "The crown advances. They will answer for it.",
+          ],
+          for: plan.speaker,
+          extraAvoiding: additionalLines
+        )
       }
-      return context.contextMode == .ambient
-        ? "Hold formation. The crown is still intact."
-        : "The crown steps forward. Behave accordingly."
+      return pickDistinctPieceVoiceOption(
+        context.contextMode == .ambient
+          ? [
+            "Hold formation. The crown is still intact.",
+            "Hold steady. The crown still stands.",
+            "Keep rank. The throne still breathes.",
+          ]
+          : [
+            "The crown steps forward. Behave accordingly.",
+            "I advance. Let the board remember its king.",
+            "The crown moves. Make yourselves useful.",
+          ],
+        for: plan.speaker,
+        extraAvoiding: additionalLines
+      )
     }
   }
 
@@ -7907,7 +8377,11 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       utteranceCaptions.removeAll()
     }
 
-    let pieceAudioBusyDuration = pieceAudioBusyDurationProvider?() ?? 0
+    let pieceAudioBusyDuration = blockingPieceAudioBusyDuration(
+      for: style,
+      priority: priority,
+      rawDuration: pieceAudioBusyDurationProvider?() ?? 0
+    )
     if synthesizer.isSpeaking || pieceAudioBusyDuration > 0.05 {
       let retryDelay = max(pieceAudioBusyDuration, priority == .urgent ? 0.05 : 0.08)
       if case .pieceVoice(let speaker) = style {
@@ -7969,6 +8443,12 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     let pending = PendingGeneratedNarration(text: text, style: style)
     switch style {
     case .pieceVoice:
+      pendingGeneratedNarrations.removeAll { existing in
+        if case .pieceVoice = existing.style {
+          return true
+        }
+        return false
+      }
       pendingGeneratedNarrations.insert(pending, at: 0)
     case .gemini:
       pendingGeneratedNarrations.append(pending)
@@ -7991,7 +8471,11 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       return
     }
 
-    let pieceAudioBusyDuration = pieceAudioBusyDurationProvider?() ?? 0
+    let pieceAudioBusyDuration = blockingPieceAudioBusyDuration(
+      for: pendingGeneratedNarration.style,
+      priority: .urgent,
+      rawDuration: pieceAudioBusyDurationProvider?() ?? 0
+    )
     guard !synthesizer.isSpeaking, pieceAudioBusyDuration <= 0.05 else {
       appendGeminiDebug(
         "Pending speech blocked for \(generatedNarrationDebugLabel(pendingGeneratedNarration.style)). synthesizer=\(synthesizer.isSpeaking) sfx_busy=\(String(format: "%.2f", pieceAudioBusyDuration))"
@@ -8005,6 +8489,24 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     geminiNarrationRetryWorkItem = nil
     appendGeminiDebug("Flushing queued \(generatedNarrationDebugLabel(pendingGeneratedNarration.style)) speech.")
     _ = startGeneratedNarrationNow(text: pendingGeneratedNarration.text, style: pendingGeneratedNarration.style)
+  }
+
+  private func blockingPieceAudioBusyDuration(
+    for style: GeneratedNarrationStyle,
+    priority: SpeechPriority,
+    rawDuration: TimeInterval
+  ) -> TimeInterval {
+    guard rawDuration > 0 else {
+      return 0
+    }
+
+    if priority == .urgent,
+       case .pieceVoice = style,
+       rawDuration <= Self.urgentPieceVoiceSFXOverlapAllowance {
+      return 0
+    }
+
+    return rawDuration
   }
 
   private func generatedNarrationDebugLabel(_ style: GeneratedNarrationStyle) -> String {
@@ -11617,6 +12119,7 @@ private struct NativeARView: UIViewRepresentable {
           self?.commentary.prepareEngineIfNeeded()
         }
       }
+      captureSoundEffects.prewarmIfNeeded()
       noteWarmupStatus(
         mode.warmsStockfishAnalysis
           ? "Scanning for board placement. Local Stockfish is warming in the background..."
@@ -13097,6 +13600,11 @@ private struct NativeARView: UIViewRepresentable {
       refreshBoardPresentation()
 
       captureSoundEffects.playMove(for: context.move.piece.kind)
+      commentary.startPieceVoiceLineRequest(
+        move: context.move,
+        before: context.beforeState,
+        after: context.afterState
+      )
 
       if context.move.captured != nil || context.move.isEnPassant {
         await animateCapture(for: context.move, beforeState: context.beforeState)

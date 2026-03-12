@@ -16,6 +16,7 @@ from main import (  # noqa: E402
     app,
     build_narrator_prompt,
     build_narrator_turn_addon,
+    build_piece_voice_line_duplicate_retry_query,
     build_piece_voice_line_query,
     build_piece_voice_line_retry_query,
     get_postgres_dsn,
@@ -491,6 +492,7 @@ def test_build_piece_voice_line_query_includes_personality_and_context() -> None
         fen="rnbqkbnr/pppppppp/8/8/4N3/8/PPPPPPPP/RNBQKB1R b KQkq - 1 1",
         piece_type="knight",
         piece_color="white",
+        recent_lines=["A stylish leap was overdue."],
         from_square="g1",
         to_square="e4",
         is_capture=False,
@@ -524,12 +526,21 @@ def test_build_piece_voice_line_query_includes_personality_and_context() -> None
     assert "Minimum 3 words." in query
     assert "Return exactly one complete sentence" in query
     assert "single word, single letter" in query
+    assert "Recent lines to avoid repeating:" in query
+    assert "A stylish leap was overdue." in query
 
     retry_query = build_piece_voice_line_retry_query(payload, 'Knight: "Too long."')
     assert "3 to 12 words" in retry_query
     assert "complete sentence ending with punctuation" in retry_query
     assert "Do not reuse the previous wording." in retry_query
     assert 'Previous invalid answer: Knight: "Too long."' in retry_query
+
+    duplicate_retry_query = build_piece_voice_line_duplicate_retry_query(
+        payload,
+        "A stylish leap was overdue.",
+    )
+    assert "repeated recent wording" in duplicate_retry_query
+    assert "noticeably different phrasing" in duplicate_retry_query
 
     from main import build_piece_voice_line_repair_query
 
@@ -832,6 +843,76 @@ def test_create_gemini_piece_voice_line_retries_empty_response(monkeypatch) -> N
     assert response.json() == {"line": "A sanctified strike through the dark."}
     assert len(prompts) == 2
     assert "Do not reuse the previous wording." in prompts[1]
+
+
+def test_create_gemini_piece_voice_line_retries_recent_duplicate(monkeypatch) -> None:
+    responses = iter(
+        [
+            "Forward. The trench still wants bodies.",
+            "Boots forward. The killing field is hungry.",
+        ]
+    )
+    prompts: list[str] = []
+
+    async def fake_post(self, url: str, *, headers=None, json=None) -> httpx.Response:
+        current = next(responses)
+        prompts.append(json["contents"][0]["parts"][0]["text"])
+        _ = headers
+        return httpx.Response(
+            200,
+            json={
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [
+                                {"text": current}
+                            ]
+                        }
+                    }
+                ]
+            },
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+    client = TestClient(app)
+    response = client.post(
+        "/v1/gemini/piece-voice-line",
+        json={
+            "fen": "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBR1 w KQkq - 0 1",
+            "piece_type": "pawn",
+            "piece_color": "white",
+            "recent_lines": ["Forward. The trench still wants bodies."],
+            "from_square": "e2",
+            "to_square": "e4",
+            "is_capture": False,
+            "is_check": False,
+            "is_near_enemy_king": False,
+            "is_attacked": False,
+            "is_attacked_by_multiple": False,
+            "is_defended": True,
+            "is_well_defended": False,
+            "is_hanging": False,
+            "is_pinned": False,
+            "is_retreat": False,
+            "is_aggressive_advance": True,
+            "is_fork_threat": False,
+            "attacker_count": 0,
+            "defender_count": 1,
+            "eval_before": 10,
+            "eval_after": 24,
+            "eval_delta": 14,
+            "position_state": "equal",
+            "move_quality": "aggressive",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"line": "Boots forward. The killing field is hungry."}
+    assert len(prompts) == 2
+    assert "Recent lines to avoid repeating:" in prompts[0]
+    assert "repeated recent wording" in prompts[1]
 
 
 def test_create_gemini_piece_voice_line_retries_truncated_sentence_without_punctuation(monkeypatch) -> None:
