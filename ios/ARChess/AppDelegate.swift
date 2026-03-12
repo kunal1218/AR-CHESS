@@ -5741,8 +5741,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   private static let kingCookedCooldownPly = 15
   private static let substantialGainThreshold = 120
   private static let substantialDropThreshold = -140
-  private static let movedPieceVoiceLineChance = 0.5
-  private static let ambientPieceVoiceLineChance = 0.5
+  private static let ambientPieceVoiceLineChance = 0.35
   private static let pieceVoiceLineCharacterLimit = 180
   private static let speechPrewarmDelayNanoseconds: UInt64 = 250_000_000
 
@@ -6453,15 +6452,11 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       return
     }
 
-    guard let plan = makePieceVoiceRequestPlan(
+    let plan = makePieceVoiceRequestPlan(
       move: move,
       before: beforeState,
       after: afterState
-    ) else {
-      pieceVoiceStatusText = "Skipped after moved/ambient roll."
-      appendGeminiDebug("Skipped piece voice after 50/50 moved and ambient rolls.")
-      return
-    }
+    )
 
     let sessionID = narrationSessionID
 
@@ -6489,31 +6484,32 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
         }
 
         let sanitizedLine = self.cappedPieceVoiceLineText(line)
-        guard !sanitizedLine.isEmpty else {
-          self.pieceVoiceStatusText = "Gemini returned an empty piece line."
-          self.appendGeminiDebug("Gemini piece voice line came back empty after sanitization.")
+        if sanitizedLine.isEmpty {
+          self.appendGeminiDebug("Gemini piece voice line came back empty after sanitization. Using local fallback.")
+          self.emitPieceVoiceLine(
+            self.fallbackPieceVoiceLine(for: plan),
+            for: plan,
+            statusPrefix: "Fallback"
+          )
           return
         }
 
-        let debugLine = "\(plan.speaker.displayName): \(sanitizedLine)"
-        self.pieceVoiceStatusText = "Generated: \(debugLine)"
-        self.recordPieceVoiceLine(debugLine)
-        let spokeImmediately = self.speakGeneratedPieceVoiceLine(
-          text: sanitizedLine,
-          speaker: plan.speaker,
-          priority: .urgent
-        )
-        self.appendGeminiDebug(
-          spokeImmediately
-            ? "Piece voice handed to speech engine for \(plan.speaker.displayName.lowercased())."
-            : "Piece voice did not reach speech engine for \(plan.speaker.displayName.lowercased())."
-        )
+        self.emitPieceVoiceLine(sanitizedLine, for: plan, statusPrefix: "Generated")
       } catch is CancellationError {
         self.pieceVoiceStatusText = "Piece voice request cancelled."
         return
       } catch {
-        self.pieceVoiceStatusText = "Piece voice failed: \(error.localizedDescription)"
-        self.appendGeminiDebug("Gemini piece voice request failed: \(error.localizedDescription)")
+        guard self.narrationSessionID == sessionID else {
+          self.pieceVoiceStatusText = "Dropped after session reset."
+          self.appendGeminiDebug("Dropped stale fallback piece voice line because the session reset.")
+          return
+        }
+        self.appendGeminiDebug("Gemini piece voice request failed: \(error.localizedDescription). Using local fallback.")
+        self.emitPieceVoiceLine(
+          self.fallbackPieceVoiceLine(for: plan),
+          for: plan,
+          statusPrefix: "Fallback"
+        )
       }
     }
   }
@@ -6522,13 +6518,17 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     move: ChessMove,
     before beforeState: ChessGameState,
     after afterState: ChessGameState
-  ) -> PieceVoiceRequestPlan? {
-    if shouldTriggerMovedPieceVoiceLine() {
-      let speaker = personalitySpeaker(for: move.piece.kind)
+  ) -> PieceVoiceRequestPlan {
+    if shouldTriggerAmbientPieceVoiceLine(),
+       let ambientSpeaker = selectAmbientPieceVoiceSpeaker(
+        in: afterState,
+        excluding: move.to
+       ) {
+      let speaker = personalitySpeaker(for: ambientSpeaker.piece.kind)
       let context = buildPieceVoiceLineContext(
-        speakingSquare: move.to,
-        piece: move.piece,
-        contextMode: .moved,
+        speakingSquare: ambientSpeaker.square,
+        piece: ambientSpeaker.piece,
+        contextMode: .ambient,
         before: beforeState,
         after: afterState,
         referenceMove: move
@@ -6536,23 +6536,15 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       return PieceVoiceRequestPlan(
         speaker: speaker,
         context: context,
-        label: "\(speaker.displayName.lowercased()) moved \(move.from.algebraic)-\(move.to.algebraic)"
+        label: "\(speaker.displayName.lowercased()) observing from \(ambientSpeaker.square.algebraic)"
       )
     }
 
-    guard shouldTriggerAmbientPieceVoiceLine(),
-          let ambientSpeaker = selectAmbientPieceVoiceSpeaker(
-            in: afterState,
-            excluding: move.to
-          ) else {
-      return nil
-    }
-
-    let speaker = personalitySpeaker(for: ambientSpeaker.piece.kind)
+    let speaker = personalitySpeaker(for: move.piece.kind)
     let context = buildPieceVoiceLineContext(
-      speakingSquare: ambientSpeaker.square,
-      piece: ambientSpeaker.piece,
-      contextMode: .ambient,
+      speakingSquare: move.to,
+      piece: move.piece,
+      contextMode: .moved,
       before: beforeState,
       after: afterState,
       referenceMove: move
@@ -6560,12 +6552,8 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     return PieceVoiceRequestPlan(
       speaker: speaker,
       context: context,
-      label: "\(speaker.displayName.lowercased()) observing from \(ambientSpeaker.square.algebraic)"
+      label: "\(speaker.displayName.lowercased()) moved \(move.from.algebraic)-\(move.to.algebraic)"
     )
-  }
-
-  private func shouldTriggerMovedPieceVoiceLine() -> Bool {
-    Double.random(in: 0..<1) < Self.movedPieceVoiceLineChance
   }
 
   private func shouldTriggerAmbientPieceVoiceLine() -> Bool {
@@ -6859,6 +6847,108 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     appendGeminiDebug("Piece voice ready: \(line)")
   }
 
+  private func emitPieceVoiceLine(
+    _ text: String,
+    for plan: PieceVoiceRequestPlan,
+    statusPrefix: String
+  ) {
+    let debugLine = "\(plan.speaker.displayName): \(text)"
+    pieceVoiceStatusText = "\(statusPrefix): \(debugLine)"
+    recordPieceVoiceLine(debugLine)
+    let spokeImmediately = speakGeneratedPieceVoiceLine(
+      text: text,
+      speaker: plan.speaker,
+      priority: .urgent
+    )
+    appendGeminiDebug(
+      spokeImmediately
+        ? "Piece voice handed to speech engine for \(plan.speaker.displayName.lowercased())."
+        : "Piece voice did not reach speech engine for \(plan.speaker.displayName.lowercased())."
+    )
+  }
+
+  private func fallbackPieceVoiceLine(for plan: PieceVoiceRequestPlan) -> String {
+    let context = plan.context
+
+    switch plan.speaker {
+    case .pawn:
+      if context.isCapture {
+        return "Another body falls in the mud."
+      }
+      if context.isCheck {
+        return "Press on. Their king can smell me."
+      }
+      if context.isRetreat {
+        return "Back a step. Then back into blood."
+      }
+      return context.contextMode == .ambient
+        ? "I am ready for the next brawl."
+        : "Forward. The trench still wants bodies."
+    case .rook:
+      if context.isCapture {
+        return "I break their line and keep rolling."
+      }
+      if context.isCheck {
+        return "Their king hears the tower coming."
+      }
+      if context.isPinned || context.isAttackedByMultiple {
+        return "Let them crowd me. I crush through crowds."
+      }
+      return context.contextMode == .ambient
+        ? "Hold the file. I am not done here."
+        : "I move once. The whole file shudders."
+    case .knight:
+      if context.isForkThreat {
+        return "A graceful fork is already in motion."
+      }
+      if context.isCapture {
+        return "A neat cut. The dance continues."
+      }
+      if context.isRetreat {
+        return "A measured retreat sharpens the next strike."
+      }
+      return context.contextMode == .ambient
+        ? "I circle quietly before the next flourish."
+        : "A stylish leap was overdue."
+    case .bishop:
+      if context.isCheck {
+        return "Judgment reaches their king at last."
+      }
+      if context.isCapture {
+        return "Another sinner falls under holy fire."
+      }
+      if context.isPinned {
+        return "Even pinned, I keep my faith and aim."
+      }
+      return context.contextMode == .ambient
+        ? "I watch the diagonal and wait for sin."
+        : "This diagonal now belongs to judgment."
+    case .queen:
+      if context.isCheck {
+        return "There. The king finally notices me."
+      }
+      if context.isCapture {
+        return "Cleanup, again. You are welcome."
+      }
+      if context.isAttacked {
+        return "Honestly, this square had better be worth it."
+      }
+      return context.contextMode == .ambient
+        ? "I remain the only adult on this board."
+        : "Try to keep up with my standards."
+    case .king:
+      if context.positionState == .losing || context.isAttacked {
+        return "Keep them off me and we survive this."
+      }
+      if context.isCheck {
+        return "Good. Let them feel the crown advance."
+      }
+      return context.contextMode == .ambient
+        ? "Hold formation. The crown is still intact."
+        : "The crown steps forward. Behave accordingly."
+    }
+  }
+
   private func cappedPieceVoiceLineText(
     _ text: String,
     maxCharacters: Int? = nil
@@ -6877,24 +6967,12 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       with: "",
       options: .regularExpression
     )
-    let firstSentence = withoutLabel.replacingOccurrences(
-      of: #"^(.+?[.!?])(?:\s.*)?$"#,
-      with: "$1",
-      options: .regularExpression
-    )
-    let trimmed = firstSentence.trimmingCharacters(in: CharacterSet(charactersIn: " \n\t,;:-"))
+    let trimmed = withoutLabel.trimmingCharacters(in: CharacterSet(charactersIn: " \n\t,;:-"))
     guard !trimmed.isEmpty else {
       return ""
     }
 
-    var capped = trimmed
-    if capped.hasSuffix("...") {
-      return ""
-    }
-    if !capped.isEmpty && !capped.hasSuffix(".") && !capped.hasSuffix("!") && !capped.hasSuffix("?") {
-      capped.append(".")
-    }
-    return capped
+    return trimmed
   }
 
   private func chebyshevDistance(from source: BoardSquare, to target: BoardSquare) -> Int {
@@ -9050,6 +9128,7 @@ private struct NativeARExperienceView: View {
   @State private var isModePanelVisible = false
   @State private var isMatchLogVisible = false
   @State private var isGeminiDebugVisible = false
+  @State private var isVoiceStackVisible = false
   @State private var isStockfishDebugVisible = false
   @State private var isMusicMuted = AmbientMusicController.shared.isMuted
   @State private var notifiedCompletedLessonID: String?
@@ -9217,6 +9296,11 @@ private struct NativeARExperienceView: View {
               .transition(.move(edge: .bottom).combined(with: .opacity))
           }
 
+          if isVoiceStackVisible {
+            voiceStackPanel
+              .transition(.move(edge: .bottom).combined(with: .opacity))
+          }
+
           if isStockfishDebugVisible {
             stockfishDebugPanel
               .transition(.move(edge: .bottom).combined(with: .opacity))
@@ -9324,6 +9408,15 @@ private struct NativeARExperienceView: View {
                     }
                   }
                   syncStockfishDebugVisibility()
+                }
+
+                overlayToggleButton(
+                  title: isVoiceStackVisible ? "Hide Voices" : "Show Voices",
+                  systemImage: "text.quote"
+                ) {
+                  withAnimation(.spring(response: 0.30, dampingFraction: 0.86)) {
+                    isVoiceStackVisible.toggle()
+                  }
                 }
 
                 overlayToggleButton(
@@ -9483,6 +9576,7 @@ private struct NativeARExperienceView: View {
       isModePanelVisible = false
       isMatchLogVisible = false
       isGeminiDebugVisible = false
+      isVoiceStackVisible = false
       isStockfishDebugVisible = false
       syncStockfishDebugVisibility()
     }
@@ -9924,6 +10018,35 @@ private struct NativeARExperienceView: View {
               .font(.system(size: 12, weight: .medium, design: .monospaced))
               .foregroundStyle(Color.white.opacity(0.80))
               .textSelection(.enabled)
+          }
+        }
+      }
+    }
+  }
+
+  private var voiceStackPanel: some View {
+    debugOverlayCard {
+      VStack(alignment: .leading, spacing: 10) {
+        Text("Voice line stack")
+          .font(.system(size: 12, weight: .bold, design: .rounded))
+          .tracking(1.8)
+          .foregroundStyle(Color(red: 0.88, green: 0.82, blue: 0.70))
+
+        Text(commentary.pieceVoiceStatusText)
+          .font(.system(size: 12, weight: .medium, design: .monospaced))
+          .foregroundStyle(Color(red: 0.80, green: 0.88, blue: 0.95))
+          .lineSpacing(2)
+
+        if commentary.pieceVoiceLines.isEmpty {
+          Text("No voice lines yet. Make a move to trigger one.")
+            .font(.system(size: 13, weight: .medium, design: .rounded))
+            .foregroundStyle(Color.white.opacity(0.72))
+        } else {
+          ForEach(Array(commentary.pieceVoiceLines.reversed().enumerated()), id: \.offset) { _, line in
+            Text(line)
+              .font(.system(size: 13, weight: .semibold, design: .rounded))
+              .foregroundStyle(Color(red: 0.86, green: 0.94, blue: 0.88))
+              .lineSpacing(2)
           }
         }
       }
