@@ -13992,13 +13992,12 @@ private struct NativeARView: UIViewRepresentable {
 
       let floatedAway = transformed(
         ghost.transform,
-        translation: captureGhostFloatOffset(for: capturedSquare, move: move),
-        rotation: simd_quatf(angle: .pi / 2.6, axis: SIMD3<Float>(0, 1, 0)),
-        scale: SIMD3<Float>(repeating: 0.80)
+        translation: captureGhostFloatOffset(),
+        scale: SIMD3<Float>(repeating: 0.86)
       )
-      ghost.move(to: floatedAway, relativeTo: ghost.parent, duration: 1.25, timingFunction: .easeOut)
+      ghost.move(to: floatedAway, relativeTo: ghost.parent, duration: 1.95, timingFunction: .easeOut)
 
-      DispatchQueue.main.asyncAfter(deadline: .now() + 1.30) { [weak ghost] in
+      DispatchQueue.main.asyncAfter(deadline: .now() + 2.05) { [weak ghost] in
         ghost?.removeFromParent()
       }
     }
@@ -14274,14 +14273,8 @@ private struct NativeARView: UIViewRepresentable {
       return normalized3(SIMD3<Float>(delta.x, 0, delta.z), fallback: SIMD3<Float>(0, 0, -1))
     }
 
-    private func captureGhostFloatOffset(for square: BoardSquare, move: ChessMove) -> SIMD3<Float> {
-      let squareSize = boardSize / 8.0
-      let localSquarePosition = boardPosition(square, squareSize: squareSize)
-      let outward = normalized3(
-        SIMD3<Float>(localSquarePosition.x, 0, localSquarePosition.z),
-        fallback: attackDirection(for: move)
-      )
-      return outward * 0.24 + SIMD3<Float>(0, 0.34, 0)
+    private func captureGhostFloatOffset() -> SIMD3<Float> {
+      SIMD3<Float>(0, 0.26, 0)
     }
 
     private func normalized3(_ value: SIMD3<Float>, fallback: SIMD3<Float>) -> SIMD3<Float> {
