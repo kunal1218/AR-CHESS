@@ -12126,6 +12126,7 @@ private struct NativeARView: UIViewRepresentable {
     private var boardViewerColor: ChessColor = .black
     private var pinchStartScale: Float = 1.0
     private var piecesContainer = Entity()
+    private var captureGhostContainer = Entity()
     private var highlightsContainer = Entity()
     private var threatOverlayContainer = Entity()
     private var activeThreatSquares: [BoardSquare] = []
@@ -13956,6 +13957,8 @@ private struct NativeARView: UIViewRepresentable {
       case .king:
         await animateKingCrownCapture(attacker: attacker, victim: victim, move: move)
       }
+
+      animateCapturedGhostIfNeeded(for: move, beforeState: beforeState, victim: victim)
     }
 
     private func capturedSquare(for move: ChessMove) -> BoardSquare? {
@@ -13964,6 +13967,50 @@ private struct NativeARView: UIViewRepresentable {
       }
 
       return move.captured == nil ? nil : move.to
+    }
+
+    @MainActor
+    private func animateCapturedGhostIfNeeded(
+      for move: ChessMove,
+      beforeState: ChessGameState,
+      victim: Entity?
+    ) {
+      guard let capturedSquare = capturedSquare(for: move),
+            let capturedPiece = beforeState.piece(at: capturedSquare) else {
+        return
+      }
+
+      let ghost = piecePrototype(
+        for: capturedPiece.kind,
+        color: capturedPiece.color,
+        isGhost: true
+      ).clone(recursive: true)
+      ghost.name = "capture_ghost_\(capturedSquare.file)_\(capturedSquare.rank)"
+
+      captureGhostContainer.addChild(ghost)
+
+      if let victim {
+        ghost.transform = victim.transform
+        victim.removeFromParent()
+      } else {
+        let squareSize = boardSize / 8.0
+        ghost.position = boardPosition(capturedSquare, squareSize: squareSize) + SIMD3<Float>(0, 0.0015, 0)
+        ghost.orientation = pieceFacingOrientation(for: capturedPiece.color)
+      }
+
+      ghost.scale = SIMD3<Float>(repeating: 0.96)
+
+      let floatedAway = transformed(
+        ghost.transform,
+        translation: captureGhostFloatOffset(for: capturedSquare, move: move),
+        rotation: simd_quatf(angle: .pi / 3.6, axis: SIMD3<Float>(0, 1, 0)),
+        scale: SIMD3<Float>(repeating: 0.72)
+      )
+      ghost.move(to: floatedAway, relativeTo: ghost.parent, duration: 0.95, timingFunction: .easeOut)
+
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.98) { [weak ghost] in
+        ghost?.removeFromParent()
+      }
     }
 
     @MainActor
@@ -14235,6 +14282,16 @@ private struct NativeARView: UIViewRepresentable {
       let squareSize = boardSize / 8.0
       let delta = boardPosition(move.to, squareSize: squareSize) - boardPosition(move.from, squareSize: squareSize)
       return normalized3(SIMD3<Float>(delta.x, 0, delta.z), fallback: SIMD3<Float>(0, 0, -1))
+    }
+
+    private func captureGhostFloatOffset(for square: BoardSquare, move: ChessMove) -> SIMD3<Float> {
+      let squareSize = boardSize / 8.0
+      let localSquarePosition = boardPosition(square, squareSize: squareSize)
+      let outward = normalized3(
+        SIMD3<Float>(localSquarePosition.x, 0, localSquarePosition.z),
+        fallback: attackDirection(for: move)
+      )
+      return outward * 0.18 + SIMD3<Float>(0, 0.26, 0)
     }
 
     private func normalized3(_ value: SIMD3<Float>, fallback: SIMD3<Float>) -> SIMD3<Float> {
@@ -14872,6 +14929,7 @@ private struct NativeARView: UIViewRepresentable {
       boardRoot.scale = SIMD3<Float>(repeating: boardScale)
       self.boardRoot = boardRoot
       piecesContainer = Entity()
+      captureGhostContainer = Entity()
       highlightsContainer = Entity()
       threatOverlayContainer = Entity()
       activeThreatEntities = []
@@ -14894,6 +14952,7 @@ private struct NativeARView: UIViewRepresentable {
         }
       }
 
+      boardRoot.addChild(captureGhostContainer)
       boardRoot.addChild(threatOverlayContainer)
       boardRoot.addChild(highlightsContainer)
       boardRoot.addChild(piecesContainer)
