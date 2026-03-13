@@ -403,6 +403,15 @@ private enum ExperienceMode: Hashable {
       return true
     }
   }
+
+  var supportsPassiveAutomaticCommentary: Bool {
+    switch self {
+    case .lesson:
+      return false
+    case .passAndPlay, .queueMatch, .playVsStockfish:
+      return true
+    }
+  }
 }
 
 private enum NativeScreen {
@@ -558,7 +567,40 @@ private struct GeminiPieceVoiceLineRequestPayload: Encodable {
   let move_quality: String
 }
 
+private struct GeminiPassiveNarratorLineRequestPayload: Encodable {
+  let fen: String
+  let recent_history: String?
+  let recent_lines: [String]
+  let phase: String
+  let turns_since_last_narrator_line: Int
+  let move_san: String?
+  let moving_piece: String?
+  let moving_color: String?
+  let from_square: String?
+  let to_square: String?
+  let is_capture: Bool
+  let is_check: Bool
+  let is_checkmate: Bool
+  let is_near_enemy_king: Bool
+  let is_attacked: Bool
+  let is_pinned: Bool
+  let is_retreat: Bool
+  let is_aggressive_advance: Bool
+  let is_fork_threat: Bool
+  let attacker_count: Int
+  let defender_count: Int
+  let eval_before: Int?
+  let eval_after: Int?
+  let eval_delta: Int?
+  let position_state: String?
+  let move_quality: String?
+}
+
 private struct GeminiPieceVoiceLineResponsePayload: Decodable {
+  let line: String
+}
+
+private struct GeminiPassiveNarratorLineResponsePayload: Decodable {
   let line: String
 }
 
@@ -660,6 +702,40 @@ private struct GeminiPieceVoiceLineContext {
   let evalDelta: Int?
   let positionState: PieceVoicePositionState
   let moveQuality: PieceVoiceMoveQuality
+}
+
+private enum PassiveNarratorPhase: String {
+  case opening
+  case move
+}
+
+private struct GeminiPassiveNarratorLineContext {
+  let fen: String
+  let recentHistory: String?
+  let recentLines: [String]
+  let phase: PassiveNarratorPhase
+  let turnsSinceLastNarratorLine: Int
+  let moveSAN: String?
+  let movingPiece: ChessPieceKind?
+  let movingColor: ChessColor?
+  let fromSquare: BoardSquare?
+  let toSquare: BoardSquare?
+  let isCapture: Bool
+  let isCheck: Bool
+  let isCheckmate: Bool
+  let isNearEnemyKing: Bool
+  let isAttacked: Bool
+  let isPinned: Bool
+  let isRetreat: Bool
+  let isAggressiveAdvance: Bool
+  let isForkThreat: Bool
+  let attackerCount: Int
+  let defenderCount: Int
+  let evalBefore: Int?
+  let evalAfter: Int?
+  let evalDelta: Int?
+  let positionState: PieceVoicePositionState?
+  let moveQuality: PieceVoiceMoveQuality?
 }
 
 private struct SocraticCoachContext: Equatable {
@@ -1346,6 +1422,10 @@ private final class SocraticCoachStore: ObservableObject {
 
   var canRequestHelp: Bool {
     isEnabled && isConfigured && !isStreamingResponse
+  }
+
+  var blocksPassiveCommentary: Bool {
+    isEnabled && (micState != .inactive || isStreamingResponse)
   }
 
   var caption: PiecePersonalityDirector.Caption? {
@@ -2227,6 +2307,91 @@ private final class GeminiHintService {
     }
 
     Self.logger.info("Gemini piece voice ready via backend duration_ms=\(durationMs, privacy: .public)")
+    return line
+  }
+
+  func fetchPassiveNarratorLine(for context: GeminiPassiveNarratorLineContext) async throws -> String {
+    guard let baseURL = apiBaseURL else {
+      throw NSError(
+        domain: "ARChess.GeminiHint",
+        code: -1012,
+        userInfo: [NSLocalizedDescriptionKey: "Gemini passive narrator is disabled until ARChessAPIBaseURL is configured."]
+      )
+    }
+
+    var request = URLRequest(
+      url: baseURL
+        .appendingPathComponent("v1")
+        .appendingPathComponent("gemini")
+        .appendingPathComponent("passive-commentary-line")
+    )
+    request.httpMethod = "POST"
+    request.timeoutInterval = 6.0
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.setValue("application/json", forHTTPHeaderField: "Accept")
+    request.httpBody = try JSONEncoder().encode(
+      GeminiPassiveNarratorLineRequestPayload(
+        fen: context.fen,
+        recent_history: context.recentHistory,
+        recent_lines: context.recentLines,
+        phase: context.phase.rawValue,
+        turns_since_last_narrator_line: context.turnsSinceLastNarratorLine,
+        move_san: context.moveSAN,
+        moving_piece: context.movingPiece?.displayName.lowercased(),
+        moving_color: context.movingColor?.displayName.lowercased(),
+        from_square: context.fromSquare?.algebraic,
+        to_square: context.toSquare?.algebraic,
+        is_capture: context.isCapture,
+        is_check: context.isCheck,
+        is_checkmate: context.isCheckmate,
+        is_near_enemy_king: context.isNearEnemyKing,
+        is_attacked: context.isAttacked,
+        is_pinned: context.isPinned,
+        is_retreat: context.isRetreat,
+        is_aggressive_advance: context.isAggressiveAdvance,
+        is_fork_threat: context.isForkThreat,
+        attacker_count: context.attackerCount,
+        defender_count: context.defenderCount,
+        eval_before: context.evalBefore,
+        eval_after: context.evalAfter,
+        eval_delta: context.evalDelta,
+        position_state: context.positionState?.rawValue,
+        move_quality: context.moveQuality?.rawValue
+      )
+    )
+
+    let startedAt = Date()
+    let (data, response) = try await session.data(for: request)
+    let durationMs = Int(Date().timeIntervalSince(startedAt) * 1_000)
+    guard let httpResponse = response as? HTTPURLResponse else {
+      throw NSError(
+        domain: "ARChess.GeminiHint",
+        code: -1013,
+        userInfo: [NSLocalizedDescriptionKey: "Gemini passive narrator endpoint did not return HTTP."]
+      )
+    }
+
+    guard (200..<300).contains(httpResponse.statusCode) else {
+      let message = String(data: data, encoding: .utf8) ?? "Unexpected Gemini passive narrator response."
+      Self.logger.error("Gemini backend passive narrator request failed status=\(httpResponse.statusCode, privacy: .public) duration_ms=\(durationMs, privacy: .public)")
+      throw NSError(
+        domain: "ARChess.GeminiHint",
+        code: httpResponse.statusCode,
+        userInfo: [NSLocalizedDescriptionKey: message]
+      )
+    }
+
+    let payload = try JSONDecoder().decode(GeminiPassiveNarratorLineResponsePayload.self, from: data)
+    let line = payload.line.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !line.isEmpty else {
+      throw NSError(
+        domain: "ARChess.GeminiHint",
+        code: -1014,
+        userInfo: [NSLocalizedDescriptionKey: "Gemini backend returned no passive narrator line."]
+      )
+    }
+
+    Self.logger.info("Gemini passive narrator ready via backend duration_ms=\(durationMs, privacy: .public)")
     return line
   }
 
@@ -5757,12 +5922,17 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
 
   private static let preferredMovetimeMs = 80
   private static let preferredHardTimeoutMs = 600
-  private static let commentaryIntervalRange = 2...3
-  private static let kingCookedCooldownPly = 15
   private static let substantialGainThreshold = 120
   private static let substantialDropThreshold = -140
+  // The passive narrator ramps by 20 percentage points after each normal move where the
+  // narrator stays silent. We evaluate the next move at `(storedTurns + 1) * increment`
+  // so the first eligible post-narrator move starts at 20%.
+  private static let narratorChanceRampIncrement = 0.20
+  // Pieces fill gaps only occasionally on quiet non-capture turns so silence stays common.
+  private static let nonCapturePieceFillerChance = 0.25
   private static let ambientPieceVoiceLineChance = 0.35
   private static let pieceVoiceLineCharacterLimit = 180
+  private static let passiveNarratorCharacterLimit = 220
   private static let speechPrewarmDelayNanoseconds: UInt64 = 250_000_000
   private static let pieceVoicePrewarmDelayNanoseconds: UInt64 = experienceStartupRemoteWorkDelayNanoseconds
   private static let urgentPieceVoiceSFXOverlapAllowance: TimeInterval = 0.16
@@ -5828,6 +5998,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
 
   private enum GeneratedNarrationStyle {
     case gemini(title: String)
+    case automaticNarrator
     case pieceVoice(speaker: PersonalitySpeaker)
   }
 
@@ -5835,6 +6006,28 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     let speaker: PersonalitySpeaker
     let context: GeminiPieceVoiceLineContext
     let label: String
+  }
+
+  private enum AutomaticCommentaryTrigger {
+    case opening(state: ChessGameState)
+    case move(move: ChessMove, before: ChessGameState, after: ChessGameState)
+  }
+
+  private struct AutomaticCommentaryDecision {
+    enum Kind {
+      case narrator
+      case piece
+      case silent
+    }
+
+    let kind: Kind
+    let narratorContext: GeminiPassiveNarratorLineContext?
+    let piecePlan: PieceVoiceRequestPlan?
+    let piecePriority: SpeechPriority?
+    let incrementsNarratorRamp: Bool
+    let resetsNarratorRamp: Bool
+    let marksOpeningNarrationDelivered: Bool
+    let reason: String
   }
 
   private struct PendingGeneratedNarration {
@@ -5870,12 +6063,12 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   private let synthesizer = AVSpeechSynthesizer()
   private let narrator: NarratorType
   private var utteranceCaptions: [ObjectIdentifier: Caption] = [:]
+  private var utteranceStyles: [ObjectIdentifier: GeneratedNarrationStyle] = [:]
   private var narrationHighlightHandler: (([String], String?) -> Void)?
   private var pieceAudioBusyDurationProvider: (() -> TimeInterval)?
+  private var passiveCommentarySuppressionProvider: (() -> Bool)?
   private var cachedAnalysis: CachedAnalysis?
   private var stockfishDebugAnalysisCache: [String: StockfishAnalysis] = [:]
-  private var completedPlyCount = 0
-  private var nextCommentaryPly = Int.random(in: commentaryIntervalRange)
   private var reactionHandler: ((ReactionCue) -> Void)?
   private var stateProvider: (() -> ChessGameState?)?
   private var hintAvailabilityProvider: (() -> Bool)?
@@ -5892,7 +6085,6 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   private var pendingGeneratedNarrations: [PendingGeneratedNarration] = []
   private var narrationSessionID = 0
   private var geminiNarrationRetryWorkItem: DispatchWorkItem?
-  private var nextKingCookedAllowedPly: [ChessColor: Int] = [:]
   private var lastGeminiStatusSnapshot: GeminiLiveStatusPayload?
   private var nextGeminiBackgroundRetryAt: Date?
   private var nextGeminiCoachRetryAt: Date?
@@ -5903,11 +6095,14 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   private var stockfishDebugVisible = false
   private var speechPrewarmTask: Task<Void, Never>?
   private var pieceVoicePrewarmTask: Task<Void, Never>?
-  private var pieceVoiceRequestTask: Task<Void, Never>?
+  private var automaticCommentaryRequestTask: Task<Void, Never>?
   private var hasPrewarmedSpeechPath = false
   private var hasPrewarmedPieceVoicePath = false
   private var silentSpeechWarmupUtteranceIDs: Set<ObjectIdentifier> = []
-  private var latestPieceVoiceRequestID = 0
+  private var latestAutomaticCommentaryRequestID = 0
+  private var turnsSinceNarratorLine = 0
+  private var openingNarrationDelivered = false
+  private var queuedAutomaticCommentaryDecision: AutomaticCommentaryDecision?
 
   init(narrator: NarratorType = .silky) {
     self.narrator = narrator
@@ -6076,6 +6271,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   func resetSession() {
     synthesizer.stopSpeaking(at: .immediate)
     utteranceCaptions.removeAll()
+    utteranceStyles.removeAll()
     geminiNarrationRetryWorkItem?.cancel()
     geminiNarrationRetryWorkItem = nil
     pendingGeneratedNarrations.removeAll()
@@ -6087,8 +6283,8 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     hintTask = nil
     commentaryRequestTask?.cancel()
     commentaryRequestTask = nil
-    pieceVoiceRequestTask?.cancel()
-    pieceVoiceRequestTask = nil
+    automaticCommentaryRequestTask?.cancel()
+    automaticCommentaryRequestTask = nil
     geminiStatusTask?.cancel()
     geminiStatusTask = nil
     engineWarmupTask?.cancel()
@@ -6105,7 +6301,8 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     coachLines = []
     pieceVoiceLines = []
     pieceVoiceStatusText = "Waiting for a move."
-    latestPieceVoiceRequestID = 0
+    latestAutomaticCommentaryRequestID = 0
+    queuedAutomaticCommentaryDecision = nil
     topWorkers = []
     topTraitors = []
     stockfishDebugStatusText = "Open Stockfish debug to inspect engine candidates."
@@ -6113,9 +6310,8 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     stockfishDebugBlackMoves = []
     visibleHintText = nil
     isHintLoading = false
-    completedPlyCount = 0
-    nextCommentaryPly = Int.random(in: Self.commentaryIntervalRange)
-    nextKingCookedAllowedPly = [:]
+    turnsSinceNarratorLine = 0
+    openingNarrationDelivered = false
     nextGeminiCoachRetryAt = nil
     latestAnalyzedFEN = nil
     pendingCommentaryFEN = nil
@@ -6171,6 +6367,14 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
 
   func unbindRecentHistoryProvider() {
     recentHistoryProvider = nil
+  }
+
+  func bindPassiveCommentarySuppressionProvider(_ provider: @escaping () -> Bool) {
+    passiveCommentarySuppressionProvider = provider
+  }
+
+  func unbindPassiveCommentarySuppressionProvider() {
+    passiveCommentarySuppressionProvider = nil
   }
 
   func bindPieceAudioBusyDurationProvider(_ provider: @escaping () -> TimeInterval) {
@@ -6314,16 +6518,263 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     narrationHighlightHandler = nil
   }
 
-  func startPieceVoiceLineRequest(
+  func maybeStartOpeningNarration(for state: ChessGameState) {
+    triggerAutomaticCommentary(for: .opening(state: state))
+  }
+
+  func triggerAutomaticCommentaryForMove(
     move: ChessMove,
     before beforeState: ChessGameState,
     after afterState: ChessGameState
   ) {
-    maybeTriggerPieceVoiceLine(
-      move: move,
-      before: beforeState,
-      after: afterState
+    triggerAutomaticCommentary(
+      for: .move(move: move, before: beforeState, after: afterState)
     )
+  }
+
+  private func triggerAutomaticCommentary(for trigger: AutomaticCommentaryTrigger) {
+    // Passive automatic commentary is mutually exclusive per event: narrator, piece, or silence.
+    // The mic-driven coach flow remains separate and intentionally untouched.
+    let decision = decideCommentaryEvent(for: trigger)
+    guard !shouldQueueAutomaticCommentaryDecision(decision) else {
+      queueAutomaticCommentaryDecision(decision)
+      return
+    }
+    applyAutomaticCommentaryDecision(decision)
+  }
+
+  private func decideCommentaryEvent(for trigger: AutomaticCommentaryTrigger) -> AutomaticCommentaryDecision {
+    switch trigger {
+    case .opening(let state):
+      guard !openingNarrationDelivered else {
+        return silentAutomaticCommentaryDecision(reason: "Opening narration already delivered.")
+      }
+      guard !shouldSuppressPassiveCommentaryForCoach() else {
+        return silentAutomaticCommentaryDecision(reason: "Coach is active; opening narration backed off.")
+      }
+      return AutomaticCommentaryDecision(
+        kind: .narrator,
+        narratorContext: buildPassiveNarratorLineContext(forOpening: state),
+        piecePlan: nil,
+        piecePriority: nil,
+        incrementsNarratorRamp: false,
+        resetsNarratorRamp: true,
+        marksOpeningNarrationDelivered: true,
+        reason: "Opening narration introduces the match."
+      )
+    case .move(let move, let beforeState, let afterState):
+      let isCapture = move.captured != nil || move.isEnPassant
+      if isCapture {
+        // Captures exclusively use piece dialogue and do not reset the narrator ramp.
+        // This keeps combat reactive while the narrator cadence continues across exchanges.
+        return AutomaticCommentaryDecision(
+          kind: .piece,
+          narratorContext: nil,
+          piecePlan: makePieceVoiceRequestPlan(
+            move: move,
+            before: beforeState,
+            after: afterState,
+            allowAmbient: false
+          ),
+          piecePriority: .normal,
+          incrementsNarratorRamp: false,
+          resetsNarratorRamp: false,
+          marksOpeningNarrationDelivered: false,
+          reason: "Capture override forced piece dialogue."
+        )
+      }
+
+      guard !shouldSuppressPassiveCommentaryForCoach() else {
+        return silentAutomaticCommentaryDecision(
+          incrementsNarratorRamp: true,
+          reason: "Coach is active; passive commentary skipped for this turn."
+        )
+      }
+
+      if !openingNarrationDelivered {
+        return AutomaticCommentaryDecision(
+          kind: .narrator,
+          narratorContext: buildPassiveNarratorLineContext(forOpening: afterState),
+          piecePlan: nil,
+          piecePriority: nil,
+          incrementsNarratorRamp: false,
+          resetsNarratorRamp: true,
+          marksOpeningNarrationDelivered: true,
+          reason: "Opening narration had not fired yet, so this turn delivers it."
+        )
+      }
+
+      if Double.random(in: 0..<1) < narratorChanceForNextEligibleTurn() {
+        return AutomaticCommentaryDecision(
+          kind: .narrator,
+          narratorContext: buildPassiveNarratorLineContext(
+            for: move,
+            before: beforeState,
+            after: afterState
+          ),
+          piecePlan: nil,
+          piecePriority: nil,
+          incrementsNarratorRamp: false,
+          resetsNarratorRamp: true,
+          marksOpeningNarrationDelivered: false,
+          reason: "Narrator won the passive commentary ramp roll."
+        )
+      }
+
+      if Double.random(in: 0..<1) < Self.nonCapturePieceFillerChance {
+        return AutomaticCommentaryDecision(
+          kind: .piece,
+          narratorContext: nil,
+          piecePlan: makePieceVoiceRequestPlan(
+            move: move,
+            before: beforeState,
+            after: afterState,
+            allowAmbient: true
+          ),
+          piecePriority: .normal,
+          incrementsNarratorRamp: true,
+          resetsNarratorRamp: false,
+          marksOpeningNarrationDelivered: false,
+          reason: "Narrator passed; a filler piece line fills the gap."
+        )
+      }
+
+      // Silence is a valid outcome on normal turns so the match can breathe.
+      return silentAutomaticCommentaryDecision(
+        incrementsNarratorRamp: true,
+        reason: "Narrator missed and filler-piece chatter also stayed silent."
+      )
+    }
+  }
+
+  private func applyAutomaticCommentaryDecision(_ decision: AutomaticCommentaryDecision) {
+    switch decision.kind {
+    case .silent:
+      if decision.incrementsNarratorRamp {
+        turnsSinceNarratorLine += 1
+      }
+      pieceVoiceStatusText = "Silent turn."
+      appendGeminiDebug("Automatic commentary silent: \(decision.reason)")
+    case .piece:
+      if decision.incrementsNarratorRamp {
+        turnsSinceNarratorLine += 1
+      }
+      guard let plan = decision.piecePlan,
+            let priority = decision.piecePriority else {
+        return
+      }
+      requestPieceVoiceLine(plan, priority: priority, reason: decision.reason)
+    case .narrator:
+      guard let context = decision.narratorContext else {
+        return
+      }
+      requestPassiveNarratorLine(
+        context,
+        resetsNarratorRamp: decision.resetsNarratorRamp,
+        marksOpeningNarrationDelivered: decision.marksOpeningNarrationDelivered,
+        reason: decision.reason
+      )
+    }
+  }
+
+  private func silentAutomaticCommentaryDecision(
+    incrementsNarratorRamp: Bool = false,
+    reason: String
+  ) -> AutomaticCommentaryDecision {
+    AutomaticCommentaryDecision(
+      kind: .silent,
+      narratorContext: nil,
+      piecePlan: nil,
+      piecePriority: nil,
+      incrementsNarratorRamp: incrementsNarratorRamp,
+      resetsNarratorRamp: false,
+      marksOpeningNarrationDelivered: false,
+      reason: reason
+    )
+  }
+
+  private func narratorChanceForNextEligibleTurn() -> Double {
+    min(1.0, Double(turnsSinceNarratorLine + 1) * Self.narratorChanceRampIncrement)
+  }
+
+  private func shouldSuppressPassiveCommentaryForCoach() -> Bool {
+    passiveCommentarySuppressionProvider?() ?? false
+  }
+
+  private func shouldQueueAutomaticCommentaryDecision(_ decision: AutomaticCommentaryDecision) -> Bool {
+    guard automaticCommentaryDecisionCanProduceSpeech(decision) else {
+      return false
+    }
+    return hasAutomaticCommentaryInFlightOrQueued()
+  }
+
+  private func queueAutomaticCommentaryDecision(_ decision: AutomaticCommentaryDecision) {
+    if decision.incrementsNarratorRamp {
+      turnsSinceNarratorLine += 1
+    }
+    if decision.kind == .narrator, !decision.marksOpeningNarrationDelivered {
+      turnsSinceNarratorLine += 1
+    }
+
+    // Passive automatic commentary never overlaps itself. Normal turns simply back off when another
+    // auto line is already generating or speaking. Capture turns remain mandatory, so we retain only
+    // the latest forced piece line and flush it once the active automatic line fully clears.
+    if decision.kind == .piece, decision.piecePlan?.context.isCapture == true {
+      queuedAutomaticCommentaryDecision = decision
+      pieceVoiceStatusText = "Queued capture voice behind active commentary."
+      appendGeminiDebug("Queued latest forced capture piece line because automatic commentary is already busy.")
+      return
+    }
+
+    pieceVoiceStatusText = "Skipped overlapping auto commentary."
+    appendGeminiDebug("Skipped automatic commentary because another passive line is already in flight.")
+  }
+
+  private func automaticCommentaryDecisionCanProduceSpeech(_ decision: AutomaticCommentaryDecision) -> Bool {
+    switch decision.kind {
+    case .silent:
+      return false
+    case .narrator, .piece:
+      return true
+    }
+  }
+
+  private func hasAutomaticCommentaryInFlightOrQueued() -> Bool {
+    if automaticCommentaryRequestTask != nil {
+      return true
+    }
+
+    if pendingGeneratedNarrations.contains(where: { isPassiveAutomaticNarrationStyle($0.style) }) {
+      return true
+    }
+
+    return utteranceStyles.values.contains(where: isPassiveAutomaticNarrationStyle)
+  }
+
+  private func isPassiveAutomaticNarrationStyle(_ style: GeneratedNarrationStyle) -> Bool {
+    switch style {
+    case .automaticNarrator, .pieceVoice:
+      return true
+    case .gemini:
+      return false
+    }
+  }
+
+  private func flushQueuedAutomaticCommentaryDecisionIfPossible() {
+    guard automaticCommentaryRequestTask == nil,
+          !hasAutomaticCommentaryInFlightOrQueued(),
+          let queuedDecision = queuedAutomaticCommentaryDecision else {
+      return
+    }
+
+    queuedAutomaticCommentaryDecision = nil
+    guard !shouldSuppressPassiveCommentaryForCoach() else {
+      appendGeminiDebug("Dropped queued automatic commentary because coach interaction is active.")
+      pieceVoiceStatusText = "Queued auto commentary dropped for coach activity."
+      return
+    }
+    appendGeminiDebug("Flushing queued automatic commentary once the passive lane cleared.")
+    applyAutomaticCommentaryDecision(queuedDecision)
   }
 
   func handleMove(
@@ -6417,15 +6868,18 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     if silentSpeechWarmupUtteranceIDs.remove(utteranceID) != nil {
       if !synthesizer.isSpeaking {
         flushPendingGeneratedNarrationIfPossible()
+        flushQueuedAutomaticCommentaryDecisionIfPossible()
       }
       return
     }
 
     utteranceCaptions[utteranceID] = nil
+    utteranceStyles[utteranceID] = nil
     if !synthesizer.isSpeaking {
       AmbientMusicController.shared.setSpeechActive(false)
       caption = nil
       flushPendingGeneratedNarrationIfPossible()
+      flushQueuedAutomaticCommentaryDecisionIfPossible()
     }
   }
 
@@ -6434,15 +6888,18 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     if silentSpeechWarmupUtteranceIDs.remove(utteranceID) != nil {
       if !synthesizer.isSpeaking {
         flushPendingGeneratedNarrationIfPossible()
+        flushQueuedAutomaticCommentaryDecisionIfPossible()
       }
       return
     }
 
     utteranceCaptions[utteranceID] = nil
+    utteranceStyles[utteranceID] = nil
     if !synthesizer.isSpeaking {
       AmbientMusicController.shared.setSpeechActive(false)
       caption = nil
       flushPendingGeneratedNarrationIfPossible()
+      flushQueuedAutomaticCommentaryDecisionIfPossible()
     }
   }
 
@@ -6583,30 +7040,23 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       .map(\.0)
   }
 
-  private func maybeTriggerPieceVoiceLine(
-    move: ChessMove,
-    before beforeState: ChessGameState,
-    after afterState: ChessGameState
+  private func requestPieceVoiceLine(
+    _ plan: PieceVoiceRequestPlan,
+    priority: SpeechPriority,
+    reason: String
   ) {
     guard hintService.isConfigured else {
       pieceVoiceStatusText = "Piece voice disabled: ARChessAPIBaseURL missing."
       return
     }
 
-    let plan = makePieceVoiceRequestPlan(
-      move: move,
-      before: beforeState,
-      after: afterState
-    )
-
     let sessionID = narrationSessionID
-    latestPieceVoiceRequestID += 1
-    let requestID = latestPieceVoiceRequestID
-    pieceVoiceRequestTask?.cancel()
-    pieceVoiceRequestTask = nil
-    discardPendingPieceVoiceNarrations()
+    latestAutomaticCommentaryRequestID += 1
+    let requestID = latestAutomaticCommentaryRequestID
+    queuedAutomaticCommentaryDecision = nil
 
     pieceVoiceStatusText = "Requesting \(plan.label)..."
+    appendGeminiDebug("Automatic commentary chose piece: \(reason)")
     appendGeminiDebug("Triggering Gemini piece voice for \(plan.label).")
     appendGeminiDebug(
       "Piece voice context piece=\(plan.speaker.displayName.lowercased()) mode=\(plan.context.contextMode.rawValue) " +
@@ -6616,15 +7066,16 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
         "state=\(plan.context.positionState.rawValue) quality=\(plan.context.moveQuality.rawValue)"
     )
 
-    pieceVoiceRequestTask = Task { @MainActor [weak self] in
+    automaticCommentaryRequestTask = Task { @MainActor [weak self] in
       guard let self else {
         return
       }
 
       defer {
-        if self.latestPieceVoiceRequestID == requestID {
-          self.pieceVoiceRequestTask = nil
+        if self.latestAutomaticCommentaryRequestID == requestID {
+          self.automaticCommentaryRequestTask = nil
         }
+        self.flushQueuedAutomaticCommentaryDecisionIfPossible()
       }
 
       do {
@@ -6634,7 +7085,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
           self.appendGeminiDebug("Dropped stale Gemini piece voice line because the session reset.")
           return
         }
-        guard self.latestPieceVoiceRequestID == requestID else {
+        guard self.latestAutomaticCommentaryRequestID == requestID else {
           self.appendGeminiDebug("Dropped stale Gemini piece voice line because a newer move requested speech.")
           return
         }
@@ -6645,17 +7096,23 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
           self.emitPieceVoiceLine(
             self.fallbackPieceVoiceLine(for: plan),
             for: plan,
-            statusPrefix: "Fallback"
+            statusPrefix: "Fallback",
+            priority: priority
           )
           return
         }
 
-        self.emitPieceVoiceLine(sanitizedLine, for: plan, statusPrefix: "Generated")
+        self.emitPieceVoiceLine(
+          sanitizedLine,
+          for: plan,
+          statusPrefix: "Generated",
+          priority: priority
+        )
       } catch is CancellationError {
-        guard self.latestPieceVoiceRequestID == requestID else {
+        guard self.latestAutomaticCommentaryRequestID == requestID else {
           return
         }
-        self.pieceVoiceStatusText = "Piece voice request cancelled."
+        self.pieceVoiceStatusText = "Automatic piece line request cancelled."
         return
       } catch {
         guard self.narrationSessionID == sessionID else {
@@ -6663,7 +7120,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
           self.appendGeminiDebug("Dropped stale fallback piece voice line because the session reset.")
           return
         }
-        guard self.latestPieceVoiceRequestID == requestID else {
+        guard self.latestAutomaticCommentaryRequestID == requestID else {
           self.appendGeminiDebug("Dropped stale fallback piece voice line because a newer move requested speech.")
           return
         }
@@ -6671,18 +7128,190 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
         self.emitPieceVoiceLine(
           self.fallbackPieceVoiceLine(for: plan),
           for: plan,
-          statusPrefix: "Fallback"
+          statusPrefix: "Fallback",
+          priority: priority
         )
       }
     }
   }
 
+  private func requestPassiveNarratorLine(
+    _ context: GeminiPassiveNarratorLineContext,
+    resetsNarratorRamp: Bool,
+    marksOpeningNarrationDelivered: Bool,
+    reason: String
+  ) {
+    let sessionID = narrationSessionID
+    latestAutomaticCommentaryRequestID += 1
+    let requestID = latestAutomaticCommentaryRequestID
+    queuedAutomaticCommentaryDecision = nil
+
+    pieceVoiceStatusText = context.phase == .opening
+      ? "Requesting opening narration..."
+      : "Requesting narrator line..."
+    appendGeminiDebug("Automatic commentary chose narrator: \(reason)")
+
+    automaticCommentaryRequestTask = Task { @MainActor [weak self] in
+      guard let self else {
+        return
+      }
+
+      defer {
+        if self.latestAutomaticCommentaryRequestID == requestID {
+          self.automaticCommentaryRequestTask = nil
+        }
+        self.flushQueuedAutomaticCommentaryDecisionIfPossible()
+      }
+
+      let finalizeNarratorState = {
+        if marksOpeningNarrationDelivered {
+          self.openingNarrationDelivered = true
+        }
+        if resetsNarratorRamp {
+          self.turnsSinceNarratorLine = 0
+        }
+      }
+
+      do {
+        let line = try await self.hintService.fetchPassiveNarratorLine(for: context)
+        guard self.narrationSessionID == sessionID else {
+          self.pieceVoiceStatusText = "Dropped after session reset."
+          self.appendGeminiDebug("Dropped stale narrator line because the session reset.")
+          return
+        }
+        guard self.latestAutomaticCommentaryRequestID == requestID else {
+          self.appendGeminiDebug("Dropped stale narrator line because a newer move requested speech.")
+          return
+        }
+
+        let sanitizedLine = cappedNarrationText(
+          line,
+          maxSentences: 2,
+          maxCharacters: Self.passiveNarratorCharacterLimit
+        ).text
+        let resolvedLine = sanitizedLine.isEmpty
+          ? self.fallbackPassiveNarratorLine(for: context)
+          : self.resolveDistinctPassiveNarratorLine(sanitizedLine, for: context)
+        guard !resolvedLine.isEmpty else {
+          self.pieceVoiceStatusText = "Narrator stayed silent."
+          return
+        }
+        finalizeNarratorState()
+        self.emitPassiveNarratorLine(
+          resolvedLine,
+          context: context,
+          statusPrefix: sanitizedLine.isEmpty ? "Fallback" : "Generated"
+        )
+      } catch is CancellationError {
+        guard self.latestAutomaticCommentaryRequestID == requestID else {
+          return
+        }
+        self.pieceVoiceStatusText = "Narrator request cancelled."
+      } catch {
+        guard self.narrationSessionID == sessionID else {
+          self.pieceVoiceStatusText = "Dropped after session reset."
+          self.appendGeminiDebug("Dropped stale narrator fallback because the session reset.")
+          return
+        }
+        guard self.latestAutomaticCommentaryRequestID == requestID else {
+          self.appendGeminiDebug("Dropped stale narrator fallback because a newer move requested speech.")
+          return
+        }
+        let fallbackLine = self.fallbackPassiveNarratorLine(for: context)
+        guard !fallbackLine.isEmpty else {
+          self.pieceVoiceStatusText = "Narrator stayed silent."
+          return
+        }
+        finalizeNarratorState()
+        self.appendGeminiDebug("Gemini passive narrator request failed: \(error.localizedDescription). Using local fallback.")
+        self.emitPassiveNarratorLine(fallbackLine, context: context, statusPrefix: "Fallback")
+      }
+    }
+  }
+
+  private func buildPassiveNarratorLineContext(forOpening state: ChessGameState) -> GeminiPassiveNarratorLineContext {
+    GeminiPassiveNarratorLineContext(
+      fen: state.fenString,
+      recentHistory: recentHistoryProvider?(),
+      recentLines: recentPassiveNarratorLines(),
+      phase: .opening,
+      turnsSinceLastNarratorLine: turnsSinceNarratorLine,
+      moveSAN: nil,
+      movingPiece: nil,
+      movingColor: nil,
+      fromSquare: nil,
+      toSquare: nil,
+      isCapture: false,
+      isCheck: false,
+      isCheckmate: false,
+      isNearEnemyKing: false,
+      isAttacked: false,
+      isPinned: false,
+      isRetreat: false,
+      isAggressiveAdvance: false,
+      isForkThreat: false,
+      attackerCount: 0,
+      defenderCount: 0,
+      evalBefore: nil,
+      evalAfter: nil,
+      evalDelta: nil,
+      positionState: nil,
+      moveQuality: nil
+    )
+  }
+
+  private func buildPassiveNarratorLineContext(
+    for move: ChessMove,
+    before beforeState: ChessGameState,
+    after afterState: ChessGameState
+  ) -> GeminiPassiveNarratorLineContext {
+    let movedPieceContext = buildPieceVoiceLineContext(
+      speakingSquare: move.to,
+      piece: move.piece,
+      contextMode: .moved,
+      before: beforeState,
+      after: afterState,
+      referenceMove: move
+    )
+
+    return GeminiPassiveNarratorLineContext(
+      fen: afterState.fenString,
+      recentHistory: recentHistoryProvider?(),
+      recentLines: recentPassiveNarratorLines(),
+      phase: .move,
+      turnsSinceLastNarratorLine: turnsSinceNarratorLine,
+      moveSAN: beforeState.sanNotation(for: move),
+      movingPiece: move.piece.kind,
+      movingColor: move.piece.color,
+      fromSquare: move.from,
+      toSquare: move.to,
+      isCapture: movedPieceContext.isCapture,
+      isCheck: movedPieceContext.isCheck,
+      isCheckmate: afterState.isCheckmate(for: afterState.turn),
+      isNearEnemyKing: movedPieceContext.isNearEnemyKing,
+      isAttacked: movedPieceContext.isAttacked,
+      isPinned: movedPieceContext.isPinned,
+      isRetreat: movedPieceContext.isRetreat,
+      isAggressiveAdvance: movedPieceContext.isAggressiveAdvance,
+      isForkThreat: movedPieceContext.isForkThreat,
+      attackerCount: movedPieceContext.attackerCount,
+      defenderCount: movedPieceContext.defenderCount,
+      evalBefore: movedPieceContext.evalBefore,
+      evalAfter: movedPieceContext.evalAfter,
+      evalDelta: movedPieceContext.evalDelta,
+      positionState: movedPieceContext.positionState,
+      moveQuality: movedPieceContext.moveQuality
+    )
+  }
+
   private func makePieceVoiceRequestPlan(
     move: ChessMove,
     before beforeState: ChessGameState,
-    after afterState: ChessGameState
+    after afterState: ChessGameState,
+    allowAmbient: Bool
   ) -> PieceVoiceRequestPlan {
-    if shouldTriggerAmbientPieceVoiceLine(),
+    if allowAmbient,
+       shouldTriggerAmbientPieceVoiceLine(),
        let ambientSpeaker = selectAmbientPieceVoiceSpeaker(
         in: afterState,
         excluding: move.to
@@ -7050,13 +7679,42 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     }
   }
 
-  private func discardPendingPieceVoiceNarrations() {
+  private func recentPassiveNarratorLines(limit: Int = 4) -> [String] {
+    let prefix = "Narrator: "
+    return Array(
+      pieceVoiceLines
+        .reversed()
+        .compactMap { line -> String? in
+          guard line.hasPrefix(prefix) else {
+            return nil
+          }
+          let body = String(line.dropFirst(prefix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+          return body.isEmpty ? nil : body
+        }
+        .prefix(limit)
+    )
+  }
+
+  private func hasRecentPassiveNarratorLine(_ text: String, limit: Int = 4) -> Bool {
+    let fingerprint = pieceVoiceFingerprint(text)
+    guard !fingerprint.isEmpty else {
+      return false
+    }
+
+    return recentPassiveNarratorLines(limit: limit).contains {
+      pieceVoiceFingerprint($0) == fingerprint
+    }
+  }
+
+  private func discardPendingAutomaticNarrations() {
     let originalCount = pendingGeneratedNarrations.count
     pendingGeneratedNarrations.removeAll { pending in
-      if case .pieceVoice = pending.style {
+      switch pending.style {
+      case .automaticNarrator, .pieceVoice:
         return true
+      case .gemini:
+        return false
       }
-      return false
     }
 
     let droppedCount = originalCount - pendingGeneratedNarrations.count
@@ -7064,7 +7722,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       return
     }
 
-    appendGeminiDebug("Dropped \(droppedCount) queued stale piece voice line(s).")
+    appendGeminiDebug("Dropped \(droppedCount) queued stale passive commentary line(s).")
     if pendingGeneratedNarrations.isEmpty {
       geminiNarrationRetryWorkItem?.cancel()
       geminiNarrationRetryWorkItem = nil
@@ -7096,13 +7754,14 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     if pieceVoiceLines.count > 8 {
       pieceVoiceLines.removeFirst(pieceVoiceLines.count - 8)
     }
-    appendGeminiDebug("Piece voice ready: \(line)")
+    appendGeminiDebug("Automatic commentary ready: \(line)")
   }
 
   private func emitPieceVoiceLine(
     _ text: String,
     for plan: PieceVoiceRequestPlan,
-    statusPrefix: String
+    statusPrefix: String,
+    priority: SpeechPriority
   ) {
     var resolvedText = text
     var resolvedStatusPrefix = statusPrefix
@@ -7120,12 +7779,143 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     let spokeImmediately = speakGeneratedPieceVoiceLine(
       text: resolvedText,
       speaker: plan.speaker,
-      priority: .urgent
+      priority: priority
     )
     appendGeminiDebug(
       spokeImmediately
         ? "Piece voice handed to speech engine for \(plan.speaker.displayName.lowercased())."
         : "Piece voice did not reach speech engine for \(plan.speaker.displayName.lowercased())."
+    )
+  }
+
+  private func pickDistinctPassiveNarratorOption(
+    _ options: [String],
+    extraAvoiding additionalLines: [String] = []
+  ) -> String {
+    let avoidFingerprints = Set(
+      recentPassiveNarratorLines(limit: 6)
+        .map { pieceVoiceFingerprint($0) }
+        .filter { !$0.isEmpty }
+        + additionalLines.map { pieceVoiceFingerprint($0) }.filter { !$0.isEmpty }
+    )
+    let shuffledOptions = options.shuffled()
+    if let distinctOption = shuffledOptions.first(where: { !avoidFingerprints.contains(pieceVoiceFingerprint($0)) }) {
+      return distinctOption
+    }
+    return shuffledOptions.first ?? options.first ?? ""
+  }
+
+  private func resolveDistinctPassiveNarratorLine(
+    _ text: String,
+    for context: GeminiPassiveNarratorLineContext
+  ) -> String {
+    guard hasRecentPassiveNarratorLine(text) else {
+      return text
+    }
+    appendGeminiDebug("Passive narrator line repeated recent wording; using a varied local fallback.")
+    return fallbackPassiveNarratorLine(for: context, avoiding: [text])
+  }
+
+  private func emitPassiveNarratorLine(
+    _ text: String,
+    context: GeminiPassiveNarratorLineContext,
+    statusPrefix: String
+  ) {
+    let resolvedText = resolveDistinctPassiveNarratorLine(text, for: context)
+    let debugLine = "Narrator: \(resolvedText)"
+    pieceVoiceStatusText = "\(statusPrefix): \(debugLine)"
+    recordPieceVoiceLine(debugLine)
+    let spokeImmediately = speakPassiveNarratorLine(text: resolvedText)
+    appendGeminiDebug(
+      spokeImmediately
+        ? "Passive narrator handed to speech engine."
+        : "Passive narrator did not reach speech engine."
+    )
+  }
+
+  private func fallbackPassiveNarratorLine(
+    for context: GeminiPassiveNarratorLineContext,
+    avoiding additionalLines: [String] = []
+  ) -> String {
+    if context.phase == .opening {
+      return pickDistinctPassiveNarratorOption(
+        [
+          "The board is set, and the trouble is only beginning.",
+          "Two plans take the stage now, quiet and dangerous.",
+          "The pieces are awake. The story begins with a stare."
+        ],
+        extraAvoiding: additionalLines
+      )
+    }
+
+    if context.isCheckmate {
+      return pickDistinctPassiveNarratorOption(
+        [
+          "And just like that, the argument is over.",
+          "The board goes still. There is no answer left.",
+          "One side has run out of road and out of time."
+        ],
+        extraAvoiding: additionalLines
+      )
+    }
+
+    if context.isCheck {
+      return pickDistinctPassiveNarratorOption(
+        [
+          "The air changes. A king is suddenly short on comfort.",
+          "That move asks a direct and deeply unpleasant question.",
+          "Pressure has become immediate now."
+        ],
+        extraAvoiding: additionalLines
+      )
+    }
+
+    if let evalDelta = context.evalDelta, abs(evalDelta) >= Self.substantialGainThreshold {
+      return pickDistinctPassiveNarratorOption(
+        evalDelta > 0
+          ? [
+            "Momentum leans a little harder to one side now.",
+            "That was no routine move. The balance just shifted.",
+            "A quiet edge has turned into real momentum."
+          ]
+          : [
+            "Something important just slipped loose in that position.",
+            "The board has tilted, and not by accident.",
+            "A small mistake can sound very loud at moments like this."
+          ],
+        extraAvoiding: additionalLines
+      )
+    }
+
+    if context.isNearEnemyKing || context.isForkThreat {
+      return pickDistinctPassiveNarratorOption(
+        [
+          "There is danger in that shape now, even if it has not landed yet.",
+          "The pressure is gathering where a king can feel it.",
+          "That move leaves a threat hanging in the air."
+        ],
+        extraAvoiding: additionalLines
+      )
+    }
+
+    if context.isRetreat {
+      return pickDistinctPassiveNarratorOption(
+        [
+          "Not every retreat is fear. Sometimes it is the start of a better plan.",
+          "The piece steps back, but the position keeps tightening.",
+          "A quiet move, perhaps, though not an unimportant one."
+        ],
+        extraAvoiding: additionalLines
+      )
+    }
+
+    return pickDistinctPassiveNarratorOption(
+      [
+        "The board stays quiet, but the pressure does not.",
+        "Nothing flashy there, just a position growing heavier.",
+        "Even calm moves can leave a long echo."
+      ],
+      extraAvoiding: additionalLines
     )
   }
 
@@ -8134,18 +8924,6 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     return "\(from) to \(to), promoting to \(promotionName)"
   }
 
-  private func scheduleNextCommentaryWindow() {
-    nextCommentaryPly = completedPlyCount + Int.random(in: Self.commentaryIntervalRange)
-  }
-
-  private func canKingSayCooked(for color: ChessColor) -> Bool {
-    completedPlyCount >= (nextKingCookedAllowedPly[color] ?? 0)
-  }
-
-  private func noteKingCookedSpoken(for color: ChessColor) {
-    nextKingCookedAllowedPly[color] = completedPlyCount + Self.kingCookedCooldownPly
-  }
-
   private func lines(for classification: MoveClassification) -> [SpokenLine] {
     switch classification {
     case .brilliant:
@@ -8334,6 +9112,16 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     speakGeminiNarration(text: text, title: "Gemini Hint", priority: priority)
   }
 
+  private func speakPassiveNarratorLine(text: String) -> Bool {
+    appendGeminiDebug("Preparing passive narrator speech.")
+    return speakGeneratedNarration(
+      text: text,
+      style: .automaticNarrator,
+      priority: .normal,
+      maxCharacters: Self.passiveNarratorCharacterLimit
+    )
+  }
+
   private func speakGeminiNarration(text: String, title: String, priority: SpeechPriority) -> Bool {
     speakGeneratedNarration(
       text: text,
@@ -8367,6 +9155,8 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     switch style {
     case .gemini:
       sanitizedText = cappedNarrationText(text, maxCharacters: maxCharacters).text
+    case .automaticNarrator:
+      sanitizedText = cappedNarrationText(text, maxSentences: 2, maxCharacters: maxCharacters).text
     case .pieceVoice:
       sanitizedText = cappedPieceVoiceLineText(text, maxCharacters: maxCharacters)
     }
@@ -8422,16 +9212,30 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
         line: text,
         imageAssetName: "GeminiNarratorPortrait"
       )
+      utteranceStyles[ObjectIdentifier(utterance)] = style
+    case .automaticNarrator:
+      utterance.pitchMultiplier = 0.98
+      utterance.rate = 0.45
+      utterance.volume = 0.94
+      utteranceCaptions[ObjectIdentifier(utterance)] = Caption(
+        title: "Narrator",
+        line: text,
+        imageAssetName: "GeminiNarratorPortrait"
+      )
+      utteranceStyles[ObjectIdentifier(utterance)] = style
     case .pieceVoice(let speaker):
       utterance.pitchMultiplier = min(max(speaker.defaultPitch, 0.5), 2.0)
       utterance.rate = min(max(speaker.defaultRate, 0.1), 0.65)
       utterance.volume = min(max(speaker.defaultVolume, 0.0), 1.0)
       utteranceCaptions[ObjectIdentifier(utterance)] = Caption(speaker: speaker, line: text)
+      utteranceStyles[ObjectIdentifier(utterance)] = style
     }
 
     utterance.preUtteranceDelay = 0.02
     if case .pieceVoice(let speaker) = style {
       pieceVoiceStatusText = "Speaking \(speaker.displayName) voice."
+    } else if case .automaticNarrator = style {
+      pieceVoiceStatusText = "Speaking narrator line."
     }
     appendGeminiDebug("Speech start: \(generatedNarrationDebugLabel(style)) -> \(text)")
     maybeHighlightNarrationFocus(text)
@@ -8446,12 +9250,14 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   ) {
     let pending = PendingGeneratedNarration(text: text, style: style)
     switch style {
-    case .pieceVoice:
+    case .automaticNarrator, .pieceVoice:
       pendingGeneratedNarrations.removeAll { existing in
-        if case .pieceVoice = existing.style {
+        switch existing.style {
+        case .automaticNarrator, .pieceVoice:
           return true
+        case .gemini:
+          return false
         }
-        return false
       }
       pendingGeneratedNarrations.insert(pending, at: 0)
     case .gemini:
@@ -8517,6 +9323,8 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     switch style {
     case .gemini(let title):
       return title
+    case .automaticNarrator:
+      return "Narrator"
     case .pieceVoice(let speaker):
       return "\(speaker.displayName) piece voice"
     }
@@ -10110,6 +10918,7 @@ private struct NativeARExperienceView: View {
       commentary.unbindReactionHandler()
       commentary.unbindNarrationHighlightHandler()
       commentary.unbindPieceAudioBusyDurationProvider()
+      commentary.unbindPassiveCommentarySuppressionProvider()
       socraticCoach.unbindThreatZoneHandler()
       socraticCoach.unbindMoveHandler()
       socraticCoach.unbindDirectVoiceCommandHandler()
@@ -10491,7 +11300,7 @@ private struct NativeARExperienceView: View {
         }
 
         VStack(alignment: .leading, spacing: 6) {
-          Text("Piece Voice Lines")
+          Text("Auto Commentary Lines")
             .font(.system(size: 12, weight: .bold, design: .rounded))
             .foregroundStyle(Color.white.opacity(0.88))
 
@@ -10501,7 +11310,7 @@ private struct NativeARExperienceView: View {
             .lineSpacing(2)
 
           if commentary.pieceVoiceLines.isEmpty {
-            Text("No piece voices yet.")
+            Text("No automatic commentary yet.")
               .font(.system(size: 13, weight: .medium, design: .rounded))
               .foregroundStyle(Color.white.opacity(0.68))
           } else {
@@ -10544,7 +11353,7 @@ private struct NativeARExperienceView: View {
           .lineSpacing(2)
 
         if commentary.pieceVoiceLines.isEmpty {
-          Text("No voice lines yet. Make a move to trigger one.")
+          Text("No automatic commentary yet. Make a move to trigger one.")
             .font(.system(size: 13, weight: .medium, design: .rounded))
             .foregroundStyle(Color.white.opacity(0.72))
         } else {
@@ -12315,6 +13124,12 @@ private struct NativeARView: UIViewRepresentable {
               return self.gameState.turn == configuration.humanColor
             }
           }
+          self.commentary.bindPassiveCommentarySuppressionProvider { [weak self] in
+            self?.socraticCoach.blocksPassiveCommentary ?? false
+          }
+          if self.mode.supportsPassiveAutomaticCommentary {
+            self.commentary.maybeStartOpeningNarration(for: self.gameState)
+          }
         }
       }
 
@@ -13801,11 +14616,13 @@ private struct NativeARView: UIViewRepresentable {
       refreshBoardPresentation()
 
       captureSoundEffects.playMove(for: context.move.piece.kind)
-      commentary.startPieceVoiceLineRequest(
-        move: context.move,
-        before: context.beforeState,
-        after: context.afterState
-      )
+      if mode.supportsPassiveAutomaticCommentary {
+        commentary.triggerAutomaticCommentaryForMove(
+          move: context.move,
+          before: context.beforeState,
+          after: context.afterState
+        )
+      }
 
       if context.move.captured != nil || context.move.isEnPassant {
         await animateCapture(for: context.move, beforeState: context.beforeState)

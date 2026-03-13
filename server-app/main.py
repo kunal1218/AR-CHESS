@@ -404,6 +404,128 @@ class GeminiPieceVoiceResponse(BaseModel):
     line: str
 
 
+class GeminiPassiveNarratorRequest(BaseModel):
+    fen: str = Field(..., min_length=1, max_length=256)
+    recent_history: str | None = Field(default=None, max_length=512)
+    recent_lines: list[str] = Field(default_factory=list, max_length=6)
+    phase: str = Field(..., min_length=1, max_length=16)
+    turns_since_last_narrator_line: int = Field(default=0, ge=0, le=64)
+    move_san: str | None = Field(default=None, max_length=32)
+    moving_piece: str | None = Field(default=None, max_length=16)
+    moving_color: str | None = Field(default=None, max_length=16)
+    from_square: str | None = Field(default=None, min_length=2, max_length=2)
+    to_square: str | None = Field(default=None, min_length=2, max_length=2)
+    is_capture: bool = False
+    is_check: bool = False
+    is_checkmate: bool = False
+    is_near_enemy_king: bool = False
+    is_attacked: bool = False
+    is_pinned: bool = False
+    is_retreat: bool = False
+    is_aggressive_advance: bool = False
+    is_fork_threat: bool = False
+    attacker_count: int = Field(default=0, ge=0, le=16)
+    defender_count: int = Field(default=0, ge=0, le=16)
+    eval_before: int | None = Field(default=None, ge=-100000, le=100000)
+    eval_after: int | None = Field(default=None, ge=-100000, le=100000)
+    eval_delta: int | None = Field(default=None, ge=-100000, le=100000)
+    position_state: str | None = Field(default=None, min_length=1, max_length=16)
+    move_quality: str | None = Field(default=None, min_length=1, max_length=32)
+
+    @field_validator("fen")
+    @classmethod
+    def validate_passive_narrator_fen(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("fen must not be empty.")
+        return normalized
+
+    @field_validator("recent_history")
+    @classmethod
+    def validate_recent_history(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = re.sub(r"\s+", " ", value).strip()
+        return normalized or None
+
+    @field_validator("recent_lines")
+    @classmethod
+    def validate_narrator_recent_lines(cls, value: list[str]) -> list[str]:
+        normalized_lines: list[str] = []
+        for line in value:
+            normalized = re.sub(r"\s+", " ", line).strip()
+            if not normalized:
+                continue
+            normalized_lines.append(normalized[:220])
+            if len(normalized_lines) >= 6:
+                break
+        return normalized_lines
+
+    @field_validator("phase")
+    @classmethod
+    def validate_phase(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"opening", "move"}:
+            raise ValueError("phase must be opening or move.")
+        return normalized
+
+    @field_validator("moving_piece")
+    @classmethod
+    def validate_moving_piece(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip().lower()
+        if normalized not in {"pawn", "knight", "bishop", "rook", "queen", "king"}:
+            raise ValueError("moving_piece must be one of pawn, knight, bishop, rook, queen, king.")
+        return normalized
+
+    @field_validator("moving_color")
+    @classmethod
+    def validate_moving_color(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip().lower()
+        if normalized not in {"white", "black"}:
+            raise ValueError("moving_color must be 'white' or 'black'.")
+        return normalized
+
+    @field_validator("from_square", "to_square")
+    @classmethod
+    def validate_optional_square(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip().lower()
+        if not re.fullmatch(r"[a-h][1-8]", normalized):
+            raise ValueError("narrator squares must use algebraic notation such as e4.")
+        return normalized
+
+    @field_validator("position_state")
+    @classmethod
+    def validate_optional_position_state(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip().lower()
+        if normalized not in {"winning", "equal", "losing"}:
+            raise ValueError("position_state must be winning, equal, or losing.")
+        return normalized
+
+    @field_validator("move_quality")
+    @classmethod
+    def validate_optional_move_quality(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip().lower()
+        if normalized not in {"strong", "tactical", "defensive", "desperate", "poor", "aggressive", "routine"}:
+            raise ValueError(
+                "move_quality must be strong, tactical, defensive, desperate, poor, aggressive, or routine."
+            )
+        return normalized
+
+
+class GeminiPassiveNarratorResponse(BaseModel):
+    line: str
+
+
 GEMINI_HINT_SYSTEM_PROMPT = """
 You are a Grandmaster Chess Consultant. You will receive a FEN and a short PGN sequence.
 Use the FEN to identify tactical geometry (x-rays, pins, hanging pieces) and the PGN to identify strategic momentum and player intent.
@@ -417,6 +539,17 @@ Never output files, ranks, e2e4, d2d4, or any square names.
 Keep it to one sentence, around 6 to 14 words.
 Keep it educational, concrete, and easy to understand.
 Return plain text only.
+""".strip()
+GEMINI_PASSIVE_NARRATOR_SYSTEM_PROMPT = """
+You write passive automatic chess commentary for an in-game narrator.
+The voice is warm, observant, cinematic, calm, intelligent, and lightly amused.
+Sound like a polished documentary or sports-story narrator, but never imitate or mention any real person.
+You are not the coach and you are not a chess piece. You are the outside storyteller watching the match.
+Keep every line concise, vivid, and pleasant to listen to.
+Return plain text only.
+Use 1 to 2 short sentences.
+Avoid move notation, square names, engine jargon, and coordinate callouts.
+Comment on tension, pressure, looming threats, strategic turns, positional squeezes, momentum shifts, or the opening mood of the game.
 """.strip()
 GEMINI_HINT_MOVE_PATTERN = re.compile(r"\b[a-h][1-8][a-h][1-8][qrbn]?\b|\b[a-h][1-8]\b", re.IGNORECASE)
 GEMINI_COACH_BASE_SYSTEM_PROMPT = """
@@ -668,6 +801,25 @@ def sanitize_piece_voice_line_text(raw_text: str) -> str:
     return condensed
 
 
+def sanitize_passive_narrator_line_text(raw_text: str, fallback: str) -> str:
+    condensed = re.sub(r"\s+", " ", raw_text).strip().strip("\"'")
+    condensed = re.sub(r"^narrator\s*:\s*", "", condensed, flags=re.IGNORECASE)
+    condensed = condensed.strip("\"' ")
+    if not condensed:
+        return fallback
+    if GEMINI_HINT_MOVE_PATTERN.search(condensed):
+        return fallback
+
+    condensed = truncate_narration_text(condensed, max_sentences=2, max_characters=220)
+    if not condensed:
+        return fallback
+    if condensed.endswith(("...", ",", ";", ":")):
+        return fallback
+    if not condensed.endswith((".", "!", "?")):
+        condensed = f"{condensed}."
+    return condensed
+
+
 def normalize_piece_voice_line_text(text: str) -> str:
     condensed = text.strip().strip("\"'")
     if not condensed:
@@ -698,6 +850,19 @@ def piece_voice_repetition_key(text: str) -> str:
 
 
 def is_piece_voice_line_repetitive(text: str, recent_lines: list[str]) -> bool:
+    candidate_key = piece_voice_repetition_key(text)
+    if not candidate_key:
+        return False
+
+    recent_keys = {
+        piece_voice_repetition_key(line)
+        for line in recent_lines
+        if piece_voice_repetition_key(line)
+    }
+    return candidate_key in recent_keys
+
+
+def is_passive_narrator_line_repetitive(text: str, recent_lines: list[str]) -> bool:
     candidate_key = piece_voice_repetition_key(text)
     if not candidate_key:
         return False
@@ -850,6 +1015,119 @@ def build_piece_voice_line_query(payload: GeminiPieceVoiceRequest) -> str:
         f"{recent_lines_text}"
     )
 
+
+def build_passive_narrator_line_query(payload: GeminiPassiveNarratorRequest) -> str:
+    eval_before = "unknown" if payload.eval_before is None else str(payload.eval_before)
+    eval_after = "unknown" if payload.eval_after is None else str(payload.eval_after)
+    eval_delta = "unknown" if payload.eval_delta is None else str(payload.eval_delta)
+    recent_lines_text = ""
+    if payload.recent_lines:
+        formatted_recent_lines = "\n".join(f"- {line}" for line in payload.recent_lines)
+        recent_lines_text = (
+            "\nRecent narrator lines to avoid repeating:\n"
+            f"{formatted_recent_lines}\n"
+            "Do not reuse these exact lines or their core phrasing.\n"
+        )
+
+    if payload.phase == "opening":
+        return (
+            "Write one opening-of-match narrator line for an automatic chess broadcast. "
+            "Set the stakes for the coming duel in 1 or 2 concise sentences. "
+            "Be calm, anticipatory, cinematic, and fun to listen to. "
+            "Do not speak as a coach. Do not speak as a chess piece. "
+            "Do not mention squares, coordinates, SAN, or engine terms. "
+            "Output only the line itself.\n\n"
+            f"Turns since last narrator line: {payload.turns_since_last_narrator_line}"
+            f"{recent_lines_text}"
+        )
+
+    move_san = payload.move_san or "unknown"
+    moving_piece = payload.moving_piece or "piece"
+    moving_color = payload.moving_color or "unknown"
+    from_square = payload.from_square or "unknown"
+    to_square = payload.to_square or "unknown"
+    capture_text = "yes" if payload.is_capture else "no"
+    check_text = "yes" if payload.is_check else "no"
+    checkmate_text = "yes" if payload.is_checkmate else "no"
+    near_king_text = "yes" if payload.is_near_enemy_king else "no"
+    attacked_text = "yes" if payload.is_attacked else "no"
+    pinned_text = "yes" if payload.is_pinned else "no"
+    retreat_text = "yes" if payload.is_retreat else "no"
+    aggressive_text = "yes" if payload.is_aggressive_advance else "no"
+    fork_text = "yes" if payload.is_fork_threat else "no"
+    position_state = payload.position_state or "unknown"
+    move_quality = payload.move_quality or "unknown"
+
+    return (
+        "Write one passive automatic narrator line for a chess game. "
+        "This is story-like commentary, not coaching and not in-character piece dialogue. "
+        "Speak only as an outside narrator who notices tension, pressure, momentum, danger, or the weight of a quiet move. "
+        "Keep it concise and polished. Use 1 or 2 short sentences. "
+        "Do not mention squares, coordinates, move notation, SAN, or engine terms. "
+        "Output only the line itself.\n\n"
+        f"Turns since last narrator line: {payload.turns_since_last_narrator_line}\n"
+        f"Move SAN: {move_san}\n"
+        f"Moving piece: {moving_color} {moving_piece}\n"
+        f"Move path: {from_square} to {to_square}\n"
+        f"Capture: {capture_text}\n"
+        f"Check: {check_text}\n"
+        f"Checkmate: {checkmate_text}\n"
+        f"Near enemy king: {near_king_text}\n"
+        f"Moved piece is attacked: {attacked_text}\n"
+        f"Pinned: {pinned_text}\n"
+        f"Retreat: {retreat_text}\n"
+        f"Aggressive advance: {aggressive_text}\n"
+        f"Fork threat: {fork_text}\n"
+        f"Attacker count: {payload.attacker_count}\n"
+        f"Defender count: {payload.defender_count}\n"
+        f"Position state: {position_state}\n"
+        f"Move quality: {move_quality}\n"
+        f"Eval before: {eval_before}\n"
+        f"Eval after: {eval_after}\n"
+        f"Eval delta: {eval_delta}"
+        f"{recent_lines_text}"
+    )
+
+
+def build_passive_narrator_line_retry_query(payload: GeminiPassiveNarratorRequest, previous_response: str) -> str:
+    trimmed_previous = re.sub(r"\s+", " ", previous_response).strip()
+    return (
+        build_passive_narrator_line_query(payload)
+        + "\n\n"
+        + "Your previous answer repeated recent wording or was unusable. "
+        + "Return one fresh alternative right now with noticeably different phrasing. "
+        + "Keep it cinematic, concise, and natural to speak aloud. "
+        + "Do not reuse the same opening words or core phrase. "
+        + "Do not return labels, quotes, or explanations. "
+        + f"Previous answer to replace: {trimmed_previous or '(empty)'}"
+    )
+
+
+def gemini_fallback_passive_narrator_line(payload: GeminiPassiveNarratorRequest) -> str:
+    if payload.phase == "opening":
+        return (
+            "The board is set, and both plans are still hiding their teeth."
+        )
+
+    if payload.is_checkmate:
+        return "The board goes quiet. There is no answer left."
+
+    if payload.is_check:
+        return "The pressure has stopped being subtle now."
+
+    if payload.is_capture:
+        return "Material changes hands, and the position remembers it immediately."
+
+    if payload.is_near_enemy_king or payload.is_fork_threat:
+        return "There is a threat in the air now, whether the board admits it or not."
+
+    if payload.eval_delta is not None and abs(payload.eval_delta) >= 80:
+        return "That move shifts the balance a little harder than it first appears."
+
+    if payload.is_retreat:
+        return "The step backward is quiet, but not without intent."
+
+    return "The board stays calm on the surface, but the pressure keeps building."
 
 def build_piece_voice_line_retry_query(payload: GeminiPieceVoiceRequest, previous_response: str) -> str:
     trimmed_previous = re.sub(r"\s+", " ", previous_response).strip()
@@ -1229,7 +1507,22 @@ GEMINI_LIVE_CLIENT = GeminiLiveClient(
     logger=logging.getLogger("archess.server.gemini_live"),
     prefer_audio_output=True,
 )
+GEMINI_PASSIVE_COMMENTARY_CLIENT = GeminiLiveClient(
+    api_key=os.getenv("GEMINI_API_KEY"),
+    model=os.getenv("GEMINI_LIVE_MODEL", GeminiLiveClient.DEFAULT_MODEL),
+    system_prompt=os.getenv("GEMINI_PASSIVE_NARRATOR_SYSTEM_PROMPT", GEMINI_PASSIVE_NARRATOR_SYSTEM_PROMPT).strip(),
+    generation_config={
+        "temperature": env_float("GEMINI_PASSIVE_NARRATOR_TEMPERATURE", 1.1),
+        "top_p": env_float("GEMINI_PASSIVE_NARRATOR_TOP_P", 0.96),
+        "top_k": env_int("GEMINI_PASSIVE_NARRATOR_TOP_K", 48),
+        "max_output_tokens": env_int("GEMINI_PASSIVE_NARRATOR_MAX_OUTPUT_TOKENS", 96),
+    },
+    ws_url=os.getenv("GEMINI_LIVE_WS_URL") or None,
+    logger=logging.getLogger("archess.server.gemini_passive"),
+    prefer_audio_output=False,
+)
 GEMINI_LIVE_TURN_TIMEOUT_SECONDS = env_float("GEMINI_LIVE_TURN_TIMEOUT_SECONDS", 12.0)
+GEMINI_PASSIVE_NARRATOR_TIMEOUT_SECONDS = env_float("GEMINI_PASSIVE_NARRATOR_TIMEOUT_SECONDS", 4.8)
 GEMINI_COACH_MODEL = os.getenv("GEMINI_COACH_MODEL", "gemini-2.5-flash")
 GEMINI_COACH_TIMEOUT_SECONDS = env_float("GEMINI_COACH_TIMEOUT_SECONDS", 12.0)
 GEMINI_PIECE_VOICE_TEXT_MODEL = os.getenv("GEMINI_PIECE_VOICE_TEXT_MODEL", GEMINI_COACH_MODEL)
@@ -1902,11 +2195,13 @@ def get_queue_match_moves(
 @app.on_event("startup")
 async def startup_gemini_live() -> None:
     GEMINI_LIVE_CLIENT.ensure_connection_background()
+    GEMINI_PASSIVE_COMMENTARY_CLIENT.ensure_connection_background()
 
 
 @app.on_event("shutdown")
 async def shutdown_gemini_live() -> None:
     await GEMINI_LIVE_CLIENT.disconnect()
+    await GEMINI_PASSIVE_COMMENTARY_CLIENT.disconnect()
 
 
 @app.get("/health/ping")
@@ -2019,6 +2314,55 @@ async def create_gemini_lesson_feedback(payload: GeminiLessonFeedbackRequest) ->
     return {
         "explanation": sanitize_lesson_feedback_text(raw_explanation, fallback),
     }
+
+
+@app.post("/v1/gemini/passive-commentary-line", response_model=GeminiPassiveNarratorResponse)
+async def create_gemini_passive_commentary_line(payload: GeminiPassiveNarratorRequest) -> dict[str, Any]:
+    fallback = gemini_fallback_passive_narrator_line(payload)
+    query = build_passive_narrator_line_query(payload)
+    metadata = {
+        "current_fen": payload.fen,
+        "recent_history": payload.recent_history,
+        "phase": payload.phase,
+        "moving_piece": payload.moving_piece,
+        "moving_color": payload.moving_color,
+        "is_capture": payload.is_capture,
+        "is_check": payload.is_check,
+        "is_checkmate": payload.is_checkmate,
+    }
+
+    try:
+        raw_line = await GEMINI_PASSIVE_COMMENTARY_CLIENT.run_turn(
+            query,
+            metadata=metadata,
+            timeout_seconds=GEMINI_PASSIVE_NARRATOR_TIMEOUT_SECONDS,
+        )
+        line = sanitize_passive_narrator_line_text(raw_line, fallback)
+
+        if is_passive_narrator_line_repetitive(line, payload.recent_lines):
+            retry_query = build_passive_narrator_line_retry_query(payload, raw_line)
+            raw_line = await GEMINI_PASSIVE_COMMENTARY_CLIENT.run_turn(
+                retry_query,
+                metadata=metadata,
+                timeout_seconds=GEMINI_PASSIVE_NARRATOR_TIMEOUT_SECONDS,
+            )
+            line = sanitize_passive_narrator_line_text(raw_line, fallback)
+    except GeminiLiveConfigurationError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except GeminiLiveBusyError as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
+    except GeminiLiveConnectionError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:  # pragma: no cover - integration guarded
+        logger.exception("Gemini passive narrator request failed unexpectedly")
+        raise HTTPException(status_code=503, detail=f"Gemini passive narrator failed: {exc}") from exc
+
+    if is_passive_narrator_line_repetitive(line, payload.recent_lines):
+        line = fallback
+    if not line:
+        line = fallback
+
+    return {"line": line}
 
 
 @app.post("/v1/gemini/piece-voice-line", response_model=GeminiPieceVoiceResponse)

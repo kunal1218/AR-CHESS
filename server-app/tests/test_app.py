@@ -14,6 +14,7 @@ if str(SERVER_APP_ROOT) not in sys.path:
 
 from main import (  # noqa: E402
     app,
+    build_passive_narrator_line_query,
     build_narrator_prompt,
     build_narrator_turn_addon,
     build_piece_voice_line_duplicate_retry_query,
@@ -27,6 +28,7 @@ from main import (  # noqa: E402
     parse_gemini_coach_response,
     sanitize_hint_text,
     sanitize_lesson_feedback_text,
+    sanitize_passive_narrator_line_text,
     sanitize_piece_voice_line_text,
 )
 
@@ -587,6 +589,59 @@ def test_build_piece_voice_line_query_supports_ambient_piece_context() -> None:
     assert "Current square: d8" in query
 
 
+def test_build_passive_narrator_line_query_includes_story_context() -> None:
+    from main import GeminiPassiveNarratorRequest
+
+    payload = GeminiPassiveNarratorRequest(
+        fen="rnbqkbnr/pppp1ppp/8/4p3/3PP3/8/PPP2PPP/RNBQKBNR b KQkq - 0 2",
+        recent_history="1. e4 e5 2. d4",
+        recent_lines=["The board stays calm on the surface, but the pressure keeps building."],
+        phase="move",
+        turns_since_last_narrator_line=3,
+        move_san="...exd4",
+        moving_piece="pawn",
+        moving_color="black",
+        from_square="e5",
+        to_square="d4",
+        is_capture=True,
+        is_check=False,
+        is_checkmate=False,
+        is_near_enemy_king=False,
+        is_attacked=True,
+        is_pinned=False,
+        is_retreat=False,
+        is_aggressive_advance=True,
+        is_fork_threat=False,
+        attacker_count=1,
+        defender_count=0,
+        eval_before=18,
+        eval_after=-42,
+        eval_delta=-60,
+        position_state="equal",
+        move_quality="tactical",
+    )
+
+    query = build_passive_narrator_line_query(payload)
+
+    assert "story-like commentary" in query
+    assert "Turns since last narrator line: 3" in query
+    assert "Moving piece: black pawn" in query
+    assert "Capture: yes" in query
+    assert "Recent narrator lines to avoid repeating:" in query
+
+
+def test_sanitize_passive_narrator_line_text_strips_labels_and_blocks_coordinates() -> None:
+    fallback = "The board stays calm on the surface, but the pressure keeps building."
+
+    sanitized = sanitize_passive_narrator_line_text(
+        'Narrator: "A tense hush settles over the board. Something is about to give."',
+        fallback,
+    )
+    assert sanitized == "A tense hush settles over the board. Something is about to give."
+
+    assert sanitize_passive_narrator_line_text("Knight lands on e4.", fallback) == fallback
+
+
 def test_build_narrator_prompt_appends_selected_personality() -> None:
     silky_prompt = build_narrator_prompt("silky")
     fletcher_prompt = build_narrator_prompt("fletcher")
@@ -780,6 +835,141 @@ def test_create_gemini_piece_voice_line_returns_sanitized_line(monkeypatch) -> N
 
     assert response.status_code == 200
     assert response.json() == {"line": "Break them now."}
+
+
+def test_create_gemini_passive_commentary_line_returns_sanitized_line(monkeypatch) -> None:
+    prompts: list[str] = []
+
+    async def fake_run_turn(query: str, *, metadata=None, timeout_seconds=0) -> str:
+        prompts.append(query)
+        assert metadata["current_fen"].startswith("rnbqkbnr")
+        assert metadata["phase"] == "move"
+        assert timeout_seconds > 0
+        return 'Narrator: "A tense hush settles over the board. Something important is leaning."'
+
+    monkeypatch.setattr("main.GEMINI_PASSIVE_COMMENTARY_CLIENT.run_turn", fake_run_turn)
+
+    client = TestClient(app)
+    response = client.post(
+        "/v1/gemini/passive-commentary-line",
+        json={
+            "fen": "rnbqkbnr/pppp1ppp/8/4p3/3PP3/8/PPP2PPP/RNBQKBNR b KQkq - 0 2",
+            "recent_history": "1. e4 e5 2. d4",
+            "recent_lines": ["The board stays calm on the surface, but the pressure keeps building."],
+            "phase": "move",
+            "turns_since_last_narrator_line": 3,
+            "move_san": "...exd4",
+            "moving_piece": "pawn",
+            "moving_color": "black",
+            "from_square": "e5",
+            "to_square": "d4",
+            "is_capture": True,
+            "is_check": False,
+            "is_checkmate": False,
+            "is_near_enemy_king": False,
+            "is_attacked": True,
+            "is_pinned": False,
+            "is_retreat": False,
+            "is_aggressive_advance": True,
+            "is_fork_threat": False,
+            "attacker_count": 1,
+            "defender_count": 0,
+            "eval_before": 18,
+            "eval_after": -42,
+            "eval_delta": -60,
+            "position_state": "equal",
+            "move_quality": "tactical",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "line": "A tense hush settles over the board. Something important is leaning."
+    }
+    assert len(prompts) == 1
+    assert "story-like commentary" in prompts[0]
+
+
+def test_create_gemini_passive_commentary_line_retries_recent_duplicate(monkeypatch) -> None:
+    responses = iter(
+        [
+            "The board stays calm on the surface, but the pressure keeps building.",
+            "The position still looks quiet, but the strain is starting to show.",
+        ]
+    )
+    prompts: list[str] = []
+
+    async def fake_run_turn(query: str, *, metadata=None, timeout_seconds=0) -> str:
+        prompts.append(query)
+        _ = metadata
+        _ = timeout_seconds
+        return next(responses)
+
+    monkeypatch.setattr("main.GEMINI_PASSIVE_COMMENTARY_CLIENT.run_turn", fake_run_turn)
+
+    client = TestClient(app)
+    response = client.post(
+        "/v1/gemini/passive-commentary-line",
+        json={
+            "fen": "rnbqkbnr/pppp1ppp/8/4p3/3PP3/8/PPP2PPP/RNBQKBNR b KQkq - 0 2",
+            "phase": "move",
+            "turns_since_last_narrator_line": 4,
+            "move_san": "...exd4",
+            "moving_piece": "pawn",
+            "moving_color": "black",
+            "from_square": "e5",
+            "to_square": "d4",
+            "is_capture": False,
+            "is_check": False,
+            "is_checkmate": False,
+            "is_near_enemy_king": False,
+            "is_attacked": False,
+            "is_pinned": False,
+            "is_retreat": False,
+            "is_aggressive_advance": True,
+            "is_fork_threat": False,
+            "attacker_count": 0,
+            "defender_count": 0,
+            "eval_before": 18,
+            "eval_after": -42,
+            "eval_delta": -60,
+            "position_state": "equal",
+            "move_quality": "routine",
+            "recent_lines": ["The board stays calm on the surface, but the pressure keeps building."],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "line": "The position still looks quiet, but the strain is starting to show."
+    }
+    assert len(prompts) == 2
+    assert "Previous answer to replace" in prompts[1]
+
+
+def test_create_gemini_passive_commentary_line_falls_back_when_model_uses_coordinates(monkeypatch) -> None:
+    async def fake_run_turn(query: str, *, metadata=None, timeout_seconds=0) -> str:
+        _ = query
+        _ = metadata
+        _ = timeout_seconds
+        return "The knight lands on e4."
+
+    monkeypatch.setattr("main.GEMINI_PASSIVE_COMMENTARY_CLIENT.run_turn", fake_run_turn)
+
+    client = TestClient(app)
+    response = client.post(
+        "/v1/gemini/passive-commentary-line",
+        json={
+            "fen": "rnbqkbnr/pppp1ppp/8/4p3/3PP3/8/PPP2PPP/RNBQKBNR b KQkq - 0 2",
+            "phase": "opening",
+            "turns_since_last_narrator_line": 0,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "line": "The board is set, and both plans are still hiding their teeth."
+    }
 
 
 def test_create_gemini_piece_voice_line_retries_empty_response(monkeypatch) -> None:
