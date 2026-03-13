@@ -6194,12 +6194,16 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     await prepare(with: state, force: true)
   }
 
-  func isTopFiveStockfishMove(_ move: ChessMove, before state: ChessGameState) async -> Bool {
+  func stockfishRank(for move: ChessMove, before state: ChessGameState) async -> Int? {
     guard let analysis = await analysisForCurrentTurn(state: state) else {
-      return false
+      return nil
     }
 
-    return analysis.topUniqueMoves.contains { $0.move == move.uciString }
+    return analysis.topUniqueMoves.first(where: { $0.move == move.uciString })?.rank
+  }
+
+  func isTopFiveStockfishMove(_ move: ChessMove, before state: ChessGameState) async -> Bool {
+    await stockfishRank(for: move, before: state) != nil
   }
 
   func gameplayReplyMove(for state: ChessGameState) async -> ChessMove? {
@@ -11483,6 +11487,112 @@ private struct ChessGameState {
     return origins
   }
 
+  func attackedSquares(from origin: BoardSquare) -> [BoardSquare] {
+    guard let piece = board[origin] else {
+      return []
+    }
+
+    switch piece.kind {
+    case .pawn:
+      let direction = piece.color == .white ? 1 : -1
+      return [-1, 1].compactMap { origin.offset(file: $0, rank: direction) }
+    case .knight:
+      let offsets = [
+        (1, 2), (2, 1), (2, -1), (1, -2),
+        (-1, -2), (-2, -1), (-2, 1), (-1, 2),
+      ]
+      return offsets.compactMap { origin.offset(file: $0.0, rank: $0.1) }
+    case .bishop:
+      return attackedSquaresAlongDirections(
+        from: origin,
+        attackerColor: piece.color,
+        directions: [(1, 1), (1, -1), (-1, -1), (-1, 1)]
+      )
+    case .rook:
+      return attackedSquaresAlongDirections(
+        from: origin,
+        attackerColor: piece.color,
+        directions: [(1, 0), (-1, 0), (0, 1), (0, -1)]
+      )
+    case .queen:
+      return attackedSquaresAlongDirections(
+        from: origin,
+        attackerColor: piece.color,
+        directions: [
+          (1, 1), (1, -1), (-1, -1), (-1, 1),
+          (1, 0), (-1, 0), (0, 1), (0, -1),
+        ]
+      )
+    case .king:
+      var squares: [BoardSquare] = []
+      for deltaFile in -1...1 {
+        for deltaRank in -1...1 {
+          guard deltaFile != 0 || deltaRank != 0,
+                let target = origin.offset(file: deltaFile, rank: deltaRank) else {
+            continue
+          }
+          squares.append(target)
+        }
+      }
+      return squares
+    }
+  }
+
+  func longestSlidingAttackRayLength(from origin: BoardSquare) -> Int {
+    guard let piece = board[origin] else {
+      return 0
+    }
+
+    let directions: [(Int, Int)]
+    switch piece.kind {
+    case .bishop:
+      directions = [(1, 1), (1, -1), (-1, -1), (-1, 1)]
+    case .rook:
+      directions = [(1, 0), (-1, 0), (0, 1), (0, -1)]
+    case .queen:
+      directions = [
+        (1, 1), (1, -1), (-1, -1), (-1, 1),
+        (1, 0), (-1, 0), (0, 1), (0, -1),
+      ]
+    default:
+      return 0
+    }
+
+    return directions.map {
+      attackSquaresAlongRay(from: origin, attackerColor: piece.color, direction: $0).count
+    }.max() ?? 0
+  }
+
+  private func attackedSquaresAlongDirections(
+    from origin: BoardSquare,
+    attackerColor: ChessColor,
+    directions: [(Int, Int)]
+  ) -> [BoardSquare] {
+    directions.flatMap { attackSquaresAlongRay(from: origin, attackerColor: attackerColor, direction: $0) }
+  }
+
+  private func attackSquaresAlongRay(
+    from origin: BoardSquare,
+    attackerColor: ChessColor,
+    direction: (Int, Int)
+  ) -> [BoardSquare] {
+    var squares: [BoardSquare] = []
+    var current = origin
+
+    while let next = current.offset(file: direction.0, rank: direction.1) {
+      if let occupant = board[next] {
+        if occupant.color != attackerColor {
+          squares.append(next)
+        }
+        break
+      }
+      squares.append(next)
+      current = next
+    }
+
+    return squares
+  }
+
   func isPiecePinned(at square: BoardSquare) -> Bool {
     guard let piece = board[square],
           piece.kind != .king,
@@ -11996,6 +12106,8 @@ private struct NativeARView: UIViewRepresentable {
     private let boardInset: Float = 0.035
     private let minimumBoardScale: Float = 0.72
     private let maximumBoardScale: Float = 2.4
+    private let strongMoveAttackHighlightMaxRank = 3
+    private let strongMoveAttackHighlightMinSlidingLength = 4
     private static let brilliantAnimation = GIFAnimationSequence.loadFromBundle(named: "brilliant", withExtension: "gif")
     private let matchLog: MatchLogStore
     private let queueMatch: QueueMatchStore
@@ -12017,6 +12129,7 @@ private struct NativeARView: UIViewRepresentable {
     private var highlightsContainer = Entity()
     private var threatOverlayContainer = Entity()
     private var activeThreatSquares: [BoardSquare] = []
+    private var persistentThreatSquares: [BoardSquare] = []
     private var activeThreatEntities: [ModelEntity] = []
     private var threatOverlayDisplayLink: CADisplayLink?
     private var threatOverlayHideWorkItem: DispatchWorkItem?
@@ -12610,7 +12723,7 @@ private struct NativeARView: UIViewRepresentable {
         )
       )
       if force {
-        clearThreatOverlay()
+        clearAllThreatOverlays()
       }
     }
 
@@ -12619,13 +12732,7 @@ private struct NativeARView: UIViewRepresentable {
     }
 
     private func showThreatOverlay(algebraicSquares: [String]) {
-      var resolvedSquares: [BoardSquare] = []
-      var seenSquares = Set<BoardSquare>()
-      for square in algebraicSquares.compactMap(BoardSquare.init(algebraic:)) {
-        if seenSquares.insert(square).inserted {
-          resolvedSquares.append(square)
-        }
-      }
+      let resolvedSquares = deduplicatedSquares(algebraicSquares.compactMap(BoardSquare.init(algebraic:)))
       guard !resolvedSquares.isEmpty else {
         return
       }
@@ -12645,11 +12752,37 @@ private struct NativeARView: UIViewRepresentable {
     private func clearThreatOverlay() {
       threatOverlayHideWorkItem?.cancel()
       threatOverlayHideWorkItem = nil
-      threatOverlayDisplayLink?.invalidate()
-      threatOverlayDisplayLink = nil
       activeThreatSquares.removeAll(keepingCapacity: false)
-      Array(threatOverlayContainer.children).forEach { $0.removeFromParent() }
-      activeThreatEntities.removeAll(keepingCapacity: false)
+      syncThreatOverlay()
+      stopThreatOverlayAnimationIfNeeded()
+    }
+
+    private func setPersistentThreatOverlay(squares: [BoardSquare]) {
+      persistentThreatSquares = deduplicatedSquares(squares)
+      syncThreatOverlay()
+      if persistentThreatSquares.isEmpty {
+        stopThreatOverlayAnimationIfNeeded()
+      } else {
+        startThreatOverlayAnimationIfNeeded()
+      }
+    }
+
+    private func clearPersistentThreatOverlay() {
+      guard !persistentThreatSquares.isEmpty else {
+        return
+      }
+      persistentThreatSquares.removeAll(keepingCapacity: false)
+      syncThreatOverlay()
+      stopThreatOverlayAnimationIfNeeded()
+    }
+
+    private func clearAllThreatOverlays() {
+      threatOverlayHideWorkItem?.cancel()
+      threatOverlayHideWorkItem = nil
+      activeThreatSquares.removeAll(keepingCapacity: false)
+      persistentThreatSquares.removeAll(keepingCapacity: false)
+      syncThreatOverlay()
+      stopThreatOverlayAnimationIfNeeded()
     }
 
     private func startThreatOverlayAnimationIfNeeded() {
@@ -12660,6 +12793,23 @@ private struct NativeARView: UIViewRepresentable {
       let displayLink = CADisplayLink(target: self, selector: #selector(handleThreatOverlayDisplayLink))
       displayLink.add(to: .main, forMode: .common)
       threatOverlayDisplayLink = displayLink
+    }
+
+    private func stopThreatOverlayAnimationIfNeeded() {
+      guard activeThreatSquares.isEmpty, persistentThreatSquares.isEmpty else {
+        return
+      }
+      threatOverlayDisplayLink?.invalidate()
+      threatOverlayDisplayLink = nil
+    }
+
+    private func deduplicatedSquares(_ squares: [BoardSquare]) -> [BoardSquare] {
+      var resolvedSquares: [BoardSquare] = []
+      var seenSquares = Set<BoardSquare>()
+      for square in squares where seenSquares.insert(square).inserted {
+        resolvedSquares.append(square)
+      }
+      return resolvedSquares
     }
 
     @objc
@@ -12686,6 +12836,61 @@ private struct NativeARView: UIViewRepresentable {
     private func currentThreatPulseScale() -> Float {
       let pulse = (sin(CACurrentMediaTime() * (.pi * 3.0)) + 1.0) * 0.5
       return Float(0.97 + (pulse * 0.06))
+    }
+
+    @MainActor
+    private func applyEngineMoveHighlightsIfNeeded(
+      for move: ChessMove,
+      before beforeState: ChessGameState,
+      after afterState: ChessGameState
+    ) async {
+      guard let stockfishRank = await commentary.stockfishRank(for: move, before: beforeState) else {
+        return
+      }
+
+      showBrilliantMoveMarker(at: move.to)
+
+      guard stockfishRank <= strongMoveAttackHighlightMaxRank else {
+        return
+      }
+
+      let qualifyingSquares = qualifyingStrongMoveAttackSquares(for: move, in: afterState)
+      guard !qualifyingSquares.isEmpty else {
+        return
+      }
+
+      setPersistentThreatOverlay(squares: qualifyingSquares)
+    }
+
+    private func qualifyingStrongMoveAttackSquares(
+      for move: ChessMove,
+      in state: ChessGameState
+    ) -> [BoardSquare] {
+      guard let movedPiece = state.piece(at: move.to) else {
+        return []
+      }
+
+      let attackedSquares = deduplicatedSquares(state.attackedSquares(from: move.to))
+      guard !attackedSquares.isEmpty else {
+        return []
+      }
+
+      let targetsEnemy = attackedSquares.contains { square in
+        guard let occupant = state.piece(at: square) else {
+          return false
+        }
+        return occupant.color == movedPiece.color.opponent
+      }
+
+      let holdsLongSlidingLine: Bool
+      switch movedPiece.kind {
+      case .bishop, .rook, .queen:
+        holdsLongSlidingLine = state.longestSlidingAttackRayLength(from: move.to) >= strongMoveAttackHighlightMinSlidingLength
+      default:
+        holdsLongSlidingLine = false
+      }
+
+      return (holdsLongSlidingLine || targetsEnemy) ? attackedSquares : []
     }
 
     private func handleTapOnPiece(at square: BoardSquare) {
@@ -12942,9 +13147,6 @@ private struct NativeARView: UIViewRepresentable {
 
             self.matchLog.recordMove(move.uciString, color: movingColor)
             self.recordNarrativeMove(move, before: beforeState)
-            if await self.commentary.isTopFiveStockfishMove(move, before: beforeState) {
-              self.showBrilliantMoveMarker(at: move.to)
-            }
             let evaluationDelta = await self.commentary.handleMove(move: move, before: beforeState, after: afterState)
             self.recordReviewCheckpointIfNeeded(
               for: move,
@@ -13021,9 +13223,6 @@ private struct NativeARView: UIViewRepresentable {
               return
             }
 
-            if await self.commentary.isTopFiveStockfishMove(item.move, before: item.before) {
-              self.showBrilliantMoveMarker(at: item.move.to)
-            }
             let evaluationDelta = await self.commentary.handleMove(move: item.move, before: item.before, after: item.after)
             self.recordReviewCheckpointIfNeeded(
               for: item.move,
@@ -13590,6 +13789,7 @@ private struct NativeARView: UIViewRepresentable {
     @MainActor
     private func animateAndApply(_ context: AnimatedMoveContext) async {
       clearThreatOverlay()
+      clearPersistentThreatOverlay()
 
       if activeKnightForkBinding?.clearsOnMoveBy == context.move.piece.color {
         activeKnightForkBinding = nil
@@ -13614,6 +13814,11 @@ private struct NativeARView: UIViewRepresentable {
       syncBoardPerspectiveIfNeeded()
       refreshBoardPresentation()
       syncSocraticCoachContext()
+      await applyEngineMoveHighlightsIfNeeded(
+        for: context.move,
+        before: context.beforeState,
+        after: context.afterState
+      )
       await context.postApply?()
       await maybeBeginPostGameFlowIfNeeded(after: context.afterState)
     }
@@ -14808,13 +15013,14 @@ private struct NativeARView: UIViewRepresentable {
       Array(threatOverlayContainer.children).forEach { $0.removeFromParent() }
       activeThreatEntities.removeAll(keepingCapacity: false)
 
-      guard !activeThreatSquares.isEmpty else {
+      let visibleThreatSquares = deduplicatedSquares(activeThreatSquares + persistentThreatSquares)
+      guard !visibleThreatSquares.isEmpty else {
         return
       }
 
       let squareSize = boardSize / 8.0
       let alpha = currentThreatPulseAlpha()
-      for square in activeThreatSquares {
+      for square in visibleThreatSquares {
         let threatEntity = makeThreatOverlayEntity(size: squareSize * 0.96, alpha: alpha)
         threatEntity.position = boardPosition(square, squareSize: squareSize) + SIMD3<Float>(0, 0.0042, 0)
         threatOverlayContainer.addChild(threatEntity)
