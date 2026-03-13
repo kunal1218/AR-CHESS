@@ -27,6 +27,7 @@ from services.narrator_personality import (
     narrator_personality_addon,
     normalize_narrator,
 )
+from services.passive_narrator_live import PassiveNarratorLiveSession
 from services.socratic_coach import SocraticCoachSession
 from services.stockfish_engine import StockfishEngine
 
@@ -2245,6 +2246,24 @@ async def gemini_live_socket(websocket: WebSocket) -> None:
         await session.run()
     except WebSocketDisconnect:
         logger.info("Socratic coach client disconnected")
+    finally:
+        await session.close()
+
+
+@app.websocket("/v1/gemini/passive-live")
+async def gemini_passive_live_socket(websocket: WebSocket) -> None:
+    session = PassiveNarratorLiveSession(
+        frontend_socket=websocket,
+        logger=logging.getLogger("archess.server.passive_live"),
+        api_key=os.getenv("GEMINI_API_KEY"),
+        model=os.getenv("GEMINI_LIVE_MODEL", GeminiLiveClient.DEFAULT_MODEL),
+        ws_url=os.getenv("GEMINI_LIVE_WS_URL") or None,
+    )
+
+    try:
+        await session.run()
+    except WebSocketDisconnect:
+        logger.info("Passive narrator live client disconnected")
     finally:
         await session.close()
 
