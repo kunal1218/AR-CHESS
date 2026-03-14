@@ -5,9 +5,11 @@ import os
 import random
 import re
 import uuid
+from collections import Counter, deque
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from threading import Lock
 from typing import Any
 from urllib.parse import urlparse
 
@@ -56,6 +58,8 @@ PIECE_DIALOGUE_INTENTS = (
     "command",
     "dismiss",
 )
+PIECE_DIALOGUE_FOCUS_TARGETS = ("self", "enemy", "battle", "king", "survival")
+PIECE_DIALOGUE_EMOTIONAL_FLAVORS = ("confident", "vicious", "smug", "desperate", "solemn", "unstable")
 PIECE_LINE_STYLES = (
     "clipped",
     "dramatic",
@@ -81,8 +85,31 @@ app = FastAPI(title="AR Chess Server", version="0.3.0")
 class PieceDialoguePromptControls:
     dialogue_intent: str
     line_style: str
+    focus_target: str
+    emotional_flavor: str
     avoid_direct_address: bool
     conversation_loop_detected: bool
+
+
+@dataclass(frozen=True)
+class PieceVoiceGlobalMemoryEntry:
+    fingerprint: str
+    opening_prefix: str
+    coarse_pattern: str
+
+
+@dataclass(frozen=True)
+class PieceVoiceGlobalMemorySnapshot:
+    line_counts: Counter[str]
+    prefix_counts: Counter[str]
+    pattern_counts: Counter[str]
+
+
+@dataclass(frozen=True)
+class PieceVoiceCandidateChoice:
+    raw_text: str
+    line: str
+    score: float
 
 
 class EnqueueMatchmakingRequest(BaseModel):
@@ -822,6 +849,16 @@ def env_int(name: str, default: int) -> int:
     return default
 
 
+PIECE_VOICE_CANDIDATE_COUNT = min(4, max(1, env_int("GEMINI_PIECE_VOICE_CANDIDATE_COUNT", 3)))
+PIECE_VOICE_RETRY_CANDIDATE_COUNT = min(4, max(1, env_int("GEMINI_PIECE_VOICE_RETRY_CANDIDATE_COUNT", 2)))
+PIECE_VOICE_GLOBAL_MEMORY_LIMIT = max(32, env_int("GEMINI_PIECE_VOICE_GLOBAL_MEMORY_LIMIT", 256))
+_piece_voice_global_memory_lock = Lock()
+_piece_voice_global_memory_entries: deque[PieceVoiceGlobalMemoryEntry] = deque()
+_piece_voice_global_line_counts: Counter[str] = Counter()
+_piece_voice_global_prefix_counts: Counter[str] = Counter()
+_piece_voice_global_pattern_counts: Counter[str] = Counter()
+
+
 def truncate_narration_text(text: str, *, max_sentences: int, max_characters: int) -> str:
     condensed = re.sub(r"\s+", " ", text).strip()
     if not condensed:
@@ -988,6 +1025,74 @@ def piece_voice_repetition_key(text: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9\s]", " ", text.lower())).strip()
 
 
+def piece_voice_opening_prefix(text: str, words: int = 3) -> str:
+    word_list = re.findall(r"[A-Za-z0-9']+", text.lower())
+    if not word_list:
+        return ""
+    return " ".join(word_list[: min(words, len(word_list))])
+
+
+def piece_voice_coarse_pattern(text: str) -> str:
+    word_count = len(re.findall(r"[A-Za-z0-9']+", text))
+    punctuation = text.strip()[-1:] or "."
+    direct_address = "direct" if is_piece_direct_address_line(text) else "plain"
+    if word_count <= 4:
+        length_bucket = "short"
+    elif word_count <= 8:
+        length_bucket = "medium"
+    else:
+        length_bucket = "long"
+    return f"{direct_address}:{length_bucket}:{punctuation}"
+
+
+def reset_piece_voice_global_memory() -> None:
+    with _piece_voice_global_memory_lock:
+        _piece_voice_global_memory_entries.clear()
+        _piece_voice_global_line_counts.clear()
+        _piece_voice_global_prefix_counts.clear()
+        _piece_voice_global_pattern_counts.clear()
+
+
+def piece_voice_global_memory_snapshot() -> PieceVoiceGlobalMemorySnapshot:
+    with _piece_voice_global_memory_lock:
+        return PieceVoiceGlobalMemorySnapshot(
+            line_counts=Counter(_piece_voice_global_line_counts),
+            prefix_counts=Counter(_piece_voice_global_prefix_counts),
+            pattern_counts=Counter(_piece_voice_global_pattern_counts),
+        )
+
+
+def record_piece_voice_global_usage(text: str) -> None:
+    fingerprint = piece_voice_repetition_key(text)
+    if not fingerprint:
+        return
+
+    entry = PieceVoiceGlobalMemoryEntry(
+        fingerprint=fingerprint,
+        opening_prefix=piece_voice_opening_prefix(text),
+        coarse_pattern=piece_voice_coarse_pattern(text),
+    )
+    with _piece_voice_global_memory_lock:
+        if len(_piece_voice_global_memory_entries) >= PIECE_VOICE_GLOBAL_MEMORY_LIMIT:
+            oldest = _piece_voice_global_memory_entries.popleft()
+            _piece_voice_global_line_counts[oldest.fingerprint] -= 1
+            if _piece_voice_global_line_counts[oldest.fingerprint] <= 0:
+                _piece_voice_global_line_counts.pop(oldest.fingerprint, None)
+            if oldest.opening_prefix:
+                _piece_voice_global_prefix_counts[oldest.opening_prefix] -= 1
+                if _piece_voice_global_prefix_counts[oldest.opening_prefix] <= 0:
+                    _piece_voice_global_prefix_counts.pop(oldest.opening_prefix, None)
+            _piece_voice_global_pattern_counts[oldest.coarse_pattern] -= 1
+            if _piece_voice_global_pattern_counts[oldest.coarse_pattern] <= 0:
+                _piece_voice_global_pattern_counts.pop(oldest.coarse_pattern, None)
+
+        _piece_voice_global_memory_entries.append(entry)
+        _piece_voice_global_line_counts[entry.fingerprint] += 1
+        if entry.opening_prefix:
+            _piece_voice_global_prefix_counts[entry.opening_prefix] += 1
+        _piece_voice_global_pattern_counts[entry.coarse_pattern] += 1
+
+
 def is_piece_voice_line_repetitive(text: str, recent_lines: list[str]) -> bool:
     candidate_key = piece_voice_repetition_key(text)
     if not candidate_key:
@@ -1022,6 +1127,14 @@ def sample_piece_dialogue_intent() -> str:
 def sample_piece_line_style() -> str:
     # A second tiny stochastic control changes phrasing rhythm without changing board grounding.
     return random.choice(PIECE_LINE_STYLES)
+
+
+def sample_piece_focus_target() -> str:
+    return random.choice(PIECE_DIALOGUE_FOCUS_TARGETS)
+
+
+def sample_piece_emotional_flavor() -> str:
+    return random.choice(PIECE_DIALOGUE_EMOTIONAL_FLAVORS)
 
 
 def is_piece_direct_address_line(text: str) -> bool:
@@ -1073,9 +1186,77 @@ def build_piece_dialogue_prompt_controls(payload: GeminiPieceVoiceRequest) -> Pi
     return PieceDialoguePromptControls(
         dialogue_intent=sample_piece_dialogue_intent(),
         line_style=sample_piece_line_style(),
+        focus_target=sample_piece_focus_target(),
+        emotional_flavor=sample_piece_emotional_flavor(),
         avoid_direct_address=avoid_direct_address,
         conversation_loop_detected=conversation_loop_detected,
     )
+
+
+def choose_piece_voice_candidate(
+    raw_candidates: list[str],
+    payload: GeminiPieceVoiceRequest,
+    prompt_controls: PieceDialoguePromptControls,
+    *,
+    global_memory: PieceVoiceGlobalMemorySnapshot | None = None,
+) -> PieceVoiceCandidateChoice:
+    memory = global_memory or piece_voice_global_memory_snapshot()
+    recent_texts = [
+        *payload.recent_lines,
+        *(entry.text for entry in payload.piece_dialogue_history),
+    ]
+    recent_fingerprints = {
+        piece_voice_repetition_key(text)
+        for text in recent_texts
+        if piece_voice_repetition_key(text)
+    }
+    recent_prefix_counts = Counter(
+        piece_voice_opening_prefix(text)
+        for text in recent_texts
+        if piece_voice_opening_prefix(text)
+    )
+    recent_direct_address_count = sum(1 for text in recent_texts if is_piece_direct_address_line(text))
+
+    ranked: list[PieceVoiceCandidateChoice] = []
+    seen_fingerprints: set[str] = set()
+    for raw_text in raw_candidates:
+        line = normalize_piece_voice_line_text(sanitize_piece_voice_line_text(raw_text))
+        fingerprint = piece_voice_repetition_key(line)
+        if fingerprint and fingerprint in seen_fingerprints:
+            continue
+        if fingerprint:
+            seen_fingerprints.add(fingerprint)
+
+        prefix = piece_voice_opening_prefix(line)
+        pattern = piece_voice_coarse_pattern(line) if line else ""
+        score = 0.0
+        if not line:
+            score -= 10_000
+        if line and not is_complete_piece_voice_line_text(line):
+            score -= 400
+        if fingerprint in recent_fingerprints:
+            score -= 1_000
+        if prefix:
+            score -= 140 * recent_prefix_counts.get(prefix, 0)
+            score -= 45 * memory.prefix_counts.get(prefix, 0)
+        if fingerprint:
+            score -= 180 * memory.line_counts.get(fingerprint, 0)
+        if pattern:
+            score -= 18 * memory.pattern_counts.get(pattern, 0)
+        if is_piece_direct_address_line(line):
+            score -= 110 * recent_direct_address_count
+            if prompt_controls.avoid_direct_address:
+                score -= 220
+            if prompt_controls.conversation_loop_detected:
+                score -= 260
+
+        ranked.append(PieceVoiceCandidateChoice(raw_text=raw_text, line=line, score=score))
+
+    if not ranked:
+        return PieceVoiceCandidateChoice(raw_text="", line="", score=-10_000)
+
+    ranked.sort(key=lambda candidate: candidate.score, reverse=True)
+    return ranked[0]
 
 
 def build_gemini_user_query(payload: GeminiHintRequest) -> str:
@@ -1268,6 +1449,8 @@ def build_piece_voice_line_query(
         f"Eval delta: {eval_delta}\n"
         f"Dialogue intent: {controls.dialogue_intent}\n"
         f"Line style: {controls.line_style}\n"
+        f"Focus target: {controls.focus_target}\n"
+        f"Emotional flavor: {controls.emotional_flavor}\n"
         f"Avoid direct address: {'yes' if controls.avoid_direct_address else 'no'}\n"
         f"Conversation loop detected: {'yes' if controls.conversation_loop_detected else 'no'}"
         f"{piece_dialogue_history_text}"
@@ -1595,17 +1778,30 @@ def parse_gemini_coach_response(raw_text: str) -> GeminiCoachResponse:
     return response
 
 
-def extract_generate_content_text(body: dict[str, Any]) -> str:
+def extract_generate_content_candidates(body: dict[str, Any]) -> list[tuple[str, str]]:
     candidates = body.get("candidates") or []
     if not candidates:
         raise ValueError("Gemini coach response contained no candidates.")
 
-    parts = ((candidates[0].get("content") or {}).get("parts") or [])
-    text_parts = [part.get("text", "") for part in parts if isinstance(part, dict)]
-    raw_text = "".join(text_parts).strip()
-    if not raw_text:
+    extracted: list[tuple[str, str]] = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        parts = ((candidate.get("content") or {}).get("parts") or [])
+        text_parts = [part.get("text", "") for part in parts if isinstance(part, dict)]
+        raw_text = "".join(text_parts).strip()
+        if not raw_text:
+            continue
+        finish_reason = str(candidate.get("finishReason") or candidate.get("finish_reason") or "").strip().upper()
+        extracted.append((raw_text, finish_reason))
+
+    if not extracted:
         raise ValueError("Gemini coach response contained no text.")
-    return raw_text
+    return extracted
+
+
+def extract_generate_content_text(body: dict[str, Any]) -> str:
+    return extract_generate_content_candidates(body)[0][0]
 
 
 def validate_gemini_coach_configuration() -> None:
@@ -1716,7 +1912,12 @@ async def fetch_gemini_coach_commentary(payload: GeminiCoachRequest) -> GeminiCo
     return parse_gemini_coach_response(repaired_text)
 
 
-async def fetch_gemini_piece_voice_line_text(prompt_text: str, *, temperature: float | None = None) -> str:
+async def fetch_gemini_piece_voice_line_candidates(
+    prompt_text: str,
+    *,
+    temperature: float | None = None,
+    candidate_count: int = 1,
+) -> list[str]:
     validate_gemini_piece_voice_configuration()
 
     request_payload: dict[str, Any] = {
@@ -1744,6 +1945,7 @@ async def fetch_gemini_piece_voice_line_text(prompt_text: str, *, temperature: f
             "topP": env_float("GEMINI_PIECE_VOICE_TOP_P", 0.98),
             "topK": env_int("GEMINI_PIECE_VOICE_TOP_K", 64),
             "maxOutputTokens": env_int("GEMINI_PIECE_VOICE_MAX_OUTPUT_TOKENS", 80),
+            "candidateCount": min(4, max(1, candidate_count)),
         },
     }
 
@@ -1774,19 +1976,27 @@ async def fetch_gemini_piece_voice_line_text(prompt_text: str, *, temperature: f
     response.raise_for_status()
     with suppress(ValueError):
         body = response.json()
-        candidates = body.get("candidates") or []
-        if candidates and isinstance(candidates[0], dict):
-            finish_reason = str(
-                candidates[0].get("finishReason") or candidates[0].get("finish_reason") or ""
-            ).strip().upper()
-            if finish_reason and finish_reason not in {"STOP", "FINISH_REASON_UNSPECIFIED"}:
-                logger.warning(
-                    "Gemini piece voice response finished with %s; forcing retry.",
-                    finish_reason,
-                )
-                return ""
-        return extract_generate_content_text(body)
-    return ""
+        extracted_candidates = extract_generate_content_candidates(body)
+        usable_candidates = [
+            text
+            for text, finish_reason in extracted_candidates
+            if not finish_reason or finish_reason in {"STOP", "FINISH_REASON_UNSPECIFIED"}
+        ]
+        if usable_candidates:
+            return usable_candidates
+
+        if extracted_candidates:
+            logger.warning(
+                "Gemini piece voice candidates all finished non-cleanly: %s",
+                ", ".join(finish_reason or "UNKNOWN" for _, finish_reason in extracted_candidates[:4]),
+            )
+        return [text for text, _ in extracted_candidates]
+    return [""]
+
+
+async def fetch_gemini_piece_voice_line_text(prompt_text: str, *, temperature: float | None = None) -> str:
+    candidates = await fetch_gemini_piece_voice_line_candidates(prompt_text, temperature=temperature, candidate_count=1)
+    return candidates[0] if candidates else ""
 
 
 GEMINI_LIVE_CLIENT = GeminiLiveClient(
@@ -2686,8 +2896,14 @@ async def create_gemini_piece_voice_line(payload: GeminiPieceVoiceRequest) -> di
     initial_temperature = 1.2 if payload.dialogue_mode == "history_reactive" else None
 
     try:
-        raw_line = await fetch_gemini_piece_voice_line_text(query, temperature=initial_temperature)
-        line = normalize_piece_voice_line_text(sanitize_piece_voice_line_text(raw_line))
+        raw_candidates = await fetch_gemini_piece_voice_line_candidates(
+            query,
+            temperature=initial_temperature,
+            candidate_count=PIECE_VOICE_CANDIDATE_COUNT,
+        )
+        choice = choose_piece_voice_candidate(raw_candidates, payload, prompt_controls)
+        raw_line = choice.raw_text
+        line = choice.line
 
         if is_piece_voice_line_repetitive(line, payload.recent_lines):
             duplicate_retry_query = build_piece_voice_line_duplicate_retry_query(
@@ -2695,8 +2911,14 @@ async def create_gemini_piece_voice_line(payload: GeminiPieceVoiceRequest) -> di
                 raw_line,
                 prompt_controls=prompt_controls,
             )
-            raw_line = await fetch_gemini_piece_voice_line_text(duplicate_retry_query, temperature=1.2)
-            line = normalize_piece_voice_line_text(sanitize_piece_voice_line_text(raw_line))
+            retry_candidates = await fetch_gemini_piece_voice_line_candidates(
+                duplicate_retry_query,
+                temperature=1.2,
+                candidate_count=PIECE_VOICE_RETRY_CANDIDATE_COUNT,
+            )
+            choice = choose_piece_voice_candidate(retry_candidates, payload, prompt_controls)
+            raw_line = choice.raw_text
+            line = choice.line
 
         if not is_complete_piece_voice_line_text(line):
             retry_query = build_piece_voice_line_retry_query(
@@ -2704,8 +2926,14 @@ async def create_gemini_piece_voice_line(payload: GeminiPieceVoiceRequest) -> di
                 raw_line,
                 prompt_controls=prompt_controls,
             )
-            raw_line = await fetch_gemini_piece_voice_line_text(retry_query, temperature=1.0)
-            line = normalize_piece_voice_line_text(sanitize_piece_voice_line_text(raw_line))
+            retry_candidates = await fetch_gemini_piece_voice_line_candidates(
+                retry_query,
+                temperature=1.0,
+                candidate_count=PIECE_VOICE_RETRY_CANDIDATE_COUNT,
+            )
+            choice = choose_piece_voice_candidate(retry_candidates, payload, prompt_controls)
+            raw_line = choice.raw_text
+            line = choice.line
 
         if not is_complete_piece_voice_line_text(line):
             repair_query = build_piece_voice_line_repair_query(
@@ -2713,8 +2941,14 @@ async def create_gemini_piece_voice_line(payload: GeminiPieceVoiceRequest) -> di
                 raw_line,
                 prompt_controls=prompt_controls,
             )
-            raw_line = await fetch_gemini_piece_voice_line_text(repair_query, temperature=0.7)
-            line = normalize_piece_voice_line_text(sanitize_piece_voice_line_text(raw_line))
+            repair_candidates = await fetch_gemini_piece_voice_line_candidates(
+                repair_query,
+                temperature=0.7,
+                candidate_count=PIECE_VOICE_RETRY_CANDIDATE_COUNT,
+            )
+            choice = choose_piece_voice_candidate(repair_candidates, payload, prompt_controls)
+            raw_line = choice.raw_text
+            line = choice.line
     except GeminiLiveConfigurationError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except GeminiLiveBusyError as exc:
@@ -2730,6 +2964,7 @@ async def create_gemini_piece_voice_line(payload: GeminiPieceVoiceRequest) -> di
     if is_piece_voice_line_repetitive(line, payload.recent_lines):
         raise HTTPException(status_code=503, detail="Gemini piece voice repeated a recent line.")
 
+    record_piece_voice_global_usage(line)
     return {"line": line}
 
 

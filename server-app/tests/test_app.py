@@ -644,6 +644,8 @@ def test_build_piece_voice_line_query_uses_piece_only_dialogue_history() -> None
         prompt_controls=PieceDialoguePromptControls(
             dialogue_intent="mock",
             line_style="taunting",
+            focus_target="enemy",
+            emotional_flavor="smug",
             avoid_direct_address=False,
             conversation_loop_detected=False,
         ),
@@ -657,6 +659,8 @@ def test_build_piece_voice_line_query_uses_piece_only_dialogue_history() -> None
     assert "React to recent battlefield chatter if appropriate" in query
     assert "Dialogue intent: mock" in query
     assert "Line style: taunting" in query
+    assert "Focus target: enemy" in query
+    assert "Emotional flavor: smug" in query
     assert "Avoid direct address: no" in query
     assert "Conversation loop detected: no" in query
 
@@ -750,6 +754,8 @@ def test_build_piece_dialogue_prompt_controls_detects_ping_pong_loop() -> None:
         "grim",
         "battlefield_command",
     }
+    assert controls.focus_target in {"self", "enemy", "battle", "king", "survival"}
+    assert controls.emotional_flavor in {"confident", "vicious", "smug", "desperate", "solemn", "unstable"}
     assert controls.avoid_direct_address is True
     assert controls.conversation_loop_detected is True
 
@@ -807,6 +813,8 @@ def test_build_piece_voice_line_query_can_suppress_direct_address_loops() -> Non
         prompt_controls=PieceDialoguePromptControls(
             dialogue_intent="dismiss",
             line_style="grim",
+            focus_target="battle",
+            emotional_flavor="solemn",
             avoid_direct_address=True,
             conversation_loop_detected=True,
         ),
@@ -816,6 +824,8 @@ def test_build_piece_voice_line_query_can_suppress_direct_address_loops() -> Non
     assert "Recent chatter is looping" in query
     assert "Dialogue intent: dismiss" in query
     assert "Line style: grim" in query
+    assert "Focus target: battle" in query
+    assert "Emotional flavor: solemn" in query
     assert "Avoid direct address: yes" in query
     assert "Conversation loop detected: yes" in query
 
@@ -1390,6 +1400,129 @@ def test_create_gemini_piece_voice_line_retries_empty_response(monkeypatch) -> N
     assert response.json() == {"line": "A sanctified strike through the dark."}
     assert len(prompts) == 2
     assert "Do not reuse the previous wording." in prompts[1]
+
+
+def test_create_gemini_piece_voice_line_reranks_multiple_candidates_for_novelty(monkeypatch) -> None:
+    from main import reset_piece_voice_global_memory
+
+    reset_piece_voice_global_memory()
+    prompts: list[str] = []
+    candidate_counts: list[int] = []
+
+    async def fake_post(self, url: str, *, headers=None, json=None) -> httpx.Response:
+        prompts.append(json["contents"][0]["parts"][0]["text"])
+        candidate_counts.append(json["generationConfig"]["candidateCount"])
+        _ = headers
+        return httpx.Response(
+            200,
+            json={
+                "candidates": [
+                    {"content": {"parts": [{"text": "Forward. The trench still wants bodies."}]}, "finishReason": "STOP"},
+                    {"content": {"parts": [{"text": "Boots forward. The killing field is hungry."}]}, "finishReason": "STOP"},
+                    {"content": {"parts": [{"text": "Listen knight, the mud outranks you."}]}, "finishReason": "STOP"},
+                ]
+            },
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+    client = TestClient(app)
+    response = client.post(
+        "/v1/gemini/piece-voice-line",
+        json={
+            "fen": "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBR1 w KQkq - 0 1",
+            "piece_type": "pawn",
+            "piece_color": "white",
+            "recent_lines": ["Forward. The trench still wants bodies."],
+            "from_square": "e2",
+            "to_square": "e4",
+            "is_capture": False,
+            "is_check": False,
+            "is_near_enemy_king": False,
+            "is_attacked": False,
+            "is_attacked_by_multiple": False,
+            "is_defended": True,
+            "is_well_defended": False,
+            "is_hanging": False,
+            "is_pinned": False,
+            "is_retreat": False,
+            "is_aggressive_advance": True,
+            "is_fork_threat": False,
+            "attacker_count": 0,
+            "defender_count": 1,
+            "eval_before": 10,
+            "eval_after": 24,
+            "eval_delta": 14,
+            "position_state": "equal",
+            "move_quality": "aggressive",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"line": "Boots forward. The killing field is hungry."}
+    assert candidate_counts == [3]
+    assert len(prompts) == 1
+    reset_piece_voice_global_memory()
+
+
+def test_create_gemini_piece_voice_line_penalizes_globally_overused_lines(monkeypatch) -> None:
+    from main import record_piece_voice_global_usage, reset_piece_voice_global_memory
+
+    reset_piece_voice_global_memory()
+    for _ in range(4):
+        record_piece_voice_global_usage("Forward. The trench still wants bodies.")
+
+    async def fake_post(self, url: str, *, headers=None, json=None) -> httpx.Response:
+        _ = headers
+        return httpx.Response(
+            200,
+            json={
+                "candidates": [
+                    {"content": {"parts": [{"text": "Forward. The trench still wants bodies."}]}, "finishReason": "STOP"},
+                    {"content": {"parts": [{"text": "Another square taken. The trench opens wider."}]}, "finishReason": "STOP"},
+                    {"content": {"parts": [{"text": "Forward again. Mud first, glory second."}]}, "finishReason": "STOP"},
+                ]
+            },
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+    client = TestClient(app)
+    response = client.post(
+        "/v1/gemini/piece-voice-line",
+        json={
+            "fen": "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBR1 w KQkq - 0 1",
+            "piece_type": "pawn",
+            "piece_color": "white",
+            "from_square": "e2",
+            "to_square": "e4",
+            "is_capture": False,
+            "is_check": False,
+            "is_near_enemy_king": False,
+            "is_attacked": False,
+            "is_attacked_by_multiple": False,
+            "is_defended": True,
+            "is_well_defended": False,
+            "is_hanging": False,
+            "is_pinned": False,
+            "is_retreat": False,
+            "is_aggressive_advance": True,
+            "is_fork_threat": False,
+            "attacker_count": 0,
+            "defender_count": 1,
+            "eval_before": 10,
+            "eval_after": 24,
+            "eval_delta": 14,
+            "position_state": "equal",
+            "move_quality": "aggressive",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"line": "Another square taken. The trench opens wider."}
+    reset_piece_voice_global_memory()
 
 
 def test_create_gemini_piece_voice_line_retries_recent_duplicate(monkeypatch) -> None:
