@@ -8081,12 +8081,13 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   }
 
   private func recentPieceDialogueHistory(
-    limit: Int = Self.pieceDialogueHistoryWindow
+    limit: Int? = nil
   ) -> [GeminiDialogueUtterancePayload] {
+    let resolvedLimit = limit ?? Self.pieceDialogueHistoryWindow
     Array(
       autonomousDialogueMemory
         .filter { $0.speakerClass == .piece }
-        .suffix(limit)
+        .suffix(resolvedLimit)
         .compactMap { autonomousDialoguePayload(from: $0) }
     )
   }
