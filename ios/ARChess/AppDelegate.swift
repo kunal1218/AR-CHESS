@@ -15696,6 +15696,79 @@ private struct NativeARView: UIViewRepresentable {
 
     @MainActor
     private func animatePawnKnifeCapture(attacker: Entity, victim: Entity?, move: ChessMove) async {
+      if move.captured?.kind == .pawn,
+         let victim,
+         let attackerKnife = attacker.findEntity(named: "pawn_knife"),
+         let victimKnife = victim.findEntity(named: "pawn_knife") {
+        let direction = attackDirection(for: move)
+        let originalAttacker = attacker.transform
+        let originalVictim = victim.transform
+        let originalAttackerKnife = attackerKnife.transform
+        let originalVictimKnife = victimKnife.transform
+
+        // Pawn-on-pawn captures get a two-beat duel: one blade clash, then the finishing stab.
+        let clashAttacker = transformed(
+          originalAttacker,
+          translation: direction * 0.016 + SIMD3<Float>(0, 0.002, 0)
+        )
+        let clashVictim = transformed(
+          originalVictim,
+          translation: -(direction * 0.010) + SIMD3<Float>(0, 0.001, 0)
+        )
+        attacker.move(to: clashAttacker, relativeTo: attacker.parent, duration: 0.11, timingFunction: .easeInOut)
+        victim.move(to: clashVictim, relativeTo: victim.parent, duration: 0.11, timingFunction: .easeInOut)
+
+        let attackerKnifeClash = transformed(
+          originalAttackerKnife,
+          translation: SIMD3<Float>(0.001, 0.005, 0.010),
+          rotation: simd_quatf(angle: -.pi / 2.25, axis: SIMD3<Float>(1, 0, 0))
+        )
+        let victimKnifeClash = transformed(
+          originalVictimKnife,
+          translation: SIMD3<Float>(-0.001, 0.005, 0.008),
+          rotation: simd_quatf(angle: .pi / 2.5, axis: SIMD3<Float>(1, 0, 0))
+        )
+        attackerKnife.move(to: attackerKnifeClash, relativeTo: attacker, duration: 0.10, timingFunction: .easeInOut)
+        victimKnife.move(to: victimKnifeClash, relativeTo: victim, duration: 0.10, timingFunction: .easeInOut)
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.07) { [captureSoundEffects] in
+          captureSoundEffects.play(.pawnSword)
+        }
+
+        try? await Task.sleep(nanoseconds: 150_000_000)
+
+        let stabAttacker = transformed(
+          originalAttacker,
+          translation: direction * 0.048 + SIMD3<Float>(0, 0.003, 0)
+        )
+        let chestStrike = transformed(
+          originalAttackerKnife,
+          translation: SIMD3<Float>(0.001, 0.005, 0.019),
+          rotation: simd_quatf(angle: -.pi / 1.95, axis: SIMD3<Float>(1, 0, 0))
+        )
+        let piercedVictim = transformed(
+          originalVictim,
+          translation: direction * 0.018 + SIMD3<Float>(0, 0.014, 0),
+          rotation: simd_normalize(
+            simd_quatf(angle: .pi / 5.5, axis: SIMD3<Float>(0, 0, 1)) *
+              simd_quatf(angle: -.pi / 14, axis: SIMD3<Float>(1, 0, 0))
+          )
+        )
+        let victimKnifeCollapse = transformed(
+          originalVictimKnife,
+          translation: SIMD3<Float>(-0.006, -0.002, -0.004),
+          rotation: simd_quatf(angle: .pi / 3.2, axis: SIMD3<Float>(0, 0, 1))
+        )
+
+        attacker.move(to: stabAttacker, relativeTo: attacker.parent, duration: 0.16, timingFunction: .easeIn)
+        attackerKnife.move(to: chestStrike, relativeTo: attacker, duration: 0.14, timingFunction: .easeIn)
+        victim.move(to: piercedVictim, relativeTo: victim.parent, duration: 0.20, timingFunction: .easeOut)
+        victimKnife.move(to: victimKnifeCollapse, relativeTo: victim, duration: 0.16, timingFunction: .easeOut)
+
+        try? await Task.sleep(nanoseconds: 430_000_000)
+        return
+      }
+
       let direction = attackDirection(for: move)
       let originalAttacker = attacker.transform
       let lunge = transformed(originalAttacker, translation: direction * 0.028)
