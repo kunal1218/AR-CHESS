@@ -2144,6 +2144,7 @@ private final class GeminiPassiveNarratorLiveSpeaker {
   private var isEnabled = true
 
   var onBusyStateChange: ((Bool) -> Void)?
+  var onPlaybackActivityChange: ((PlaybackRequest?, Bool) -> Void)?
   var onLineFailure: ((PlaybackRequest, String) -> Void)?
 
   init(
@@ -2160,6 +2161,7 @@ private final class GeminiPassiveNarratorLiveSpeaker {
           return
         }
         self.isAudioPlaying = isActive
+        self.onPlaybackActivityChange?(self.currentRequest, isActive)
         self.notifyBusyStateChange()
       }
     }
@@ -2345,7 +2347,7 @@ private final class GeminiPassiveNarratorLiveSpeaker {
     case "turn_complete":
       isStreamingResponse = false
       if !isAudioPlaying {
-        currentLine = nil
+        currentRequest = nil
         hasObservedAudioForCurrentLine = false
       }
       notifyBusyStateChange()
@@ -6443,9 +6445,16 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     let underutilizedReason: String
   }
 
+  private struct AutomaticDialoguePlaybackRecord {
+    let entry: AutonomousDialogueMemoryEntry
+    let stackLine: String
+    let highlightedSquare: BoardSquare?
+  }
+
   private struct PendingGeneratedNarration {
     let text: String
     let style: GeneratedNarrationStyle
+    let playbackRecord: AutomaticDialoguePlaybackRecord?
   }
 
   @Published private(set) var caption: Caption?
@@ -6482,6 +6491,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   private let passiveNarratorLiveSpeaker: GeminiPassiveNarratorLiveSpeaker
   private var utteranceCaptions: [ObjectIdentifier: Caption] = [:]
   private var utteranceStyles: [ObjectIdentifier: GeneratedNarrationStyle] = [:]
+  private var utteranceAutomaticDialogueRecords: [ObjectIdentifier: AutomaticDialoguePlaybackRecord] = [:]
   private var narrationHighlightHandler: (([String], String?) -> Void)?
   private var pieceAudioBusyDurationProvider: (() -> TimeInterval)?
   private var passiveCommentarySuppressionProvider: (() -> Bool)?
@@ -6522,6 +6532,8 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   private var openingNarrationDelivered = false
   private var queuedAutomaticCommentaryDecision: AutomaticCommentaryDecision?
   private var liveNarratorPlaybackOwnsCaption = false
+  private var activePassiveAutomaticPlaybackRecord: AutomaticDialoguePlaybackRecord?
+  private var activePassiveAutomaticPlaybackDidStart = false
   private var autonomousDialogueMemory: [AutonomousDialogueMemoryEntry] = []
   private var trackedPieceInstanceIDsBySquare: [BoardSquare: String] = [:]
   private var trackedPieceMoveCountsByID: [String: Int] = [:]
@@ -6533,12 +6545,32 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     super.init()
     synthesizer.delegate = self
     hintStatusText = defaultHintStatus()
+    passiveNarratorLiveSpeaker.onPlaybackActivityChange = { [weak self] _, isActive in
+      Task { @MainActor [weak self] in
+        guard let self else {
+          return
+        }
+        guard isActive,
+              !self.activePassiveAutomaticPlaybackDidStart,
+              let playbackRecord = self.activePassiveAutomaticPlaybackRecord else {
+          return
+        }
+        self.activePassiveAutomaticPlaybackDidStart = true
+        self.beginAutomaticDialoguePlayback(playbackRecord)
+      }
+    }
     passiveNarratorLiveSpeaker.onBusyStateChange = { [weak self] isBusy in
       Task { @MainActor [weak self] in
         guard let self else {
           return
         }
         if !isBusy, self.liveNarratorPlaybackOwnsCaption {
+          if self.activePassiveAutomaticPlaybackDidStart,
+             let playbackRecord = self.activePassiveAutomaticPlaybackRecord {
+            self.endAutomaticDialoguePlayback(playbackRecord)
+          }
+          self.activePassiveAutomaticPlaybackRecord = nil
+          self.activePassiveAutomaticPlaybackDidStart = false
           self.liveNarratorPlaybackOwnsCaption = false
           self.caption = nil
           self.flushPendingGeneratedNarrationIfPossible()
@@ -6554,12 +6586,18 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
         self.appendGeminiDebug(
           "Gemini passive automatic audio failed: \(message). Falling back to local speech."
         )
+        let playbackRecord = self.activePassiveAutomaticPlaybackRecord
+        self.activePassiveAutomaticPlaybackRecord = nil
+        self.activePassiveAutomaticPlaybackDidStart = false
         self.liveNarratorPlaybackOwnsCaption = false
         self.caption = nil
         switch request.role {
         case .narrator:
           self.pieceVoiceStatusText = "Narrator Gemini Live unavailable. Using local fallback."
-          _ = self.startLocalAutomaticNarratorUtterance(text: request.line)
+          _ = self.startLocalAutomaticNarratorUtterance(
+            text: request.line,
+            playbackRecord: playbackRecord
+          )
         case .piece:
           guard let speakerName = request.speakerName,
                 let speaker = self.personalitySpeaker(named: speakerName) else {
@@ -6568,7 +6606,11 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
             return
           }
           self.pieceVoiceStatusText = "\(speaker.displayName) Gemini Live unavailable. Using local fallback."
-          _ = self.startLocalPieceVoiceUtterance(text: request.line, speaker: speaker)
+          _ = self.startLocalPieceVoiceUtterance(
+            text: request.line,
+            speaker: speaker,
+            playbackRecord: playbackRecord
+          )
         }
         self.flushQueuedAutomaticCommentaryDecisionIfPossible()
       }
@@ -6737,12 +6779,14 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     synthesizer.stopSpeaking(at: .immediate)
     utteranceCaptions.removeAll()
     utteranceStyles.removeAll()
+    utteranceAutomaticDialogueRecords.removeAll()
     passiveNarratorLiveSpeaker.disconnect()
     geminiNarrationRetryWorkItem?.cancel()
     geminiNarrationRetryWorkItem = nil
     pendingGeneratedNarrations.removeAll()
     narrationSessionID += 1
     caption = nil
+    narrationHighlightHandler?([], "Speaking piece")
     cachedAnalysis = nil
     stockfishDebugAnalysisCache.removeAll()
     hintTask?.cancel()
@@ -6776,6 +6820,8 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     latestAutomaticCommentaryRequestID = 0
     queuedAutomaticCommentaryDecision = nil
     liveNarratorPlaybackOwnsCaption = false
+    activePassiveAutomaticPlaybackRecord = nil
+    activePassiveAutomaticPlaybackDidStart = false
     topWorkers = []
     topTraitors = []
     stockfishDebugStatusText = "Open Stockfish debug to inspect engine candidates."
@@ -7006,6 +7052,9 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   }
 
   private func triggerAutomaticCommentary(for trigger: AutomaticCommentaryTrigger) {
+    if case .move = trigger {
+      discardPendingAutomaticCommentaryForNewMove()
+    }
     prepareAutomaticCommentaryState(for: trigger)
 
     // Passive automatic commentary is mutually exclusive per event: narrator, piece, or silence.
@@ -7016,6 +7065,22 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       return
     }
     applyAutomaticCommentaryDecision(decision)
+  }
+
+  private func discardPendingAutomaticCommentaryForNewMove() {
+    if automaticCommentaryRequestTask != nil {
+      automaticCommentaryRequestTask?.cancel()
+      automaticCommentaryRequestTask = nil
+      latestAutomaticCommentaryRequestID += 1
+      appendGeminiDebug("Cancelled stale automatic commentary request because a newer move arrived first.")
+    }
+
+    if queuedAutomaticCommentaryDecision != nil {
+      queuedAutomaticCommentaryDecision = nil
+      appendGeminiDebug("Dropped queued automatic commentary decision because a newer move superseded it.")
+    }
+
+    discardPendingAutomaticNarrations()
   }
 
   private func prepareAutomaticCommentaryState(for trigger: AutomaticCommentaryTrigger) {
@@ -7421,6 +7486,9 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
 
     AmbientMusicController.shared.setSpeechActive(true)
     caption = utteranceCaptions[utteranceID]
+    if let playbackRecord = utteranceAutomaticDialogueRecords[utteranceID] {
+      beginAutomaticDialoguePlayback(playbackRecord)
+    }
   }
 
   func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
@@ -7435,6 +7503,9 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
 
     utteranceCaptions[utteranceID] = nil
     utteranceStyles[utteranceID] = nil
+    if let playbackRecord = utteranceAutomaticDialogueRecords.removeValue(forKey: utteranceID) {
+      endAutomaticDialoguePlayback(playbackRecord)
+    }
     if !synthesizer.isSpeaking {
       AmbientMusicController.shared.setSpeechActive(false)
       caption = nil
@@ -7455,6 +7526,9 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
 
     utteranceCaptions[utteranceID] = nil
     utteranceStyles[utteranceID] = nil
+    if let playbackRecord = utteranceAutomaticDialogueRecords.removeValue(forKey: utteranceID) {
+      endAutomaticDialoguePlayback(playbackRecord)
+    }
     if !synthesizer.isSpeaking {
       AmbientMusicController.shared.setSpeechActive(false)
       caption = nil
@@ -8805,18 +8879,42 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     return shuffledOptions.first ?? options.first ?? ""
   }
 
-  private func recordAutomaticDialogueUtterance(_ entry: AutonomousDialogueMemoryEntry) {
-    autonomousDialogueMemory.append(entry)
+  private func automaticDialoguePlaybackRecord(
+    for entry: AutonomousDialogueMemoryEntry,
+    highlightedSquare: BoardSquare?
+  ) -> AutomaticDialoguePlaybackRecord {
+    AutomaticDialoguePlaybackRecord(
+      entry: entry,
+      stackLine: "\(entry.speakerName): \(entry.text)",
+      highlightedSquare: highlightedSquare
+    )
+  }
+
+  private func recordAutomaticDialogueUtterance(_ record: AutomaticDialoguePlaybackRecord) {
+    autonomousDialogueMemory.append(record.entry)
     if autonomousDialogueMemory.count > 24 {
       autonomousDialogueMemory.removeFirst(autonomousDialogueMemory.count - 24)
     }
 
-    let line = "\(entry.speakerName): \(entry.text)"
-    pieceVoiceLines.append(line)
+    pieceVoiceLines.append(record.stackLine)
     if pieceVoiceLines.count > 8 {
       pieceVoiceLines.removeFirst(pieceVoiceLines.count - 8)
     }
-    appendGeminiDebug("Automatic commentary ready: \(line)")
+    appendGeminiDebug("Automatic commentary started: \(record.stackLine)")
+  }
+
+  private func setSpeakingPieceHighlight(square: BoardSquare?) {
+    let squares = square.map { [$0.algebraic] } ?? []
+    narrationHighlightHandler?(squares, "Speaking piece")
+  }
+
+  private func beginAutomaticDialoguePlayback(_ record: AutomaticDialoguePlaybackRecord) {
+    recordAutomaticDialogueUtterance(record)
+    setSpeakingPieceHighlight(square: record.highlightedSquare)
+  }
+
+  private func endAutomaticDialoguePlayback(_ record: AutomaticDialoguePlaybackRecord) {
+    setSpeakingPieceHighlight(square: nil)
   }
 
   private func recordCoachDialogueLines(_ lines: [String]) {
@@ -8869,20 +8967,22 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
 
     let debugLine = "\(plan.speaker.displayName): \(resolvedText)"
     pieceVoiceStatusText = "\(resolvedStatusPrefix): \(debugLine)"
-    recordAutomaticDialogueUtterance(
-      AutonomousDialogueMemoryEntry(
+    let playbackRecord = automaticDialoguePlaybackRecord(
+      for: AutonomousDialogueMemoryEntry(
         speakerClass: .piece,
         speakerName: plan.speaker.displayName,
         text: resolvedText,
         pieceType: plan.context.pieceType,
         pieceColor: plan.context.pieceColor,
         pieceIdentity: "\(plan.context.pieceColor.displayName.capitalized) \(plan.context.pieceType.displayName) on \(plan.context.toSquare.algebraic)"
-      )
+      ),
+      highlightedSquare: plan.context.toSquare
     )
     let spokeImmediately = speakGeneratedPieceVoiceLine(
       text: resolvedText,
       speaker: plan.speaker,
-      priority: priority
+      priority: priority,
+      playbackRecord: playbackRecord
     )
     appendGeminiDebug(
       spokeImmediately
@@ -8927,17 +9027,21 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     let resolvedText = resolveDistinctPassiveNarratorLine(text, for: context)
     let debugLine = "Narrator: \(resolvedText)"
     pieceVoiceStatusText = "\(statusPrefix): \(debugLine)"
-    recordAutomaticDialogueUtterance(
-      AutonomousDialogueMemoryEntry(
+    let playbackRecord = automaticDialoguePlaybackRecord(
+      for: AutonomousDialogueMemoryEntry(
         speakerClass: .narrator,
         speakerName: "Narrator",
         text: resolvedText,
         pieceType: nil,
         pieceColor: nil,
         pieceIdentity: nil
-      )
+      ),
+      highlightedSquare: nil
     )
-    let spokeImmediately = speakPassiveNarratorLine(text: resolvedText)
+    let spokeImmediately = speakPassiveNarratorLine(
+      text: resolvedText,
+      playbackRecord: playbackRecord
+    )
     appendGeminiDebug(
       spokeImmediately
         ? "Passive narrator handed to speech engine."
@@ -10323,13 +10427,17 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     speakGeminiNarration(text: text, title: "Gemini Hint", priority: priority)
   }
 
-  private func speakPassiveNarratorLine(text: String) -> Bool {
+  private func speakPassiveNarratorLine(
+    text: String,
+    playbackRecord: AutomaticDialoguePlaybackRecord?
+  ) -> Bool {
     appendGeminiDebug("Preparing passive narrator Gemini Live speech.")
     return speakGeneratedNarration(
       text: text,
       style: .automaticNarrator,
       priority: .normal,
-      maxCharacters: Self.passiveNarratorCharacterLimit
+      maxCharacters: Self.passiveNarratorCharacterLimit,
+      playbackRecord: playbackRecord
     )
   }
 
@@ -10345,14 +10453,16 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   private func speakGeneratedPieceVoiceLine(
     text: String,
     speaker: PersonalitySpeaker,
-    priority: SpeechPriority
+    priority: SpeechPriority,
+    playbackRecord: AutomaticDialoguePlaybackRecord?
   ) -> Bool {
     appendGeminiDebug("Preparing piece voice speech for \(speaker.displayName.lowercased()).")
     return speakGeneratedNarration(
       text: text,
       style: .pieceVoice(speaker: speaker),
       priority: priority,
-      maxCharacters: Self.pieceVoiceLineCharacterLimit
+      maxCharacters: Self.pieceVoiceLineCharacterLimit,
+      playbackRecord: playbackRecord
     )
   }
 
@@ -10360,7 +10470,8 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     text: String,
     style: GeneratedNarrationStyle,
     priority: SpeechPriority,
-    maxCharacters: Int
+    maxCharacters: Int,
+    playbackRecord: AutomaticDialoguePlaybackRecord? = nil
   ) -> Bool {
     let sanitizedText: String
     switch style {
@@ -10396,15 +10507,28 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       appendGeminiDebug(
         "Queued \(generatedNarrationDebugLabel(style)) speech. synthesizer=\(synthesizer.isSpeaking) passive_live=\(passiveNarratorBusy) sfx_busy=\(String(format: "%.2f", pieceAudioBusyDuration)) retry=\(String(format: "%.2f", retryDelay))"
       )
-      queuePendingGeneratedNarration(text: sanitizedText, style: style, retryAfter: retryDelay)
+      queuePendingGeneratedNarration(
+        text: sanitizedText,
+        style: style,
+        playbackRecord: playbackRecord,
+        retryAfter: retryDelay
+      )
       return true
     }
 
     appendGeminiDebug("Starting \(generatedNarrationDebugLabel(style)) speech immediately.")
-    return startGeneratedNarrationNow(text: sanitizedText, style: style)
+    return startGeneratedNarrationNow(
+      text: sanitizedText,
+      style: style,
+      playbackRecord: playbackRecord
+    )
   }
 
-  private func startGeneratedNarrationNow(text: String, style: GeneratedNarrationStyle) -> Bool {
+  private func startGeneratedNarrationNow(
+    text: String,
+    style: GeneratedNarrationStyle,
+    playbackRecord: AutomaticDialoguePlaybackRecord? = nil
+  ) -> Bool {
     do {
       try AudioSessionCoordinator.shared.activatePlaybackSession()
     } catch {
@@ -10413,7 +10537,11 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
 
     switch style {
     case .automaticNarrator, .pieceVoice:
-      return startPassiveAutomaticLivePlayback(text: text, style: style)
+      return startPassiveAutomaticLivePlayback(
+        text: text,
+        style: style,
+        playbackRecord: playbackRecord
+      )
     case .gemini:
       break
     }
@@ -10442,6 +10570,10 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       return false
     }
 
+    if let playbackRecord {
+      utteranceAutomaticDialogueRecords[ObjectIdentifier(utterance)] = playbackRecord
+    }
+
     utterance.preUtteranceDelay = 0.02
     if case .pieceVoice(let speaker) = style {
       pieceVoiceStatusText = "Speaking \(speaker.displayName) voice."
@@ -10454,7 +10586,11 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     return true
   }
 
-  private func startPassiveAutomaticLivePlayback(text: String, style: GeneratedNarrationStyle) -> Bool {
+  private func startPassiveAutomaticLivePlayback(
+    text: String,
+    style: GeneratedNarrationStyle,
+    playbackRecord: AutomaticDialoguePlaybackRecord?
+  ) -> Bool {
     maybeHighlightNarrationFocus(text)
 
     let role: GeminiPassiveAutomaticSpeakerRole
@@ -10481,23 +10617,37 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     appendGeminiDebug("Speech start: \(generatedNarrationDebugLabel(style)) via Gemini Live -> \(text)")
     guard passiveNarratorLiveSpeaker.speak(line: text, role: role, speakerName: speakerName) else {
       appendGeminiDebug("Gemini passive automatic audio unavailable right now; using local speech fallback.")
+      activePassiveAutomaticPlaybackRecord = nil
+      activePassiveAutomaticPlaybackDidStart = false
       liveNarratorPlaybackOwnsCaption = false
       caption = nil
       switch style {
       case .automaticNarrator:
-        return startLocalAutomaticNarratorUtterance(text: text)
+        return startLocalAutomaticNarratorUtterance(
+          text: text,
+          playbackRecord: playbackRecord
+        )
       case .pieceVoice(let speaker):
-        return startLocalPieceVoiceUtterance(text: text, speaker: speaker)
+        return startLocalPieceVoiceUtterance(
+          text: text,
+          speaker: speaker,
+          playbackRecord: playbackRecord
+        )
       case .gemini:
         return false
       }
     }
 
+    activePassiveAutomaticPlaybackRecord = playbackRecord
+    activePassiveAutomaticPlaybackDidStart = false
     liveNarratorPlaybackOwnsCaption = true
     return true
   }
 
-  private func startLocalAutomaticNarratorUtterance(text: String) -> Bool {
+  private func startLocalAutomaticNarratorUtterance(
+    text: String,
+    playbackRecord: AutomaticDialoguePlaybackRecord? = nil
+  ) -> Bool {
     liveNarratorPlaybackOwnsCaption = false
     let utterance = AVSpeechUtterance(string: text)
     utterance.voice = AVSpeechSynthesisVoice(language: "en-US")
@@ -10511,6 +10661,9 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       imageAssetName: "GeminiNarratorPortrait"
     )
     utteranceStyles[ObjectIdentifier(utterance)] = .automaticNarrator
+    if let playbackRecord {
+      utteranceAutomaticDialogueRecords[ObjectIdentifier(utterance)] = playbackRecord
+    }
     pieceVoiceStatusText = "Speaking narrator line."
     appendGeminiDebug("Speech start: Narrator (local fallback) -> \(text)")
     maybeHighlightNarrationFocus(text)
@@ -10518,7 +10671,11 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     return true
   }
 
-  private func startLocalPieceVoiceUtterance(text: String, speaker: PersonalitySpeaker) -> Bool {
+  private func startLocalPieceVoiceUtterance(
+    text: String,
+    speaker: PersonalitySpeaker,
+    playbackRecord: AutomaticDialoguePlaybackRecord? = nil
+  ) -> Bool {
     let utterance = AVSpeechUtterance(string: text)
     utterance.voice = AVSpeechSynthesisVoice(language: "en-US")
     utterance.pitchMultiplier = min(max(speaker.defaultPitch, 0.5), 2.0)
@@ -10527,6 +10684,9 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     utterance.preUtteranceDelay = 0.02
     utteranceCaptions[ObjectIdentifier(utterance)] = Caption(speaker: speaker, line: text)
     utteranceStyles[ObjectIdentifier(utterance)] = .pieceVoice(speaker: speaker)
+    if let playbackRecord {
+      utteranceAutomaticDialogueRecords[ObjectIdentifier(utterance)] = playbackRecord
+    }
     pieceVoiceStatusText = "Speaking \(speaker.displayName) voice."
     appendGeminiDebug("Speech start: \(speaker.displayName) piece voice (local fallback) -> \(text)")
     maybeHighlightNarrationFocus(text)
@@ -10537,9 +10697,14 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   private func queuePendingGeneratedNarration(
     text: String,
     style: GeneratedNarrationStyle,
+    playbackRecord: AutomaticDialoguePlaybackRecord?,
     retryAfter delay: TimeInterval
   ) {
-    let pending = PendingGeneratedNarration(text: text, style: style)
+    let pending = PendingGeneratedNarration(
+      text: text,
+      style: style,
+      playbackRecord: playbackRecord
+    )
     switch style {
     case .automaticNarrator, .pieceVoice:
       pendingGeneratedNarrations.removeAll { existing in
@@ -10591,7 +10756,11 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     geminiNarrationRetryWorkItem?.cancel()
     geminiNarrationRetryWorkItem = nil
     appendGeminiDebug("Flushing queued \(generatedNarrationDebugLabel(pendingGeneratedNarration.style)) speech.")
-    _ = startGeneratedNarrationNow(text: pendingGeneratedNarration.text, style: pendingGeneratedNarration.style)
+    _ = startGeneratedNarrationNow(
+      text: pendingGeneratedNarration.text,
+      style: pendingGeneratedNarration.style,
+      playbackRecord: pendingGeneratedNarration.playbackRecord
+    )
   }
 
   private func blockingPieceAudioBusyDuration(
@@ -14365,6 +14534,7 @@ private struct NativeARView: UIViewRepresentable {
     private var threatOverlayContainer = Entity()
     private var activeThreatSquares: [BoardSquare] = []
     private var persistentThreatSquares: [BoardSquare] = []
+    private var speakingPieceHighlightSquare: BoardSquare?
     private var activeThreatEntities: [ModelEntity] = []
     private var threatOverlayDisplayLink: CADisplayLink?
     private var threatOverlayHideWorkItem: DispatchWorkItem?
@@ -14521,8 +14691,15 @@ private struct NativeARView: UIViewRepresentable {
           self.commentary.bindReactionHandler { [weak self] cue in
             self?.handleReactionCue(cue)
           }
-          self.commentary.bindNarrationHighlightHandler { [weak self] squares, _ in
-            self?.showThreatOverlay(algebraicSquares: squares)
+          self.commentary.bindNarrationHighlightHandler { [weak self] squares, reason in
+            guard let self else {
+              return
+            }
+            if reason == "Speaking piece" {
+              self.setSpeakingPieceHighlight(algebraicSquares: squares)
+            } else {
+              self.showThreatOverlay(algebraicSquares: squares)
+            }
           }
           self.commentary.bindPieceAudioBusyDurationProvider { [weak self] in
             self?.captureSoundEffects.remainingPlaybackTime() ?? 0
@@ -14988,6 +15165,15 @@ private struct NativeARView: UIViewRepresentable {
       }
       threatOverlayHideWorkItem = hideWorkItem
       DispatchQueue.main.asyncAfter(deadline: .now() + 4.0, execute: hideWorkItem)
+    }
+
+    private func setSpeakingPieceHighlight(algebraicSquares: [String]) {
+      let resolvedSquare = algebraicSquares.compactMap(BoardSquare.init(algebraic:)).first
+      guard speakingPieceHighlightSquare != resolvedSquare else {
+        return
+      }
+      speakingPieceHighlightSquare = resolvedSquare
+      syncHighlights()
     }
 
     private func clearThreatOverlay() {
@@ -17338,6 +17524,15 @@ private struct NativeARView: UIViewRepresentable {
         let highlight = makeHighlightEntity(size: squareSize * (isCapture ? 0.94 : 0.58), color: color)
         highlight.position = boardPosition(move.to, squareSize: squareSize) + SIMD3<Float>(0, 0.0026, 0)
         highlightsContainer.addChild(highlight)
+      }
+
+      if let speakingPieceHighlightSquare {
+        let speakingHighlight = makeHighlightEntity(
+          size: squareSize * 0.90,
+          color: UIColor(red: 0.18, green: 0.76, blue: 0.70, alpha: 0.42)
+        )
+        speakingHighlight.position = boardPosition(speakingPieceHighlightSquare, squareSize: squareSize) + SIMD3<Float>(0, 0.0034, 0)
+        highlightsContainer.addChild(speakingHighlight)
       }
 
       if mode.isLessonMode,
