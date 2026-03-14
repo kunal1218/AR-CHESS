@@ -8084,7 +8084,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     limit: Int? = nil
   ) -> [GeminiDialogueUtterancePayload] {
     let resolvedLimit = limit ?? Self.pieceDialogueHistoryWindow
-    Array(
+    return Array(
       autonomousDialogueMemory
         .filter { $0.speakerClass == .piece }
         .suffix(resolvedLimit)
