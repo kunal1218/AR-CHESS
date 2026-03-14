@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
+import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
@@ -589,6 +590,56 @@ def test_build_piece_voice_line_query_supports_ambient_piece_context() -> None:
     assert "Current square: d8" in query
 
 
+def test_build_piece_voice_line_query_uses_piece_only_dialogue_history() -> None:
+    from main import GeminiPieceVoiceRequest
+
+    payload = GeminiPieceVoiceRequest(
+        fen="r1bqkbnr/pppp1ppp/2n5/4p3/3PP3/5N2/PPP2PPP/RNBQKB1R w KQkq - 2 3",
+        piece_type="knight",
+        piece_color="white",
+        recent_lines=["I smell a weak square."],
+        dialogue_mode="history_reactive",
+        piece_dialogue_history=[
+            {
+                "speaker_class": "piece",
+                "piece_type": "pawn",
+                "piece_color": "white",
+                "piece_identity": "White Pawn on e4",
+                "text": "Forward. The center wants blood.",
+            }
+        ],
+        context_mode="moved",
+        from_square="f3",
+        to_square="e5",
+        is_capture=False,
+        is_check=False,
+        is_near_enemy_king=False,
+        is_attacked=True,
+        is_attacked_by_multiple=False,
+        is_defended=True,
+        is_well_defended=False,
+        is_hanging=False,
+        is_pinned=False,
+        is_retreat=False,
+        is_aggressive_advance=True,
+        is_fork_threat=True,
+        attacker_count=1,
+        defender_count=1,
+        eval_before=24,
+        eval_after=80,
+        eval_delta=56,
+        position_state="equal",
+        move_quality="tactical",
+    )
+
+    query = build_piece_voice_line_query(payload)
+
+    assert "Dialogue mode: history_reactive" in query
+    assert "Pieces can hear other pieces, but never the narrator." in query
+    assert "Recent piece-only battlefield chatter you may react to:" in query
+    assert "White Pawn on e4" in query
+
+
 def test_build_passive_narrator_line_query_includes_story_context() -> None:
     from main import GeminiPassiveNarratorRequest
 
@@ -628,6 +679,93 @@ def test_build_passive_narrator_line_query_includes_story_context() -> None:
     assert "Moving piece: black pawn" in query
     assert "Capture: yes" in query
     assert "Recent narrator lines to avoid repeating:" in query
+
+
+def test_build_passive_narrator_line_query_can_react_to_latest_piece_line() -> None:
+    from main import GeminiPassiveNarratorRequest, build_passive_narrator_line_query
+
+    payload = GeminiPassiveNarratorRequest(
+        fen="rnbqkbnr/pppp1ppp/8/4p3/3PP3/5N2/PPP2PPP/RNBQKB1R b KQkq - 1 2",
+        phase="move",
+        dialogue_mode="piece_reactive",
+        latest_piece_line={
+            "speaker_class": "piece",
+            "piece_type": "knight",
+            "piece_color": "white",
+            "piece_identity": "White Knight on f3",
+            "text": "A finer road opens from here.",
+        },
+        turns_since_last_narrator_line=2,
+        move_san="...exd4",
+        moving_piece="pawn",
+        moving_color="black",
+        from_square="e5",
+        to_square="d4",
+        is_capture=True,
+        is_check=False,
+        is_checkmate=False,
+        is_near_enemy_king=False,
+        is_attacked=True,
+        is_pinned=False,
+        is_retreat=False,
+        is_aggressive_advance=True,
+        is_fork_threat=False,
+        attacker_count=1,
+        defender_count=0,
+        eval_before=18,
+        eval_after=-42,
+        eval_delta=-60,
+        position_state="equal",
+        move_quality="tactical",
+    )
+
+    query = build_passive_narrator_line_query(payload)
+
+    assert "Dialogue mode: piece_reactive" in query
+    assert "Most recent piece line you may react to:" in query
+    assert "White Knight on f3" in query
+    assert "Pieces cannot hear the narrator" in query
+
+
+def test_piece_voice_request_rejects_non_piece_dialogue_history() -> None:
+    from pydantic import ValidationError
+    from main import GeminiPieceVoiceRequest
+
+    with pytest.raises(ValidationError):
+        GeminiPieceVoiceRequest(
+            fen="rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBR1 w KQkq - 0 1",
+            piece_type="rook",
+            piece_color="white",
+            dialogue_mode="history_reactive",
+            piece_dialogue_history=[
+                {
+                    "speaker_class": "narrator",
+                    "text": "A hush settles over the board.",
+                }
+            ],
+            context_mode="moved",
+            from_square="h1",
+            to_square="g1",
+            is_capture=False,
+            is_check=False,
+            is_near_enemy_king=False,
+            is_attacked=False,
+            is_attacked_by_multiple=False,
+            is_defended=True,
+            is_well_defended=True,
+            is_hanging=False,
+            is_pinned=False,
+            is_retreat=False,
+            is_aggressive_advance=False,
+            is_fork_threat=False,
+            attacker_count=0,
+            defender_count=2,
+            eval_before=40,
+            eval_after=120,
+            eval_delta=80,
+            position_state="winning",
+            move_quality="strong",
+        )
 
 
 def test_sanitize_passive_narrator_line_text_strips_labels_and_blocks_coordinates() -> None:

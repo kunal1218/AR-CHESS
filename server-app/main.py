@@ -14,7 +14,7 @@ import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect, status
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from services.gemini_live import (
     GeminiLiveBusyError,
@@ -301,11 +301,63 @@ class GeminiCoachResponse(BaseModel):
         return cleaned[:3]
 
 
+class GeminiDialogueUtterance(BaseModel):
+    speaker_class: str = Field(..., min_length=1, max_length=16)
+    piece_type: str | None = Field(default=None, max_length=16)
+    piece_color: str | None = Field(default=None, max_length=16)
+    piece_identity: str | None = Field(default=None, max_length=80)
+    text: str = Field(..., min_length=1, max_length=220)
+
+    @field_validator("speaker_class")
+    @classmethod
+    def validate_speaker_class(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"piece", "narrator", "coach", "user"}:
+            raise ValueError("speaker_class must be piece, narrator, coach, or user.")
+        return normalized
+
+    @field_validator("piece_type")
+    @classmethod
+    def validate_optional_piece_type(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip().lower()
+        if normalized not in {"pawn", "knight", "bishop", "rook", "queen", "king"}:
+            raise ValueError("piece_type must be one of pawn, knight, bishop, rook, queen, king.")
+        return normalized
+
+    @field_validator("piece_color")
+    @classmethod
+    def validate_optional_piece_color(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip().lower()
+        if normalized not in {"white", "black"}:
+            raise ValueError("piece_color must be 'white' or 'black'.")
+        return normalized
+
+    @field_validator("piece_identity", "text")
+    @classmethod
+    def validate_dialogue_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = re.sub(r"\s+", " ", value).strip()
+        return normalized or None
+
+    @model_validator(mode="after")
+    def validate_piece_metadata(self) -> "GeminiDialogueUtterance":
+        if self.speaker_class == "piece" and (self.piece_type is None or self.piece_color is None):
+            raise ValueError("piece dialogue entries must include piece_type and piece_color.")
+        return self
+
+
 class GeminiPieceVoiceRequest(BaseModel):
     fen: str = Field(..., min_length=1, max_length=256)
     piece_type: str = Field(..., min_length=1, max_length=16)
     piece_color: str = Field(..., min_length=1, max_length=16)
     recent_lines: list[str] = Field(default_factory=list, max_length=6)
+    dialogue_mode: str = Field(default="independent", min_length=1, max_length=32)
+    piece_dialogue_history: list[GeminiDialogueUtterance] = Field(default_factory=list, max_length=4)
     context_mode: str = Field(default="moved", min_length=1, max_length=16)
     from_square: str = Field(..., min_length=2, max_length=2)
     to_square: str = Field(..., min_length=2, max_length=2)
@@ -366,6 +418,26 @@ class GeminiPieceVoiceRequest(BaseModel):
                 break
         return normalized_lines
 
+    @field_validator("dialogue_mode")
+    @classmethod
+    def validate_piece_dialogue_mode(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"history_reactive", "independent"}:
+            raise ValueError("dialogue_mode must be history_reactive or independent.")
+        return normalized
+
+    @field_validator("piece_dialogue_history")
+    @classmethod
+    def validate_piece_dialogue_history(cls, value: list[GeminiDialogueUtterance]) -> list[GeminiDialogueUtterance]:
+        history: list[GeminiDialogueUtterance] = []
+        for entry in value:
+            if entry.speaker_class != "piece":
+                raise ValueError("piece_dialogue_history may only contain piece speaker_class entries.")
+            history.append(entry)
+            if len(history) >= 4:
+                break
+        return history
+
     @field_validator("context_mode")
     @classmethod
     def validate_context_mode(cls, value: str) -> str:
@@ -409,6 +481,8 @@ class GeminiPassiveNarratorRequest(BaseModel):
     fen: str = Field(..., min_length=1, max_length=256)
     recent_history: str | None = Field(default=None, max_length=512)
     recent_lines: list[str] = Field(default_factory=list, max_length=6)
+    dialogue_mode: str = Field(default="independent", min_length=1, max_length=32)
+    latest_piece_line: GeminiDialogueUtterance | None = None
     phase: str = Field(..., min_length=1, max_length=16)
     turns_since_last_narrator_line: int = Field(default=0, ge=0, le=64)
     move_san: str | None = Field(default=None, max_length=32)
@@ -461,6 +535,23 @@ class GeminiPassiveNarratorRequest(BaseModel):
             if len(normalized_lines) >= 6:
                 break
         return normalized_lines
+
+    @field_validator("dialogue_mode")
+    @classmethod
+    def validate_narrator_dialogue_mode(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"independent", "piece_reactive"}:
+            raise ValueError("dialogue_mode must be independent or piece_reactive.")
+        return normalized
+
+    @field_validator("latest_piece_line")
+    @classmethod
+    def validate_latest_piece_line(cls, value: GeminiDialogueUtterance | None) -> GeminiDialogueUtterance | None:
+        if value is None:
+            return None
+        if value.speaker_class != "piece":
+            raise ValueError("latest_piece_line must use speaker_class 'piece'.")
+        return value
 
     @field_validator("phase")
     @classmethod
@@ -945,6 +1036,29 @@ def build_piece_voice_line_query(payload: GeminiPieceVoiceRequest) -> str:
         if context_mode == "moved"
         else f"Current square: {payload.to_square}"
     )
+    dialogue_mode = payload.dialogue_mode.lower()
+    dialogue_instruction = (
+        "Say something fresh and independent from prior dialogue. "
+        "Stay grounded in the board state and your personality, but do not build on earlier talk."
+    )
+    piece_dialogue_history_text = ""
+    if dialogue_mode == "history_reactive" and payload.piece_dialogue_history:
+        formatted_history = "\n".join(
+            f"- {entry.piece_color} {entry.piece_type}"
+            + (f" ({entry.piece_identity})" if entry.piece_identity else "")
+            + f": {entry.text}"
+            for entry in payload.piece_dialogue_history
+        )
+        piece_dialogue_history_text = (
+            "\nRecent piece-only battlefield chatter you may react to:\n"
+            f"{formatted_history}\n"
+            "These lines came from pieces only. The narrator is not present here. "
+            "Use this chatter lightly for continuity, not as a script.\n"
+        )
+        dialogue_instruction = (
+            "Pieces can hear other pieces, but never the narrator. "
+            "Build lightly off the recent piece-only battlefield chatter while still reacting to the current board state."
+        )
     recent_lines_text = ""
     if payload.recent_lines:
         formatted_recent_lines = "\n".join(f"- {line}" for line in payload.recent_lines)
@@ -956,11 +1070,13 @@ def build_piece_voice_line_query(payload: GeminiPieceVoiceRequest) -> str:
     return (
         "You are generating a single short in-character voice line spoken by a selected chess piece. "
         "You must speak as the selected piece itself, not as a narrator. "
+        "Pieces can hear other pieces. Pieces cannot hear or perceive the narrator. "
         "Your line must reflect: "
         "the piece's personality, the current tactical / positional context, whether the position is winning, equal, or losing, "
         "whether the piece is in danger, whether the piece is threatening the enemy king, "
         "and whether the move was strong, desperate, defensive, aggressive, or poor. "
         f"{context_instruction} "
+        f"{dialogue_instruction} "
         "Keep the line short, vivid, punchy, and freshly phrased. Aim for 5 to 10 words. Minimum 3 words. Maximum 12 words. "
         "Return exactly one complete sentence, not a fragment. End the sentence with a period, exclamation point, or question mark. "
         "Do not return a single word, single letter, grunt, or filler fragment. "
@@ -991,6 +1107,7 @@ def build_piece_voice_line_query(payload: GeminiPieceVoiceRequest) -> str:
         "Do not output quotation marks. "
         "Output exactly one short in-character line.\n\n"
         f"Focused piece personality: {piece_voice_personality_instructions(payload.piece_type)}\n"
+        f"Dialogue mode: {dialogue_mode}\n"
         f"Context mode: {context_mode}\n"
         f"Moved piece: {payload.piece_color} {payload.piece_type}\n"
         f"{move_line}\n"
@@ -1013,6 +1130,7 @@ def build_piece_voice_line_query(payload: GeminiPieceVoiceRequest) -> str:
         f"Eval before: {eval_before}\n"
         f"Eval after: {eval_after}\n"
         f"Eval delta: {eval_delta}"
+        f"{piece_dialogue_history_text}"
         f"{recent_lines_text}"
     )
 
@@ -1058,14 +1176,37 @@ def build_passive_narrator_line_query(payload: GeminiPassiveNarratorRequest) -> 
     fork_text = "yes" if payload.is_fork_threat else "no"
     position_state = payload.position_state or "unknown"
     move_quality = payload.move_quality or "unknown"
+    dialogue_mode = payload.dialogue_mode.lower()
+    piece_reaction_text = ""
+    narrator_dialogue_instruction = (
+        "Stay mostly independent from piece talk. "
+        "Observe the board from outside the battle and do not behave like a participant in any conversation."
+    )
+    if dialogue_mode == "piece_reactive" and payload.latest_piece_line is not None:
+        latest_piece = payload.latest_piece_line
+        piece_reaction_text = (
+            "\nMost recent piece line you may react to:\n"
+            f"- {latest_piece.piece_color} {latest_piece.piece_type}"
+            + (f" ({latest_piece.piece_identity})" if latest_piece.piece_identity else "")
+            + f": {latest_piece.text}\n"
+            "You can hear pieces, but you are outside the battle. "
+            "React observationally, analytically, or cinematically rather than answering like another combatant.\n"
+        )
+        narrator_dialogue_instruction = (
+            "You can hear the latest piece-spoken line, but only from outside the battle. "
+            "React to it like a cinematic observer, not a participant."
+        )
 
     return (
         "Write one passive automatic narrator line for a chess game. "
         "This is story-like commentary, not coaching and not in-character piece dialogue. "
+        "The narrator can hear pieces. Pieces cannot hear the narrator, and narrator lines never enter their world. "
         "Speak only as an outside narrator who notices tension, pressure, momentum, danger, or the weight of a quiet move. "
+        f"{narrator_dialogue_instruction} "
         "Keep it concise and polished. Use 1 or 2 short sentences. "
         "Do not mention squares, coordinates, move notation, SAN, or engine terms. "
         "Output only the line itself.\n\n"
+        f"Dialogue mode: {dialogue_mode}\n"
         f"Turns since last narrator line: {payload.turns_since_last_narrator_line}\n"
         f"Move SAN: {move_san}\n"
         f"Moving piece: {moving_color} {moving_piece}\n"
@@ -1086,6 +1227,7 @@ def build_passive_narrator_line_query(payload: GeminiPassiveNarratorRequest) -> 
         f"Eval before: {eval_before}\n"
         f"Eval after: {eval_after}\n"
         f"Eval delta: {eval_delta}"
+        f"{piece_reaction_text}"
         f"{recent_lines_text}"
     )
 

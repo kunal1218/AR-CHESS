@@ -543,6 +543,8 @@ private struct GeminiPieceVoiceLineRequestPayload: Encodable {
   let piece_type: String
   let piece_color: String
   let recent_lines: [String]
+  let dialogue_mode: String
+  let piece_dialogue_history: [GeminiDialogueUtterancePayload]
   let context_mode: String
   let from_square: String
   let to_square: String
@@ -571,6 +573,8 @@ private struct GeminiPassiveNarratorLineRequestPayload: Encodable {
   let fen: String
   let recent_history: String?
   let recent_lines: [String]
+  let dialogue_mode: String
+  let latest_piece_line: GeminiDialogueUtterancePayload?
   let phase: String
   let turns_since_last_narrator_line: Int
   let move_san: String?
@@ -675,11 +679,38 @@ private enum PieceVoiceMoveQuality: String {
   case routine
 }
 
+private enum AutonomousDialogueSpeakerClass: String {
+  case piece
+  case narrator
+  case coach
+  case user
+}
+
+private enum PieceDialogueMode: String {
+  case historyReactive = "history_reactive"
+  case independent
+}
+
+private enum PassiveNarratorDialogueMode: String {
+  case independent
+  case pieceReactive = "piece_reactive"
+}
+
+private struct GeminiDialogueUtterancePayload: Encodable {
+  let speaker_class: String
+  let piece_type: String?
+  let piece_color: String?
+  let piece_identity: String?
+  let text: String
+}
+
 private struct GeminiPieceVoiceLineContext {
   let fen: String
   let pieceType: ChessPieceKind
   let pieceColor: ChessColor
   let recentLines: [String]
+  let dialogueMode: PieceDialogueMode
+  let pieceDialogueHistory: [GeminiDialogueUtterancePayload]
   let contextMode: PieceVoiceContextMode
   let fromSquare: BoardSquare
   let toSquare: BoardSquare
@@ -713,6 +744,8 @@ private struct GeminiPassiveNarratorLineContext {
   let fen: String
   let recentHistory: String?
   let recentLines: [String]
+  let dialogueMode: PassiveNarratorDialogueMode
+  let latestPieceLine: GeminiDialogueUtterancePayload?
   let phase: PassiveNarratorPhase
   let turnsSinceLastNarratorLine: Int
   let moveSAN: String?
@@ -736,6 +769,15 @@ private struct GeminiPassiveNarratorLineContext {
   let evalDelta: Int?
   let positionState: PieceVoicePositionState?
   let moveQuality: PieceVoiceMoveQuality?
+}
+
+private struct AutonomousDialogueMemoryEntry {
+  let speakerClass: AutonomousDialogueSpeakerClass
+  let speakerName: String
+  let text: String
+  let pieceType: ChessPieceKind?
+  let pieceColor: ChessColor?
+  let pieceIdentity: String?
 }
 
 private struct SocraticCoachContext: Equatable {
@@ -2563,6 +2605,8 @@ private final class GeminiHintService {
         piece_type: context.pieceType.displayName.lowercased(),
         piece_color: context.pieceColor.displayName.lowercased(),
         recent_lines: context.recentLines,
+        dialogue_mode: context.dialogueMode.rawValue,
+        piece_dialogue_history: context.pieceDialogueHistory,
         context_mode: context.contextMode.rawValue,
         from_square: context.fromSquare.algebraic,
         to_square: context.toSquare.algebraic,
@@ -2647,6 +2691,8 @@ private final class GeminiHintService {
         fen: context.fen,
         recent_history: context.recentHistory,
         recent_lines: context.recentLines,
+        dialogue_mode: context.dialogueMode.rawValue,
+        latest_piece_line: context.latestPieceLine,
         phase: context.phase.rawValue,
         turns_since_last_narrator_line: context.turnsSinceLastNarratorLine,
         move_san: context.moveSAN,
@@ -6242,6 +6288,10 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   // so the first eligible post-narrator move starts at 20%.
   private static let narratorChanceRampIncrement = 0.20
   private static let ambientPieceVoiceLineChance = 0.35
+  private static let passiveDialogueModeRollSides = 5
+  private static let pieceHistoryReactiveRollThreshold = 3
+  private static let narratorIndependentRollThreshold = 3
+  private static let pieceDialogueHistoryWindow = 4
   private static let pieceVoiceLineCharacterLimit = 180
   private static let passiveNarratorCharacterLimit = 220
   private static let speechPrewarmDelayNanoseconds: UInt64 = 250_000_000
@@ -6252,6 +6302,8 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     pieceType: .pawn,
     pieceColor: .white,
     recentLines: [],
+    dialogueMode: .independent,
+    pieceDialogueHistory: [],
     contextMode: .moved,
     fromSquare: BoardSquare(file: 4, rank: 1),
     toSquare: BoardSquare(file: 4, rank: 3),
@@ -6416,6 +6468,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   private var openingNarrationDelivered = false
   private var queuedAutomaticCommentaryDecision: AutomaticCommentaryDecision?
   private var liveNarratorPlaybackOwnsCaption = false
+  private var autonomousDialogueMemory: [AutonomousDialogueMemoryEntry] = []
 
   init(narrator: NarratorType = .silky) {
     self.narrator = narrator
@@ -6647,6 +6700,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     coachLines = []
     pieceVoiceLines = []
     pieceVoiceStatusText = "Waiting for a move."
+    autonomousDialogueMemory = []
     latestAutomaticCommentaryRequestID = 0
     queuedAutomaticCommentaryDecision = nil
     liveNarratorPlaybackOwnsCaption = false
@@ -7578,6 +7632,8 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       fen: state.fenString,
       recentHistory: recentHistoryProvider?(),
       recentLines: recentPassiveNarratorLines(),
+      dialogueMode: .independent,
+      latestPieceLine: nil,
       phase: .opening,
       turnsSinceLastNarratorLine: turnsSinceNarratorLine,
       moveSAN: nil,
@@ -7617,11 +7673,16 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       after: afterState,
       referenceMove: move
     )
+    let latestPieceLine = latestPieceDialoguePayload()
+    let dialogueMode = chooseNarratorDialogueMode(hasLatestPieceLine: latestPieceLine != nil)
+    let reactivePieceLine = dialogueMode == .pieceReactive ? latestPieceLine : nil
 
     return GeminiPassiveNarratorLineContext(
       fen: afterState.fenString,
       recentHistory: recentHistoryProvider?(),
       recentLines: recentPassiveNarratorLines(),
+      dialogueMode: dialogueMode,
+      latestPieceLine: reactivePieceLine,
       phase: .move,
       turnsSinceLastNarratorLine: turnsSinceNarratorLine,
       moveSAN: beforeState.sanNotation(for: move),
@@ -7662,6 +7723,8 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
        ) {
       let speaker = personalitySpeaker(for: ambientSpeaker.piece.kind)
       let recentLines = recentPieceVoiceLines(for: speaker)
+      let pieceHistory = recentPieceDialogueHistory()
+      let dialogueMode = choosePieceDialogueMode(hasHistory: !pieceHistory.isEmpty)
       let context = buildPieceVoiceLineContext(
         speakingSquare: ambientSpeaker.square,
         piece: ambientSpeaker.piece,
@@ -7669,7 +7732,9 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
         before: beforeState,
         after: afterState,
         referenceMove: move,
-        recentLines: recentLines
+        recentLines: recentLines,
+        dialogueMode: dialogueMode,
+        pieceDialogueHistory: dialogueMode == .historyReactive ? pieceHistory : []
       )
       return PieceVoiceRequestPlan(
         speaker: speaker,
@@ -7680,6 +7745,8 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
 
     let speaker = personalitySpeaker(for: move.piece.kind)
     let recentLines = recentPieceVoiceLines(for: speaker)
+    let pieceHistory = recentPieceDialogueHistory()
+    let dialogueMode = choosePieceDialogueMode(hasHistory: !pieceHistory.isEmpty)
     let context = buildPieceVoiceLineContext(
       speakingSquare: move.to,
       piece: move.piece,
@@ -7687,7 +7754,9 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       before: beforeState,
       after: afterState,
       referenceMove: move,
-      recentLines: recentLines
+      recentLines: recentLines,
+      dialogueMode: dialogueMode,
+      pieceDialogueHistory: dialogueMode == .historyReactive ? pieceHistory : []
     )
     return PieceVoiceRequestPlan(
       speaker: speaker,
@@ -7788,7 +7857,9 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     referenceMove: ChessMove? = nil,
     beforeAnalysis: StockfishAnalysis? = nil,
     afterAnalysis: StockfishAnalysis? = nil,
-    recentLines: [String] = []
+    recentLines: [String] = [],
+    dialogueMode: PieceDialogueMode = .independent,
+    pieceDialogueHistory: [GeminiDialogueUtterancePayload] = []
   ) -> GeminiPieceVoiceLineContext {
     let moverColor = piece.color
     let opponent = moverColor.opponent
@@ -7859,6 +7930,8 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       pieceType: piece.kind,
       pieceColor: moverColor,
       recentLines: recentLines,
+      dialogueMode: dialogueMode,
+      pieceDialogueHistory: pieceDialogueHistory,
       contextMode: contextMode,
       fromSquare: fromSquare,
       toSquare: speakingSquare,
@@ -7989,19 +8062,76 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       .trimmingCharacters(in: .whitespacesAndNewlines)
   }
 
+  private func autonomousDialoguePayload(
+    from entry: AutonomousDialogueMemoryEntry
+  ) -> GeminiDialogueUtterancePayload? {
+    // This is the asymmetry boundary: only piece-tagged utterances can ever flow back into
+    // autonomous dialogue prompts, so narrator lines never enter piece conversational memory.
+    guard entry.speakerClass == .piece else {
+      return nil
+    }
+
+    return GeminiDialogueUtterancePayload(
+      speaker_class: entry.speakerClass.rawValue,
+      piece_type: entry.pieceType?.displayName.lowercased(),
+      piece_color: entry.pieceColor?.displayName.lowercased(),
+      piece_identity: entry.pieceIdentity,
+      text: entry.text
+    )
+  }
+
+  private func recentPieceDialogueHistory(
+    limit: Int = Self.pieceDialogueHistoryWindow
+  ) -> [GeminiDialogueUtterancePayload] {
+    Array(
+      autonomousDialogueMemory
+        .filter { $0.speakerClass == .piece }
+        .suffix(limit)
+        .compactMap { autonomousDialoguePayload(from: $0) }
+    )
+  }
+
+  private func latestPieceDialoguePayload() -> GeminiDialogueUtterancePayload? {
+    autonomousDialogueMemory
+      .last(where: { $0.speakerClass == .piece })
+      .flatMap { autonomousDialoguePayload(from: $0) }
+  }
+
+  private func choosePieceDialogueMode(hasHistory: Bool) -> PieceDialogueMode {
+    guard hasHistory else {
+      return .independent
+    }
+
+    // Pieces mostly sound aware of other pieces, but they still get fresh beats 2/5 of the time.
+    return Int.random(in: 0..<Self.passiveDialogueModeRollSides) < Self.pieceHistoryReactiveRollThreshold
+      ? .historyReactive
+      : .independent
+  }
+
+  private func chooseNarratorDialogueMode(hasLatestPieceLine: Bool) -> PassiveNarratorDialogueMode {
+    guard hasLatestPieceLine else {
+      return .independent
+    }
+
+    // The narrator stays mostly independent and only reacts to a piece line 2/5 of the time.
+    return Int.random(in: 0..<Self.passiveDialogueModeRollSides) < Self.narratorIndependentRollThreshold
+      ? .independent
+      : .pieceReactive
+  }
+
   private func recentPieceVoiceLines(
     for speaker: PersonalitySpeaker,
     limit: Int = 4
   ) -> [String] {
-    let prefix = "\(speaker.displayName): "
     return Array(
-      pieceVoiceLines
+      autonomousDialogueMemory
         .reversed()
-        .compactMap { line -> String? in
-          guard line.hasPrefix(prefix) else {
+        .compactMap { entry -> String? in
+          guard entry.speakerClass == .piece,
+                entry.speakerName == speaker.displayName else {
             return nil
           }
-          let body = String(line.dropFirst(prefix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+          let body = entry.text.trimmingCharacters(in: .whitespacesAndNewlines)
           return body.isEmpty ? nil : body
         }
         .prefix(limit)
@@ -8024,15 +8154,14 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   }
 
   private func recentPassiveNarratorLines(limit: Int = 4) -> [String] {
-    let prefix = "Narrator: "
     return Array(
-      pieceVoiceLines
+      autonomousDialogueMemory
         .reversed()
-        .compactMap { line -> String? in
-          guard line.hasPrefix(prefix) else {
+        .compactMap { entry -> String? in
+          guard entry.speakerClass == .narrator else {
             return nil
           }
-          let body = String(line.dropFirst(prefix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+          let body = entry.text.trimmingCharacters(in: .whitespacesAndNewlines)
           return body.isEmpty ? nil : body
         }
         .prefix(limit)
@@ -8093,12 +8222,36 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     return shuffledOptions.first ?? options.first ?? ""
   }
 
-  private func recordPieceVoiceLine(_ line: String) {
+  private func recordAutomaticDialogueUtterance(_ entry: AutonomousDialogueMemoryEntry) {
+    autonomousDialogueMemory.append(entry)
+    if autonomousDialogueMemory.count > 24 {
+      autonomousDialogueMemory.removeFirst(autonomousDialogueMemory.count - 24)
+    }
+
+    let line = "\(entry.speakerName): \(entry.text)"
     pieceVoiceLines.append(line)
     if pieceVoiceLines.count > 8 {
       pieceVoiceLines.removeFirst(pieceVoiceLines.count - 8)
     }
     appendGeminiDebug("Automatic commentary ready: \(line)")
+  }
+
+  private func recordCoachDialogueLines(_ lines: [String]) {
+    for line in lines {
+      autonomousDialogueMemory.append(
+        AutonomousDialogueMemoryEntry(
+          speakerClass: .coach,
+          speakerName: "Coach",
+          text: line,
+          pieceType: nil,
+          pieceColor: nil,
+          pieceIdentity: nil
+        )
+      )
+    }
+    if autonomousDialogueMemory.count > 24 {
+      autonomousDialogueMemory.removeFirst(autonomousDialogueMemory.count - 24)
+    }
   }
 
   private func emitPieceVoiceLine(
@@ -8119,7 +8272,16 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
 
     let debugLine = "\(plan.speaker.displayName): \(resolvedText)"
     pieceVoiceStatusText = "\(resolvedStatusPrefix): \(debugLine)"
-    recordPieceVoiceLine(debugLine)
+    recordAutomaticDialogueUtterance(
+      AutonomousDialogueMemoryEntry(
+        speakerClass: .piece,
+        speakerName: plan.speaker.displayName,
+        text: resolvedText,
+        pieceType: plan.context.pieceType,
+        pieceColor: plan.context.pieceColor,
+        pieceIdentity: "\(plan.context.pieceColor.displayName.capitalized) \(plan.context.pieceType.displayName) on \(plan.context.toSquare.algebraic)"
+      )
+    )
     let spokeImmediately = speakGeneratedPieceVoiceLine(
       text: resolvedText,
       speaker: plan.speaker,
@@ -8168,7 +8330,16 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     let resolvedText = resolveDistinctPassiveNarratorLine(text, for: context)
     let debugLine = "Narrator: \(resolvedText)"
     pieceVoiceStatusText = "\(statusPrefix): \(debugLine)"
-    recordPieceVoiceLine(debugLine)
+    recordAutomaticDialogueUtterance(
+      AutonomousDialogueMemoryEntry(
+        speakerClass: .narrator,
+        speakerName: "Narrator",
+        text: resolvedText,
+        pieceType: nil,
+        pieceColor: nil,
+        pieceIdentity: nil
+      )
+    )
     let spokeImmediately = speakPassiveNarratorLine(text: resolvedText)
     appendGeminiDebug(
       spokeImmediately
@@ -8957,6 +9128,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       }.filter { !$0.isEmpty }
     )
     coachLines = normalizedLines
+    recordCoachDialogueLines(normalizedLines)
     topWorkers = Array(commentary.topWorkers.prefix(3))
     topTraitors = Array(commentary.topTraitors.prefix(3))
   }
