@@ -6241,8 +6241,6 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   // narrator stays silent. We evaluate the next move at `(storedTurns + 1) * increment`
   // so the first eligible post-narrator move starts at 20%.
   private static let narratorChanceRampIncrement = 0.20
-  // Pieces fill gaps only occasionally on quiet non-capture turns so silence stays common.
-  private static let nonCapturePieceFillerChance = 0.25
   private static let ambientPieceVoiceLineChance = 0.35
   private static let pieceVoiceLineCharacterLimit = 180
   private static let passiveNarratorCharacterLimit = 220
@@ -6970,28 +6968,21 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
         )
       }
 
-      if Double.random(in: 0..<1) < Self.nonCapturePieceFillerChance {
-        return AutomaticCommentaryDecision(
-          kind: .piece,
-          narratorContext: nil,
-          piecePlan: makePieceVoiceRequestPlan(
-            move: move,
-            before: beforeState,
-            after: afterState,
-            allowAmbient: true
-          ),
-          piecePriority: .normal,
-          incrementsNarratorRamp: true,
-          resetsNarratorRamp: false,
-          marksOpeningNarrationDelivered: false,
-          reason: "Narrator passed; a filler piece line fills the gap."
-        )
-      }
-
-      // Silence is a valid outcome on normal turns so the match can breathe.
-      return silentAutomaticCommentaryDecision(
+      // When the narrator does not win a normal move, the moved piece now always gets the line.
+      return AutomaticCommentaryDecision(
+        kind: .piece,
+        narratorContext: nil,
+        piecePlan: makePieceVoiceRequestPlan(
+          move: move,
+          before: beforeState,
+          after: afterState,
+          allowAmbient: false
+        ),
+        piecePriority: .normal,
         incrementsNarratorRamp: true,
-        reason: "Narrator missed and filler-piece chatter also stayed silent."
+        resetsNarratorRamp: false,
+        marksOpeningNarrationDelivered: false,
+        reason: "Narrator passed; the moved piece takes the line."
       )
     }
   }
