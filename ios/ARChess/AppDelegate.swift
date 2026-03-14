@@ -6298,7 +6298,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   // so the first eligible post-narrator move starts at 10%.
   private static let narratorChanceRampIncrement = 0.10
   private static let ambientPieceVoiceLineChance = 0.35
-  private static let underutilizedSnarkMinimumMovesPerPlayer = 10
+  private static let underutilizedSnarkMinimumMovesPerPlayer = 6
   private static let underutilizedSnarkTriggerChance = 0.25
   private static let underutilizedSnarkPoolSize = 5
   private static let defaultPieceHistoryReactiveChancePercent = 60
