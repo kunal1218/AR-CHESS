@@ -358,6 +358,7 @@ class GeminiPieceVoiceRequest(BaseModel):
     recent_lines: list[str] = Field(default_factory=list, max_length=6)
     dialogue_mode: str = Field(default="independent", min_length=1, max_length=32)
     piece_dialogue_history: list[GeminiDialogueUtterance] = Field(default_factory=list, max_length=4)
+    latest_piece_line: GeminiDialogueUtterance | None = None
     context_mode: str = Field(default="moved", min_length=1, max_length=16)
     from_square: str = Field(..., min_length=2, max_length=2)
     to_square: str = Field(..., min_length=2, max_length=2)
@@ -437,6 +438,15 @@ class GeminiPieceVoiceRequest(BaseModel):
             if len(history) >= 4:
                 break
         return history
+
+    @field_validator("latest_piece_line")
+    @classmethod
+    def validate_piece_latest_piece_line(cls, value: GeminiDialogueUtterance | None) -> GeminiDialogueUtterance | None:
+        if value is None:
+            return None
+        if value.speaker_class != "piece":
+            raise ValueError("latest_piece_line must use speaker_class 'piece'.")
+        return value
 
     @field_validator("context_mode")
     @classmethod
@@ -1042,6 +1052,7 @@ def build_piece_voice_line_query(payload: GeminiPieceVoiceRequest) -> str:
         "Stay grounded in the board state and your personality, but do not build on earlier talk."
     )
     piece_dialogue_history_text = ""
+    latest_piece_line_text = ""
     if dialogue_mode == "history_reactive" and payload.piece_dialogue_history:
         formatted_history = "\n".join(
             f"- {entry.piece_color} {entry.piece_type}"
@@ -1052,12 +1063,25 @@ def build_piece_voice_line_query(payload: GeminiPieceVoiceRequest) -> str:
         piece_dialogue_history_text = (
             "\nRecent piece-only battlefield chatter you may react to:\n"
             f"{formatted_history}\n"
-            "These lines came from pieces only. The narrator is not present here. "
-            "Use this chatter lightly for continuity, not as a script.\n"
+            "These lines came from pieces only. The narrator is not present here.\n"
         )
         dialogue_instruction = (
             "Pieces can hear other pieces, but never the narrator. "
-            "Build lightly off the recent piece-only battlefield chatter while still reacting to the current board state."
+            "Make this line feel like part of that battlefield conversation while still reacting to the current board state."
+        )
+    if dialogue_mode == "history_reactive" and payload.latest_piece_line is not None:
+        latest_piece = payload.latest_piece_line
+        latest_piece_line_text = (
+            "\nLatest piece line to answer right now:\n"
+            f"- {latest_piece.piece_color} {latest_piece.piece_type}"
+            + (f" ({latest_piece.piece_identity})" if latest_piece.piece_identity else "")
+            + f": {latest_piece.text}\n"
+            "Reply to that line directly in spirit. Mock it, challenge it, escalate it, contradict it, or answer it with grim approval. "
+            "Do not ignore it. Do not just fall back to a generic stock slogan.\n"
+        )
+        dialogue_instruction = (
+            "Pieces can hear other pieces, but never the narrator. "
+            "This line should sound like a direct battlefield reply to the latest piece-spoken line while still matching the current move and board state."
         )
     recent_lines_text = ""
     if payload.recent_lines:
@@ -1131,6 +1155,7 @@ def build_piece_voice_line_query(payload: GeminiPieceVoiceRequest) -> str:
         f"Eval after: {eval_after}\n"
         f"Eval delta: {eval_delta}"
         f"{piece_dialogue_history_text}"
+        f"{latest_piece_line_text}"
         f"{recent_lines_text}"
     )
 
@@ -2529,9 +2554,10 @@ async def create_gemini_passive_commentary_line(payload: GeminiPassiveNarratorRe
 @app.post("/v1/gemini/piece-voice-line", response_model=GeminiPieceVoiceResponse)
 async def create_gemini_piece_voice_line(payload: GeminiPieceVoiceRequest) -> dict[str, Any]:
     query = build_piece_voice_line_query(payload)
+    initial_temperature = 1.2 if payload.dialogue_mode == "history_reactive" else None
 
     try:
-        raw_line = await fetch_gemini_piece_voice_line_text(query)
+        raw_line = await fetch_gemini_piece_voice_line_text(query, temperature=initial_temperature)
         line = normalize_piece_voice_line_text(sanitize_piece_voice_line_text(raw_line))
 
         if is_piece_voice_line_repetitive(line, payload.recent_lines):

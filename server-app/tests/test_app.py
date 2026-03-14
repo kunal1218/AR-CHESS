@@ -608,6 +608,13 @@ def test_build_piece_voice_line_query_uses_piece_only_dialogue_history() -> None
                 "text": "Forward. The center wants blood.",
             }
         ],
+        latest_piece_line={
+            "speaker_class": "piece",
+            "piece_type": "pawn",
+            "piece_color": "white",
+            "piece_identity": "White Pawn on e4",
+            "text": "Forward. The center wants blood.",
+        },
         context_mode="moved",
         from_square="f3",
         to_square="e5",
@@ -638,6 +645,8 @@ def test_build_piece_voice_line_query_uses_piece_only_dialogue_history() -> None
     assert "Pieces can hear other pieces, but never the narrator." in query
     assert "Recent piece-only battlefield chatter you may react to:" in query
     assert "White Pawn on e4" in query
+    assert "Latest piece line to answer right now:" in query
+    assert "Do not just fall back to a generic stock slogan." in query
 
 
 def test_build_passive_narrator_line_query_includes_story_context() -> None:
@@ -743,6 +752,45 @@ def test_piece_voice_request_rejects_non_piece_dialogue_history() -> None:
                     "text": "A hush settles over the board.",
                 }
             ],
+            context_mode="moved",
+            from_square="h1",
+            to_square="g1",
+            is_capture=False,
+            is_check=False,
+            is_near_enemy_king=False,
+            is_attacked=False,
+            is_attacked_by_multiple=False,
+            is_defended=True,
+            is_well_defended=True,
+            is_hanging=False,
+            is_pinned=False,
+            is_retreat=False,
+            is_aggressive_advance=False,
+            is_fork_threat=False,
+            attacker_count=0,
+            defender_count=2,
+            eval_before=40,
+            eval_after=120,
+            eval_delta=80,
+            position_state="winning",
+            move_quality="strong",
+        )
+
+
+def test_piece_voice_request_rejects_non_piece_latest_piece_line() -> None:
+    from pydantic import ValidationError
+    from main import GeminiPieceVoiceRequest
+
+    with pytest.raises(ValidationError):
+        GeminiPieceVoiceRequest(
+            fen="rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBR1 w KQkq - 0 1",
+            piece_type="rook",
+            piece_color="white",
+            dialogue_mode="history_reactive",
+            latest_piece_line={
+                "speaker_class": "narrator",
+                "text": "A hush settles over the board.",
+            },
             context_mode="moved",
             from_square="h1",
             to_square="g1",

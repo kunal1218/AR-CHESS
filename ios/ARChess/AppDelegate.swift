@@ -545,6 +545,7 @@ private struct GeminiPieceVoiceLineRequestPayload: Encodable {
   let recent_lines: [String]
   let dialogue_mode: String
   let piece_dialogue_history: [GeminiDialogueUtterancePayload]
+  let latest_piece_line: GeminiDialogueUtterancePayload?
   let context_mode: String
   let from_square: String
   let to_square: String
@@ -711,6 +712,7 @@ private struct GeminiPieceVoiceLineContext {
   let recentLines: [String]
   let dialogueMode: PieceDialogueMode
   let pieceDialogueHistory: [GeminiDialogueUtterancePayload]
+  let latestPieceLine: GeminiDialogueUtterancePayload?
   let contextMode: PieceVoiceContextMode
   let fromSquare: BoardSquare
   let toSquare: BoardSquare
@@ -2607,6 +2609,7 @@ private final class GeminiHintService {
         recent_lines: context.recentLines,
         dialogue_mode: context.dialogueMode.rawValue,
         piece_dialogue_history: context.pieceDialogueHistory,
+        latest_piece_line: context.latestPieceLine,
         context_mode: context.contextMode.rawValue,
         from_square: context.fromSquare.algebraic,
         to_square: context.toSquare.algebraic,
@@ -6303,6 +6306,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     recentLines: [],
     dialogueMode: .independent,
     pieceDialogueHistory: [],
+    latestPieceLine: nil,
     contextMode: .moved,
     fromSquare: BoardSquare(file: 4, rank: 1),
     toSquare: BoardSquare(file: 4, rank: 3),
@@ -7731,6 +7735,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       let recentLines = recentPieceVoiceLines(for: speaker)
       let pieceHistory = recentPieceDialogueHistory()
       let dialogueMode = choosePieceDialogueMode(hasHistory: !pieceHistory.isEmpty)
+      let latestPieceLine = dialogueMode == .historyReactive ? latestPieceDialoguePayload() : nil
       let context = buildPieceVoiceLineContext(
         speakingSquare: ambientSpeaker.square,
         piece: ambientSpeaker.piece,
@@ -7740,7 +7745,8 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
         referenceMove: move,
         recentLines: recentLines,
         dialogueMode: dialogueMode,
-        pieceDialogueHistory: dialogueMode == .historyReactive ? pieceHistory : []
+        pieceDialogueHistory: dialogueMode == .historyReactive ? pieceHistory : [],
+        latestPieceLine: latestPieceLine
       )
       return PieceVoiceRequestPlan(
         speaker: speaker,
@@ -7753,6 +7759,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     let recentLines = recentPieceVoiceLines(for: speaker)
     let pieceHistory = recentPieceDialogueHistory()
     let dialogueMode = choosePieceDialogueMode(hasHistory: !pieceHistory.isEmpty)
+    let latestPieceLine = dialogueMode == .historyReactive ? latestPieceDialoguePayload() : nil
     let context = buildPieceVoiceLineContext(
       speakingSquare: move.to,
       piece: move.piece,
@@ -7762,7 +7769,8 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       referenceMove: move,
       recentLines: recentLines,
       dialogueMode: dialogueMode,
-      pieceDialogueHistory: dialogueMode == .historyReactive ? pieceHistory : []
+      pieceDialogueHistory: dialogueMode == .historyReactive ? pieceHistory : [],
+      latestPieceLine: latestPieceLine
     )
     return PieceVoiceRequestPlan(
       speaker: speaker,
@@ -7865,7 +7873,8 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     afterAnalysis: StockfishAnalysis? = nil,
     recentLines: [String] = [],
     dialogueMode: PieceDialogueMode = .independent,
-    pieceDialogueHistory: [GeminiDialogueUtterancePayload] = []
+    pieceDialogueHistory: [GeminiDialogueUtterancePayload] = [],
+    latestPieceLine: GeminiDialogueUtterancePayload? = nil
   ) -> GeminiPieceVoiceLineContext {
     let moverColor = piece.color
     let opponent = moverColor.opponent
@@ -7938,6 +7947,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       recentLines: recentLines,
       dialogueMode: dialogueMode,
       pieceDialogueHistory: pieceDialogueHistory,
+      latestPieceLine: latestPieceLine,
       contextMode: contextMode,
       fromSquare: fromSquare,
       toSquare: speakingSquare,
@@ -8471,6 +8481,19 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     avoiding additionalLines: [String] = []
   ) -> String {
     let context = plan.context
+    if context.dialogueMode == .historyReactive, let latestPieceLine = context.latestPieceLine {
+      let reactingTo = latestPieceLine.piece_type?.capitalized ?? "piece"
+      return pickDistinctPieceVoiceOption(
+        [
+          "Keep talking, \(reactingTo). I answer with steel.",
+          "Boast all you want, \(reactingTo). I move louder.",
+          "Your speech is cheap, \(reactingTo). My move is not.",
+          "Say it again, \(reactingTo). I dare you.",
+        ],
+        for: plan.speaker,
+        extraAvoiding: additionalLines
+      )
+    }
 
     switch plan.speaker {
     case .pawn:
