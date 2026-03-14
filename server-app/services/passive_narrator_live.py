@@ -13,10 +13,10 @@ from services.gemini_live import GeminiLiveClient
 
 
 PASSIVE_NARRATOR_READ_SYSTEM_PROMPT = """
-You are a cinematic chess narrator performing already-written lines aloud.
-For each user turn, read the supplied narrator line exactly as written.
+You are performing already-written chess voice lines aloud.
+For each user turn, read the supplied line exactly as written.
 Do not add, remove, paraphrase, explain, preface, summarize, or continue past the supplied line.
-Keep the delivery calm, warm, observant, and natural to listen to.
+Adjust delivery to the supplied speaker role metadata when present.
 Return audio and matching transcription only.
 """.strip()
 
@@ -88,13 +88,17 @@ class PassiveNarratorLiveSession:
             line = " ".join(str(payload.get("text") or "").split()).strip()
             if not line:
                 return
+            speaker_role = str(payload.get("speaker_role") or "narrator").strip().lower()
+            if speaker_role not in {"narrator", "piece"}:
+                speaker_role = "narrator"
+            speaker_name = " ".join(str(payload.get("speaker_name") or "").split()).strip() or None
             if self._response_in_flight:
-                await self._send_frontend({"type": "busy", "message": "Narrator audio is already in flight."})
+                await self._send_frontend({"type": "busy", "message": "Automatic voice audio is already in flight."})
                 return
             self._response_in_flight = True
             await self._send_frontend({"type": "streaming", "active": True})
             try:
-                await self._send_user_turn(line)
+                await self._send_user_turn(line, speaker_role=speaker_role, speaker_name=speaker_name)
             except Exception as exc:
                 self._response_in_flight = False
                 await self._send_frontend({"type": "streaming", "active": False})
@@ -102,7 +106,7 @@ class PassiveNarratorLiveSession:
                     {
                         "type": "status",
                         "state": "error",
-                        "message": f"Gemini passive narrator send failed: {exc}",
+                        "message": f"Gemini passive automatic voice send failed: {exc}",
                     }
                 )
             return
@@ -110,7 +114,22 @@ class PassiveNarratorLiveSession:
         if message_type == "ping":
             await self._send_frontend({"type": "pong"})
 
-    async def _send_user_turn(self, line: str) -> None:
+    async def _send_user_turn(self, line: str, *, speaker_role: str, speaker_name: str | None) -> None:
+        if speaker_role == "piece":
+            role_instruction = (
+                "Speak the following chess piece line aloud exactly as written. "
+                "It is already written in first person from inside the battle. "
+                "Deliver it with immediate, characterful, reactive energy. "
+                "Do not add or change any words.\n"
+            )
+            if speaker_name:
+                role_instruction += f"Speaking piece: {speaker_name}\n"
+        else:
+            role_instruction = (
+                "Speak the following narrator line aloud exactly as written. "
+                "Deliver it calm, warm, observant, and cinematic. "
+                "Do not add or change any words.\n"
+            )
         await self._wait_until_gemini_ready()
         await self._send_gemini_json(
             {
@@ -120,11 +139,7 @@ class PassiveNarratorLiveSession:
                             "role": "user",
                             "parts": [
                                 {
-                                    "text": (
-                                        "Speak the following narrator line aloud exactly as written. "
-                                        "Do not add or change any words.\n"
-                                        f"Line: {line}"
-                                    )
+                                    "text": role_instruction + f"Line: {line}"
                                 }
                             ],
                         }

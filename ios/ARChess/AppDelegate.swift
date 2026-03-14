@@ -846,9 +846,16 @@ private struct SocraticCoachVoiceMoveCommitPayload: Encodable {
   let spoken: String?
 }
 
+private enum GeminiPassiveAutomaticSpeakerRole: String, Encodable {
+  case narrator
+  case piece
+}
+
 private struct GeminiPassiveNarratorLiveSpeakPayload: Encodable {
   let type = "narrate_line"
   let text: String
+  let speaker_role: String
+  let speaker_name: String?
 }
 
 private enum SocraticCoachMicState: String {
@@ -2115,6 +2122,12 @@ private final class SocraticCoachStore: ObservableObject {
 
 @MainActor
 private final class GeminiPassiveNarratorLiveSpeaker {
+  struct PlaybackRequest {
+    let line: String
+    let role: GeminiPassiveAutomaticSpeakerRole
+    let speakerName: String?
+  }
+
   private static let logger = Logger(subsystem: "ARChess", category: "PassiveNarratorLive")
   private static let reconnectDelay: TimeInterval = 1.5
 
@@ -2124,14 +2137,14 @@ private final class GeminiPassiveNarratorLiveSpeaker {
   private let audioPlayer = SocraticCoachPCMPlayer()
   private var webSocketTask: URLSessionWebSocketTask?
   private var reconnectWorkItem: DispatchWorkItem?
-  private var currentLine: String?
+  private var currentRequest: PlaybackRequest?
   private var hasObservedAudioForCurrentLine = false
   private var isStreamingResponse = false
   private var isAudioPlaying = false
   private var isEnabled = true
 
   var onBusyStateChange: ((Bool) -> Void)?
-  var onLineFailure: ((String, String) -> Void)?
+  var onLineFailure: ((PlaybackRequest, String) -> Void)?
 
   init(
     narrator: NarratorType,
@@ -2167,7 +2180,11 @@ private final class GeminiPassiveNarratorLiveSpeaker {
     ensureConnectedIfNeeded()
   }
 
-  func speak(line: String) -> Bool {
+  func speak(
+    line: String,
+    role: GeminiPassiveAutomaticSpeakerRole,
+    speakerName: String? = nil
+  ) -> Bool {
     let trimmedLine = line.trimmingCharacters(in: .whitespacesAndNewlines)
     guard isEnabled, isConfigured, !trimmedLine.isEmpty, !isBusy else {
       return false
@@ -2175,16 +2192,22 @@ private final class GeminiPassiveNarratorLiveSpeaker {
 
     reconnectWorkItem?.cancel()
     ensureConnectedIfNeeded()
-    currentLine = trimmedLine
+    currentRequest = PlaybackRequest(line: trimmedLine, role: role, speakerName: speakerName)
     hasObservedAudioForCurrentLine = false
     isStreamingResponse = true
     notifyBusyStateChange()
-    send(payload: GeminiPassiveNarratorLiveSpeakPayload(text: trimmedLine))
+    send(
+      payload: GeminiPassiveNarratorLiveSpeakPayload(
+        text: trimmedLine,
+        speaker_role: role.rawValue,
+        speaker_name: speakerName
+      )
+    )
     return true
   }
 
   func stop() {
-    currentLine = nil
+    currentRequest = nil
     hasObservedAudioForCurrentLine = false
     isStreamingResponse = false
     audioPlayer.stop()
@@ -2247,10 +2270,10 @@ private final class GeminiPassiveNarratorLiveSpeaker {
   private func handleReceiveFailure(_ error: Error) {
     webSocketTask = nil
     let message = error.localizedDescription
-    if let currentLine, !hasObservedAudioForCurrentLine {
-      onLineFailure?(currentLine, message)
+    if let currentRequest, !hasObservedAudioForCurrentLine {
+      onLineFailure?(currentRequest, message)
     }
-    currentLine = nil
+    currentRequest = nil
     hasObservedAudioForCurrentLine = false
     isStreamingResponse = false
     audioPlayer.stop()
@@ -2290,10 +2313,10 @@ private final class GeminiPassiveNarratorLiveSpeaker {
     case "status":
       if let state = payload["state"] as? String, state.lowercased() == "error" {
         let message = payload["message"] as? String ?? "Gemini passive narrator failed."
-        if let currentLine, !hasObservedAudioForCurrentLine {
-          onLineFailure?(currentLine, message)
+        if let currentRequest, !hasObservedAudioForCurrentLine {
+          onLineFailure?(currentRequest, message)
         }
-        currentLine = nil
+        currentRequest = nil
         hasObservedAudioForCurrentLine = false
         isStreamingResponse = false
         audioPlayer.stop()
@@ -2304,8 +2327,12 @@ private final class GeminiPassiveNarratorLiveSpeaker {
       notifyBusyStateChange()
     case "output_transcription":
       let text = (payload["text"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-      if !text.isEmpty {
-        currentLine = text
+      if !text.isEmpty, let currentRequest {
+        self.currentRequest = PlaybackRequest(
+          line: text,
+          role: currentRequest.role,
+          speakerName: currentRequest.speakerName
+        )
       }
     case "audio_chunk":
       guard let base64PCM = payload["data"] as? String else {
@@ -2323,11 +2350,11 @@ private final class GeminiPassiveNarratorLiveSpeaker {
       }
       notifyBusyStateChange()
     case "busy":
-      if let currentLine, !hasObservedAudioForCurrentLine {
+      if let currentRequest, !hasObservedAudioForCurrentLine {
         let message = payload["message"] as? String ?? "Gemini passive narrator is busy."
-        onLineFailure?(currentLine, message)
+        onLineFailure?(currentRequest, message)
       }
-      currentLine = nil
+      currentRequest = nil
       hasObservedAudioForCurrentLine = false
       isStreamingResponse = false
       notifyBusyStateChange()
@@ -2336,17 +2363,17 @@ private final class GeminiPassiveNarratorLiveSpeaker {
     }
 
     if !isBusy {
-      currentLine = nil
+      currentRequest = nil
       hasObservedAudioForCurrentLine = false
     }
   }
 
   private func send<T: Encodable>(payload: T) {
     guard let webSocketTask else {
-      if let currentLine, !hasObservedAudioForCurrentLine {
-        onLineFailure?(currentLine, "Gemini passive narrator socket is unavailable.")
+      if let currentRequest, !hasObservedAudioForCurrentLine {
+        onLineFailure?(currentRequest, "Gemini passive narrator socket is unavailable.")
       }
-      currentLine = nil
+      currentRequest = nil
       hasObservedAudioForCurrentLine = false
       isStreamingResponse = false
       notifyBusyStateChange()
@@ -2369,10 +2396,10 @@ private final class GeminiPassiveNarratorLiveSpeaker {
         }
       }
     } catch {
-      if let currentLine, !hasObservedAudioForCurrentLine {
-        onLineFailure?(currentLine, error.localizedDescription)
+      if let currentRequest, !hasObservedAudioForCurrentLine {
+        onLineFailure?(currentRequest, error.localizedDescription)
       }
-      currentLine = nil
+      currentRequest = nil
       hasObservedAudioForCurrentLine = false
       isStreamingResponse = false
       notifyBusyStateChange()
@@ -6511,7 +6538,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
         guard let self else {
           return
         }
-        if !isBusy, self.liveNarratorPlaybackOwnsCaption, self.caption?.speakerName == "Narrator" {
+        if !isBusy, self.liveNarratorPlaybackOwnsCaption {
           self.liveNarratorPlaybackOwnsCaption = false
           self.caption = nil
           self.flushPendingGeneratedNarrationIfPossible()
@@ -6519,20 +6546,30 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
         }
       }
     }
-    passiveNarratorLiveSpeaker.onLineFailure = { [weak self] line, message in
+    passiveNarratorLiveSpeaker.onLineFailure = { [weak self] request, message in
       Task { @MainActor [weak self] in
         guard let self else {
           return
         }
         self.appendGeminiDebug(
-          "Gemini passive narrator audio failed: \(message). Falling back to local narrator speech."
+          "Gemini passive automatic audio failed: \(message). Falling back to local speech."
         )
         self.liveNarratorPlaybackOwnsCaption = false
-        if self.caption?.speakerName == "Narrator" {
-          self.caption = nil
+        self.caption = nil
+        switch request.role {
+        case .narrator:
+          self.pieceVoiceStatusText = "Narrator Gemini Live unavailable. Using local fallback."
+          _ = self.startLocalAutomaticNarratorUtterance(text: request.line)
+        case .piece:
+          guard let speakerName = request.speakerName,
+                let speaker = self.personalitySpeaker(named: speakerName) else {
+            self.pieceVoiceStatusText = "Piece Gemini Live unavailable."
+            self.flushQueuedAutomaticCommentaryDecisionIfPossible()
+            return
+          }
+          self.pieceVoiceStatusText = "\(speaker.displayName) Gemini Live unavailable. Using local fallback."
+          _ = self.startLocalPieceVoiceUtterance(text: request.line, speaker: speaker)
         }
-        self.pieceVoiceStatusText = "Narrator Gemini Live unavailable. Using local fallback."
-        _ = self.startLocalAutomaticNarratorUtterance(text: line)
         self.flushQueuedAutomaticCommentaryDecisionIfPossible()
       }
     }
@@ -8442,6 +8479,25 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       return .queen
     case .king:
       return .king
+    }
+  }
+
+  private func personalitySpeaker(named displayName: String) -> PersonalitySpeaker? {
+    switch displayName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+    case "pawn":
+      return .pawn
+    case "rook":
+      return .rook
+    case "knight":
+      return .knight
+    case "bishop":
+      return .bishop
+    case "queen":
+      return .queen
+    case "king":
+      return .king
+    default:
+      return nil
     }
   }
 
@@ -10355,8 +10411,11 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       appendGeminiDebug("Failed to activate playback session for \(generatedNarrationDebugLabel(style)): \(error.localizedDescription)")
     }
 
-    if case .automaticNarrator = style {
-      return startPassiveNarratorLivePlayback(text: text)
+    switch style {
+    case .automaticNarrator, .pieceVoice:
+      return startPassiveAutomaticLivePlayback(text: text, style: style)
+    case .gemini:
+      break
     }
 
     let utterance = AVSpeechUtterance(string: text)
@@ -10395,21 +10454,43 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     return true
   }
 
-  private func startPassiveNarratorLivePlayback(text: String) -> Bool {
+  private func startPassiveAutomaticLivePlayback(text: String, style: GeneratedNarrationStyle) -> Bool {
     maybeHighlightNarrationFocus(text)
-    caption = Caption(
-      title: "Narrator",
-      line: text,
-      imageAssetName: "GeminiNarratorPortrait"
-    )
-    pieceVoiceStatusText = "Speaking narrator line."
-    appendGeminiDebug("Speech start: Narrator -> \(text)")
 
-    guard passiveNarratorLiveSpeaker.speak(line: text) else {
-      appendGeminiDebug("Gemini passive narrator audio unavailable right now; using local narrator speech.")
+    let role: GeminiPassiveAutomaticSpeakerRole
+    let speakerName: String?
+    switch style {
+    case .automaticNarrator:
+      role = .narrator
+      speakerName = nil
+      caption = Caption(
+        title: "Narrator",
+        line: text,
+        imageAssetName: "GeminiNarratorPortrait"
+      )
+      pieceVoiceStatusText = "Speaking narrator line."
+    case .pieceVoice(let speaker):
+      role = .piece
+      speakerName = speaker.displayName
+      caption = Caption(speaker: speaker, line: text)
+      pieceVoiceStatusText = "Speaking \(speaker.displayName) voice."
+    case .gemini:
+      return false
+    }
+
+    appendGeminiDebug("Speech start: \(generatedNarrationDebugLabel(style)) via Gemini Live -> \(text)")
+    guard passiveNarratorLiveSpeaker.speak(line: text, role: role, speakerName: speakerName) else {
+      appendGeminiDebug("Gemini passive automatic audio unavailable right now; using local speech fallback.")
       liveNarratorPlaybackOwnsCaption = false
       caption = nil
-      return startLocalAutomaticNarratorUtterance(text: text)
+      switch style {
+      case .automaticNarrator:
+        return startLocalAutomaticNarratorUtterance(text: text)
+      case .pieceVoice(let speaker):
+        return startLocalPieceVoiceUtterance(text: text, speaker: speaker)
+      case .gemini:
+        return false
+      }
     }
 
     liveNarratorPlaybackOwnsCaption = true
@@ -10432,6 +10513,22 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     utteranceStyles[ObjectIdentifier(utterance)] = .automaticNarrator
     pieceVoiceStatusText = "Speaking narrator line."
     appendGeminiDebug("Speech start: Narrator (local fallback) -> \(text)")
+    maybeHighlightNarrationFocus(text)
+    synthesizer.speak(utterance)
+    return true
+  }
+
+  private func startLocalPieceVoiceUtterance(text: String, speaker: PersonalitySpeaker) -> Bool {
+    let utterance = AVSpeechUtterance(string: text)
+    utterance.voice = AVSpeechSynthesisVoice(language: "en-US")
+    utterance.pitchMultiplier = min(max(speaker.defaultPitch, 0.5), 2.0)
+    utterance.rate = min(max(speaker.defaultRate, 0.1), 0.65)
+    utterance.volume = min(max(speaker.defaultVolume, 0.0), 1.0)
+    utterance.preUtteranceDelay = 0.02
+    utteranceCaptions[ObjectIdentifier(utterance)] = Caption(speaker: speaker, line: text)
+    utteranceStyles[ObjectIdentifier(utterance)] = .pieceVoice(speaker: speaker)
+    pieceVoiceStatusText = "Speaking \(speaker.displayName) voice."
+    appendGeminiDebug("Speech start: \(speaker.displayName) piece voice (local fallback) -> \(text)")
     maybeHighlightNarrationFocus(text)
     synthesizer.speak(utterance)
     return true
