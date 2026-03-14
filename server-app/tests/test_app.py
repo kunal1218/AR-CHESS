@@ -866,6 +866,9 @@ def test_build_passive_narrator_line_query_includes_story_context() -> None:
     query = build_passive_narrator_line_query(payload)
 
     assert "story-like commentary" in query
+    assert "same level of chess understanding as a strong coach" in query
+    assert "Every line must contain at least one concrete chess idea" in query
+    assert "Never address the player as you or your." in query
     assert "Turns since last narrator line: 3" in query
     assert "Moving piece: black pawn" in query
     assert "Capture: yes" in query
@@ -916,6 +919,45 @@ def test_build_passive_narrator_line_query_can_react_to_latest_piece_line() -> N
     assert "Most recent piece line you may react to:" in query
     assert "White Knight on f3" in query
     assert "Pieces cannot hear the narrator" in query
+    assert "React to it like a cinematic observer, not a participant." in query
+
+
+def test_is_passive_narrator_line_too_vague_rejects_generic_or_instructive_lines() -> None:
+    from main import GeminiPassiveNarratorRequest, is_passive_narrator_line_too_vague
+
+    payload = GeminiPassiveNarratorRequest(
+        fen="rnbqkbnr/pppp1ppp/8/4p3/3PP3/8/PPP2PPP/RNBQKBNR b KQkq - 0 2",
+        phase="move",
+        turns_since_last_narrator_line=3,
+        move_san="...exd4",
+        moving_piece="pawn",
+        moving_color="black",
+        from_square="e5",
+        to_square="d4",
+        is_capture=True,
+        is_check=False,
+        is_checkmate=False,
+        is_near_enemy_king=False,
+        is_attacked=True,
+        is_pinned=False,
+        is_retreat=False,
+        is_aggressive_advance=True,
+        is_fork_threat=False,
+        attacker_count=1,
+        defender_count=0,
+        eval_before=18,
+        eval_after=-42,
+        eval_delta=-60,
+        position_state="equal",
+        move_quality="tactical",
+    )
+
+    assert is_passive_narrator_line_too_vague("The board is a mess, but your pieces scream loud.", payload) is True
+    assert is_passive_narrator_line_too_vague("White must consolidate the center now.", payload) is True
+    assert is_passive_narrator_line_too_vague(
+        "That capture leaves the center thinner and the defenders less coordinated.",
+        payload,
+    ) is False
 
 
 def test_piece_voice_request_rejects_non_piece_dialogue_history() -> None:
@@ -1313,6 +1355,62 @@ def test_create_gemini_passive_commentary_line_retries_recent_duplicate(monkeypa
     }
     assert len(prompts) == 2
     assert "Previous answer to replace" in prompts[1]
+
+
+def test_create_gemini_passive_commentary_line_retries_vague_narration(monkeypatch) -> None:
+    responses = iter(
+        [
+            "The board is a mess, but your pieces scream loud.",
+            "The center is cracking open, and the defenders are late to seal it.",
+        ]
+    )
+    prompts: list[str] = []
+
+    async def fake_run_turn(query: str, *, metadata=None, timeout_seconds=0) -> str:
+        prompts.append(query)
+        _ = metadata
+        _ = timeout_seconds
+        return next(responses)
+
+    monkeypatch.setattr("main.GEMINI_PASSIVE_COMMENTARY_CLIENT.run_turn", fake_run_turn)
+
+    client = TestClient(app)
+    response = client.post(
+        "/v1/gemini/passive-commentary-line",
+        json={
+            "fen": "rnbqkbnr/pppp1ppp/8/4p3/3PP3/8/PPP2PPP/RNBQKBNR b KQkq - 0 2",
+            "phase": "move",
+            "turns_since_last_narrator_line": 4,
+            "move_san": "...exd4",
+            "moving_piece": "pawn",
+            "moving_color": "black",
+            "from_square": "e5",
+            "to_square": "d4",
+            "is_capture": True,
+            "is_check": False,
+            "is_checkmate": False,
+            "is_near_enemy_king": False,
+            "is_attacked": True,
+            "is_pinned": False,
+            "is_retreat": False,
+            "is_aggressive_advance": True,
+            "is_fork_threat": False,
+            "attacker_count": 1,
+            "defender_count": 0,
+            "eval_before": 18,
+            "eval_after": -42,
+            "eval_delta": -60,
+            "position_state": "equal",
+            "move_quality": "tactical",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "line": "The center is cracking open, and the defenders are late to seal it."
+    }
+    assert len(prompts) == 2
+    assert "drifted into coaching, or stayed too vague" in prompts[1]
 
 
 def test_create_gemini_passive_commentary_line_falls_back_when_model_uses_coordinates(monkeypatch) -> None:

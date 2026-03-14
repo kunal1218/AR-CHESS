@@ -77,6 +77,19 @@ PIECE_DIRECT_ADDRESS_NAME_PATTERN = re.compile(
     r"^(?:(?:white|black)\s+)?(?:pawn|knight|bishop|rook|queen|king)\b[,:]",
     re.IGNORECASE,
 )
+PASSIVE_NARRATOR_PLAYER_ADDRESS_PATTERN = re.compile(r"\b(?:you|your|yours|yourself)\b", re.IGNORECASE)
+PASSIVE_NARRATOR_INSTRUCTION_PATTERN = re.compile(
+    r"\b(?:must|should|need(?:s)?\s+to|have\s+to|has\s+to|cannot\s+afford\s+to|can't\s+afford\s+to)\b",
+    re.IGNORECASE,
+)
+PASSIVE_NARRATOR_CHESS_ANCHOR_PATTERN = re.compile(
+    r"\b(?:center|central|king|queen|rook|bishop|knight|pawn|pawns|file|files|diagonal|diagonals|"
+    r"back rank|dark squares|light squares|square|squares|initiative|tempo|development|coordination|"
+    r"pawn structure|structure|space|passed pawn|trade|trades|simplification|pin|pinned|fork|forked|"
+    r"check|checkmate|defender|defenders|attacker|attackers|shelter|open line|open lines|open file|"
+    r"open files|open diagonal|open diagonals|weak square|weak squares|promotion|endgame)\b",
+    re.IGNORECASE,
+)
 
 app = FastAPI(title="AR Chess Server", version="0.3.0")
 
@@ -1119,6 +1132,24 @@ def is_passive_narrator_line_repetitive(text: str, recent_lines: list[str]) -> b
     return candidate_key in recent_keys
 
 
+def is_passive_narrator_line_too_vague(text: str, payload: GeminiPassiveNarratorRequest) -> bool:
+    normalized = re.sub(r"\s+", " ", text).strip()
+    if not normalized:
+        return True
+
+    # Passive narrator lines are descriptive only: no player address and no coaching language.
+    if PASSIVE_NARRATOR_PLAYER_ADDRESS_PATTERN.search(normalized):
+        return True
+    if PASSIVE_NARRATOR_INSTRUCTION_PATTERN.search(normalized):
+        return True
+
+    if payload.phase == "opening":
+        return False
+
+    # Keep narrator lines grounded in a real chess feature rather than generic mood-setting.
+    return not bool(PASSIVE_NARRATOR_CHESS_ANCHOR_PATTERN.search(normalized))
+
+
 def sample_piece_dialogue_intent() -> str:
     # Lightweight intent sampling nudges the piece path away from deterministic stock phrasing.
     return random.choice(PIECE_DIALOGUE_INTENTS)
@@ -1493,8 +1524,11 @@ def build_passive_narrator_line_query(payload: GeminiPassiveNarratorRequest) -> 
         return (
             "Write one opening-of-match narrator line for an automatic chess broadcast. "
             "Set the stakes for the coming duel in 1 or 2 concise sentences. "
+            "Use the Current FEN and Recent Sequence with strong chess understanding, but keep the line introductory. "
+            "Frame the coming fight through something concrete like the center, development, king safety, or a strategic clash. "
             "Be calm, anticipatory, cinematic, and fun to listen to. "
             "Do not speak as a coach. Do not speak as a chess piece. "
+            "Never address the player as you or your. Never give advice or commands. "
             "Do not mention squares, coordinates, SAN, or engine terms. "
             "Output only the line itself.\n\n"
             f"Turns since last narrator line: {payload.turns_since_last_narrator_line}"
@@ -1542,9 +1576,16 @@ def build_passive_narrator_line_query(payload: GeminiPassiveNarratorRequest) -> 
         "Write one passive automatic narrator line for a chess game. "
         "This is story-like commentary, not coaching and not in-character piece dialogue. "
         "The narrator can hear pieces. Pieces cannot hear the narrator, and narrator lines never enter their world. "
-        "Speak only as an outside narrator who notices tension, pressure, momentum, danger, or the weight of a quiet move. "
+        "Use the Current FEN and Recent Sequence with the same level of chess understanding as a strong coach, "
+        "but speak only as an outside narrator. "
+        "First identify the real chess point of the move or position change: center control, king safety, development, "
+        "piece activity, coordination, pawn structure, open lines, weak squares, tactical threats, or simplification. "
+        "Then turn that point into a picturesque observation. "
+        "Every line must contain at least one concrete chess idea, not just mood or vague tension. "
         f"{narrator_dialogue_instruction} "
         "Keep it concise and polished. Use 1 or 2 short sentences. "
+        "Never address the player as you or your. Never give advice, commands, or imperatives. "
+        "Do not say what a side must, should, or needs to do. You are a conveyer, not a caller to action. "
         "Do not mention squares, coordinates, move notation, SAN, or engine terms. "
         "Output only the line itself.\n\n"
         f"Dialogue mode: {dialogue_mode}\n"
@@ -1578,9 +1619,10 @@ def build_passive_narrator_line_retry_query(payload: GeminiPassiveNarratorReques
     return (
         build_passive_narrator_line_query(payload)
         + "\n\n"
-        + "Your previous answer repeated recent wording or was unusable. "
+        + "Your previous answer repeated recent wording, drifted into coaching, or stayed too vague. "
         + "Return one fresh alternative right now with noticeably different phrasing. "
-        + "Keep it cinematic, concise, and natural to speak aloud. "
+        + "Keep it cinematic, concise, natural to speak aloud, and grounded in one real chess reason from the position. "
+        + "Do not address the player. Do not give instructions. "
         + "Do not reuse the same opening words or core phrase. "
         + "Do not return labels, quotes, or explanations. "
         + f"Previous answer to replace: {trimmed_previous or '(empty)'}"
@@ -1589,29 +1631,27 @@ def build_passive_narrator_line_retry_query(payload: GeminiPassiveNarratorReques
 
 def gemini_fallback_passive_narrator_line(payload: GeminiPassiveNarratorRequest) -> str:
     if payload.phase == "opening":
-        return (
-            "The board is set, and both plans are still hiding their teeth."
-        )
+        return "The center is still untouched, but both kings already have a future to answer for."
 
     if payload.is_checkmate:
-        return "The board goes quiet. There is no answer left."
+        return "The king has run out of shelter and out of squares."
 
     if payload.is_check:
-        return "The pressure has stopped being subtle now."
+        return "The king is in check now, and the defenders are short on time."
 
     if payload.is_capture:
-        return "Material changes hands, and the position remembers it immediately."
+        return "A piece comes off, and the balance around the center shifts with it."
 
     if payload.is_near_enemy_king or payload.is_fork_threat:
-        return "There is a threat in the air now, whether the board admits it or not."
+        return "The king and the loose pieces around him are beginning to share the same danger."
 
     if payload.eval_delta is not None and abs(payload.eval_delta) >= 80:
-        return "That move shifts the balance a little harder than it first appears."
+        return "That move changes the balance because the better-coordinated side now has more room to press."
 
     if payload.is_retreat:
-        return "The step backward is quiet, but not without intent."
+        return "The retreat gives ground, but it keeps the piece tied to its defenders."
 
-    return "The board stays calm on the surface, but the pressure keeps building."
+    return "The center is still under dispute, and neither side has solved the coordination problem yet."
 
 def build_piece_voice_line_retry_query(
     payload: GeminiPieceVoiceRequest,
@@ -2880,7 +2920,9 @@ async def create_gemini_passive_commentary_line(payload: GeminiPassiveNarratorRe
         )
         line = sanitize_passive_narrator_line_text(raw_line, fallback)
 
-        if is_passive_narrator_line_repetitive(line, payload.recent_lines):
+        if is_passive_narrator_line_repetitive(line, payload.recent_lines) or is_passive_narrator_line_too_vague(
+            line, payload
+        ):
             retry_query = build_passive_narrator_line_retry_query(payload, raw_line)
             raw_line = await GEMINI_PASSIVE_COMMENTARY_CLIENT.run_turn(
                 retry_query,
@@ -2898,7 +2940,9 @@ async def create_gemini_passive_commentary_line(payload: GeminiPassiveNarratorRe
         logger.exception("Gemini passive narrator request failed unexpectedly")
         raise HTTPException(status_code=503, detail=f"Gemini passive narrator failed: {exc}") from exc
 
-    if is_passive_narrator_line_repetitive(line, payload.recent_lines):
+    if is_passive_narrator_line_repetitive(line, payload.recent_lines) or is_passive_narrator_line_too_vague(
+        line, payload
+    ):
         line = fallback
     if not line:
         line = fallback

@@ -8521,9 +8521,9 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     if context.phase == .opening {
       return pickDistinctPassiveNarratorOption(
         [
-          "The board is set, and the trouble is only beginning.",
-          "Two plans take the stage now, quiet and dangerous.",
-          "The pieces are awake. The story begins with a stare."
+          "The center is still untouched, but both kings already have a future to answer for.",
+          "Development has not begun, and already the center is waiting for a fight.",
+          "Before the first clash, the center and the kings are already part of the story."
         ],
         extraAvoiding: additionalLines
       )
@@ -8532,9 +8532,9 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     if context.isCheckmate {
       return pickDistinctPassiveNarratorOption(
         [
-          "And just like that, the argument is over.",
-          "The board goes still. There is no answer left.",
-          "One side has run out of road and out of time."
+          "The king has no shelter left, and no square left worth naming.",
+          "That king has run out of squares, and the whole position folds with him.",
+          "The mating net closes because the king has nowhere clean to run."
         ],
         extraAvoiding: additionalLines
       )
@@ -8543,9 +8543,9 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     if context.isCheck {
       return pickDistinctPassiveNarratorOption(
         [
-          "The air changes. A king is suddenly short on comfort.",
-          "That move asks a direct and deeply unpleasant question.",
-          "Pressure has become immediate now."
+          "The king is in check now, and the defenders are late to the square.",
+          "That move reaches the king directly and leaves the defenders scrambling.",
+          "The king has been forced into the conversation, and the cover around him is thinner."
         ],
         extraAvoiding: additionalLines
       )
@@ -8555,14 +8555,14 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       return pickDistinctPassiveNarratorOption(
         evalDelta > 0
           ? [
-            "Momentum leans a little harder to one side now.",
-            "That was no routine move. The balance just shifted.",
-            "A quiet edge has turned into real momentum."
+            "That move improves the coordination, and now one side owns more of the center.",
+            "The balance shifts because one army is suddenly working on the same squares.",
+            "What looked tidy a moment ago now favors the side with the cleaner activity."
           ]
           : [
-            "Something important just slipped loose in that position.",
-            "The board has tilted, and not by accident.",
-            "A small mistake can sound very loud at moments like this."
+            "That slip loosens the coordination, and the better squares belong to the other side now.",
+            "The position tilts because one side has ceded too much space and too much timing.",
+            "A small error matters here because the loose piece and the weak squares arrive together."
           ],
         extraAvoiding: additionalLines
       )
@@ -8571,9 +8571,9 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     if context.isNearEnemyKing || context.isForkThreat {
       return pickDistinctPassiveNarratorOption(
         [
-          "There is danger in that shape now, even if it has not landed yet.",
-          "The pressure is gathering where a king can feel it.",
-          "That move leaves a threat hanging in the air."
+          "The king and the loose pieces around him are beginning to share the same danger.",
+          "That shape points straight at the king side, and the nearby defenders feel it too.",
+          "The threat is real now: too many targets sit on the same line of fire."
         ],
         extraAvoiding: additionalLines
       )
@@ -8582,9 +8582,9 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     if context.isRetreat {
       return pickDistinctPassiveNarratorOption(
         [
-          "Not every retreat is fear. Sometimes it is the start of a better plan.",
-          "The piece steps back, but the position keeps tightening.",
-          "A quiet move, perhaps, though not an unimportant one."
+          "The retreat yields ground, but it keeps the piece tied to its defenders.",
+          "That step back gives up space, yet it repairs a line that was starting to fray.",
+          "The piece withdraws, but the real point is to keep the structure from cracking."
         ],
         extraAvoiding: additionalLines
       )
@@ -8592,9 +8592,9 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
 
     return pickDistinctPassiveNarratorOption(
       [
-        "The board stays quiet, but the pressure does not.",
-        "Nothing flashy there, just a position growing heavier.",
-        "Even calm moves can leave a long echo."
+        "The center is still contested, and neither side has solved the coordination problem.",
+        "No piece falls, but the fight for space and clean development keeps tightening.",
+        "A quiet move, but it still changes which side owns the cleaner squares."
       ],
       extraAvoiding: additionalLines
     )
