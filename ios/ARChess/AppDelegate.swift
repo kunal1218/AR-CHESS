@@ -6288,9 +6288,8 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   // so the first eligible post-narrator move starts at 20%.
   private static let narratorChanceRampIncrement = 0.20
   private static let ambientPieceVoiceLineChance = 0.35
-  private static let passiveDialogueModeRollSides = 5
-  private static let pieceHistoryReactiveRollThreshold = 3
-  private static let narratorIndependentRollThreshold = 3
+  private static let defaultPieceHistoryReactiveChancePercent = 60
+  private static let defaultNarratorPieceReactiveChancePercent = 40
   private static let pieceDialogueHistoryWindow = 4
   private static let pieceVoiceLineCharacterLimit = 180
   private static let passiveNarratorCharacterLimit = 220
@@ -6412,6 +6411,10 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   @Published private(set) var coachLines: [String] = []
   @Published private(set) var pieceVoiceLines: [String] = []
   @Published private(set) var pieceVoiceStatusText = "Waiting for a move."
+  @Published private(set) var pieceDialogueModeStatusText = "Piece dialogue mode: waiting for a line."
+  @Published private(set) var narratorDialogueModeStatusText = "Narrator dialogue mode: waiting for a line."
+  @Published private(set) var pieceHistoryReactiveChancePercent = 60
+  @Published private(set) var narratorPieceReactiveChancePercent = 40
   @Published private(set) var topWorkers: [GeminiPieceRole] = []
   @Published private(set) var topTraitors: [GeminiPieceRole] = []
   @Published private(set) var stockfishDebugStatusText = "Open Stockfish debug to inspect engine candidates."
@@ -6700,6 +6703,8 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     coachLines = []
     pieceVoiceLines = []
     pieceVoiceStatusText = "Waiting for a move."
+    pieceDialogueModeStatusText = "Piece dialogue mode: waiting for a line."
+    narratorDialogueModeStatusText = "Narrator dialogue mode: waiting for a line."
     autonomousDialogueMemory = []
     latestAutomaticCommentaryRequestID = 0
     queuedAutomaticCommentaryDecision = nil
@@ -7628,6 +7633,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   }
 
   private func buildPassiveNarratorLineContext(forOpening state: ChessGameState) -> GeminiPassiveNarratorLineContext {
+    narratorDialogueModeStatusText = "Narrator dialogue mode: independent opening line."
     GeminiPassiveNarratorLineContext(
       fen: state.fenString,
       recentHistory: recentHistoryProvider?(),
@@ -8098,26 +8104,51 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       .flatMap { autonomousDialoguePayload(from: $0) }
   }
 
+  func setPieceHistoryReactiveChancePercent(_ percent: Int) {
+    pieceHistoryReactiveChancePercent = min(max(percent, 0), 100)
+  }
+
+  func setNarratorPieceReactiveChancePercent(_ percent: Int) {
+    narratorPieceReactiveChancePercent = min(max(percent, 0), 100)
+  }
+
+  func resetPassiveDialogueModeOddsToDefaults() {
+    pieceHistoryReactiveChancePercent = Self.defaultPieceHistoryReactiveChancePercent
+    narratorPieceReactiveChancePercent = Self.defaultNarratorPieceReactiveChancePercent
+  }
+
   private func choosePieceDialogueMode(hasHistory: Bool) -> PieceDialogueMode {
     guard hasHistory else {
+      pieceDialogueModeStatusText = "Piece dialogue mode: independent because no recent piece chatter is available."
       return .independent
     }
 
-    // Pieces mostly sound aware of other pieces, but they still get fresh beats 2/5 of the time.
-    return Int.random(in: 0..<Self.passiveDialogueModeRollSides) < Self.pieceHistoryReactiveRollThreshold
+    let reactiveChance = Double(pieceHistoryReactiveChancePercent) / 100.0
+    let mode: PieceDialogueMode = Double.random(in: 0..<1) < reactiveChance
       ? .historyReactive
       : .independent
+    let independentChancePercent = max(0, 100 - pieceHistoryReactiveChancePercent)
+    pieceDialogueModeStatusText = mode == .historyReactive
+      ? "Piece dialogue mode: with context (\(pieceHistoryReactiveChancePercent)% setting)."
+      : "Piece dialogue mode: fresh line (\(independentChancePercent)% complement)."
+    return mode
   }
 
   private func chooseNarratorDialogueMode(hasLatestPieceLine: Bool) -> PassiveNarratorDialogueMode {
     guard hasLatestPieceLine else {
+      narratorDialogueModeStatusText = "Narrator dialogue mode: independent because no recent piece line is available."
       return .independent
     }
 
-    // The narrator stays mostly independent and only reacts to a piece line 2/5 of the time.
-    return Int.random(in: 0..<Self.passiveDialogueModeRollSides) < Self.narratorIndependentRollThreshold
-      ? .independent
-      : .pieceReactive
+    let reactiveChance = Double(narratorPieceReactiveChancePercent) / 100.0
+    let mode: PassiveNarratorDialogueMode = Double.random(in: 0..<1) < reactiveChance
+      ? .pieceReactive
+      : .independent
+    let independentChancePercent = max(0, 100 - narratorPieceReactiveChancePercent)
+    narratorDialogueModeStatusText = mode == .pieceReactive
+      ? "Narrator dialogue mode: reacting to a piece line (\(narratorPieceReactiveChancePercent)% setting)."
+      : "Narrator dialogue mode: independent (\(independentChancePercent)% complement)."
+    return mode
   }
 
   private func recentPieceVoiceLines(
@@ -11899,7 +11930,7 @@ private struct NativeARExperienceView: View {
 
   private var voiceStackPanel: some View {
     debugOverlayCard {
-      VStack(alignment: .leading, spacing: 10) {
+      VStack(alignment: .leading, spacing: 14) {
         Text("Voice line stack")
           .font(.system(size: 12, weight: .bold, design: .rounded))
           .tracking(1.8)
@@ -11910,20 +11941,152 @@ private struct NativeARExperienceView: View {
           .foregroundStyle(Color(red: 0.80, green: 0.88, blue: 0.95))
           .lineSpacing(2)
 
-        if commentary.pieceVoiceLines.isEmpty {
-          Text("No automatic commentary yet. Make a move to trigger one.")
-            .font(.system(size: 13, weight: .medium, design: .rounded))
+        VStack(alignment: .leading, spacing: 10) {
+          Text("Dialogue settings")
+            .font(.system(size: 12, weight: .bold, design: .rounded))
+            .foregroundStyle(Color.white.opacity(0.88))
+
+          Text("These odds only control whether a chosen speaker reacts to recent piece dialogue or stays fresh. They do not change when narrator vs piece gets selected to talk.")
+            .font(.system(size: 12, weight: .medium, design: .rounded))
+            .foregroundStyle(Color.white.opacity(0.68))
+            .lineSpacing(2)
+
+          dialogueOddsControl(
+            title: "Piece uses piece context",
+            contextualPercent: commentary.pieceHistoryReactiveChancePercent,
+            independentLabel: "Fresh piece line",
+            independentPercent: max(0, 100 - commentary.pieceHistoryReactiveChancePercent),
+            accent: Color(red: 0.80, green: 0.92, blue: 0.84),
+            value: pieceHistoryReactiveChanceBinding
+          )
+
+          Text(commentary.pieceDialogueModeStatusText)
+            .font(.system(size: 11, weight: .medium, design: .monospaced))
             .foregroundStyle(Color.white.opacity(0.72))
-        } else {
-          ForEach(Array(commentary.pieceVoiceLines.reversed().enumerated()), id: \.offset) { _, line in
-            Text(line)
-              .font(.system(size: 13, weight: .semibold, design: .rounded))
-              .foregroundStyle(Color(red: 0.86, green: 0.94, blue: 0.88))
-              .lineSpacing(2)
+            .lineSpacing(2)
+
+          dialogueOddsControl(
+            title: "Narrator reacts to latest piece line",
+            contextualPercent: commentary.narratorPieceReactiveChancePercent,
+            independentLabel: "Independent narrator line",
+            independentPercent: max(0, 100 - commentary.narratorPieceReactiveChancePercent),
+            accent: Color(red: 0.95, green: 0.84, blue: 0.66),
+            value: narratorPieceReactiveChanceBinding
+          )
+
+          Text(commentary.narratorDialogueModeStatusText)
+            .font(.system(size: 11, weight: .medium, design: .monospaced))
+            .foregroundStyle(Color.white.opacity(0.72))
+            .lineSpacing(2)
+
+          ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+              dialoguePresetButton(title: "Defaults") {
+                commentary.resetPassiveDialogueModeOddsToDefaults()
+              }
+
+              dialoguePresetButton(title: "Context Heavy") {
+                commentary.setPieceHistoryReactiveChancePercent(100)
+                commentary.setNarratorPieceReactiveChancePercent(100)
+              }
+
+              dialoguePresetButton(title: "Fresh Only") {
+                commentary.setPieceHistoryReactiveChancePercent(0)
+                commentary.setNarratorPieceReactiveChancePercent(0)
+              }
+            }
+          }
+        }
+
+        Divider()
+          .overlay(Color.white.opacity(0.10))
+
+        VStack(alignment: .leading, spacing: 8) {
+          Text("Recent lines")
+            .font(.system(size: 12, weight: .bold, design: .rounded))
+            .foregroundStyle(Color.white.opacity(0.88))
+
+          if commentary.pieceVoiceLines.isEmpty {
+            Text("No automatic commentary yet. Make a move to trigger one.")
+              .font(.system(size: 13, weight: .medium, design: .rounded))
+              .foregroundStyle(Color.white.opacity(0.72))
+          } else {
+            ForEach(Array(commentary.pieceVoiceLines.reversed().enumerated()), id: \.offset) { _, line in
+              Text(line)
+                .font(.system(size: 13, weight: .semibold, design: .rounded))
+                .foregroundStyle(Color(red: 0.86, green: 0.94, blue: 0.88))
+                .lineSpacing(2)
+            }
           }
         }
       }
     }
+  }
+
+  private var pieceHistoryReactiveChanceBinding: Binding<Double> {
+    Binding(
+      get: { Double(commentary.pieceHistoryReactiveChancePercent) },
+      set: { commentary.setPieceHistoryReactiveChancePercent(Int($0.rounded())) }
+    )
+  }
+
+  private var narratorPieceReactiveChanceBinding: Binding<Double> {
+    Binding(
+      get: { Double(commentary.narratorPieceReactiveChancePercent) },
+      set: { commentary.setNarratorPieceReactiveChancePercent(Int($0.rounded())) }
+    )
+  }
+
+  private func dialogueOddsControl(
+    title: String,
+    contextualPercent: Int,
+    independentLabel: String,
+    independentPercent: Int,
+    accent: Color,
+    value: Binding<Double>
+  ) -> some View {
+    VStack(alignment: .leading, spacing: 6) {
+      HStack(alignment: .firstTextBaseline, spacing: 12) {
+        Text(title)
+          .font(.system(size: 12, weight: .semibold, design: .rounded))
+          .foregroundStyle(Color.white.opacity(0.90))
+
+        Spacer(minLength: 8)
+
+        Text("Context \(contextualPercent)%")
+          .font(.system(size: 11, weight: .bold, design: .monospaced))
+          .foregroundStyle(accent)
+      }
+
+      Slider(value: value, in: 0...100, step: 5)
+        .tint(accent)
+
+      Text("\(independentLabel): \(independentPercent)%")
+        .font(.system(size: 11, weight: .medium, design: .monospaced))
+        .foregroundStyle(Color.white.opacity(0.66))
+    }
+  }
+
+  private func dialoguePresetButton(
+    title: String,
+    action: @escaping () -> Void
+  ) -> some View {
+    Button(action: action) {
+      Text(title)
+        .font(.system(size: 11, weight: .bold, design: .rounded))
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .foregroundStyle(Color.white.opacity(0.92))
+        .background(
+          Capsule(style: .continuous)
+            .fill(Color.white.opacity(0.10))
+        )
+        .overlay(
+          Capsule(style: .continuous)
+            .stroke(Color.white.opacity(0.12), lineWidth: 1)
+        )
+    }
+    .buttonStyle(.plain)
   }
 
   private var stockfishDebugPanel: some View {
