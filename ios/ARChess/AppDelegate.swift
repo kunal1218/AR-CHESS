@@ -7634,7 +7634,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
 
   private func buildPassiveNarratorLineContext(forOpening state: ChessGameState) -> GeminiPassiveNarratorLineContext {
     narratorDialogueModeStatusText = "Narrator dialogue mode: independent opening line."
-    GeminiPassiveNarratorLineContext(
+    return GeminiPassiveNarratorLineContext(
       fen: state.fenString,
       recentHistory: recentHistoryProvider?(),
       recentLines: recentPassiveNarratorLines(),
