@@ -1147,6 +1147,19 @@ def is_piece_direct_address_line(text: str) -> bool:
     )
 
 
+def is_first_person_piece_voice_line(text: str) -> bool:
+    normalized = text.strip()
+    if not normalized:
+        return False
+    return bool(
+        re.search(
+            r"\b(?:i|i'm|i’ve|i'll|i’ll|i'd|i’d|me|my|mine|myself|we|we're|we’ve|we'll|we’ll|we'd|we’d|us|our|ours)\b",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
 def piece_dialogue_speaker_key(entry: GeminiDialogueUtterance) -> str:
     if entry.piece_identity:
         return entry.piece_identity.lower()
@@ -1243,6 +1256,8 @@ def choose_piece_voice_candidate(
             score -= 180 * memory.line_counts.get(fingerprint, 0)
         if pattern:
             score -= 18 * memory.pattern_counts.get(pattern, 0)
+        if line and not is_first_person_piece_voice_line(line):
+            score -= 320
         if is_piece_direct_address_line(line):
             score -= 110 * recent_direct_address_count
             if prompt_controls.avoid_direct_address:
@@ -1386,6 +1401,8 @@ def build_piece_voice_line_query(
     return (
         "You are generating a single short in-character voice line spoken by a selected chess piece. "
         "You must speak as the selected piece itself, not as a narrator. "
+        "Speak in first person from inside the battle. Use I, me, my, we, us, or our. "
+        "Do not describe yourself from a zoomed-out outside perspective. "
         "Pieces can hear other pieces. Pieces cannot hear or perceive the narrator. "
         "Your line must reflect: "
         "the piece's personality, the current tactical / positional context, whether the position is winning, equal, or losing, "

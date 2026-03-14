@@ -652,6 +652,7 @@ def test_build_piece_voice_line_query_uses_piece_only_dialogue_history() -> None
     )
 
     assert "Dialogue mode: history_reactive" in query
+    assert "Speak in first person from inside the battle." in query
     assert "Pieces can hear other pieces, but never the narrator." in query
     assert "Recent piece-only battlefield chatter you may react to:" in query
     assert "White Pawn on e4" in query

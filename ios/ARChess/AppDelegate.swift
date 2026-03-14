@@ -8108,6 +8108,16 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       || trimmed.range(of: namePattern, options: [.regularExpression, .caseInsensitive]) != nil
   }
 
+  private func isFirstPersonPieceVoiceLine(_ text: String) -> Bool {
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else {
+      return false
+    }
+
+    let pattern = #"\b(?:i|i'm|i’ve|i'll|i’ll|i'd|i’d|me|my|mine|myself|we|we're|we’ve|we'll|we’ll|we'd|we’d|us|our|ours)\b"#
+    return trimmed.range(of: pattern, options: [.regularExpression, .caseInsensitive]) != nil
+  }
+
   private func recentPieceDialogueLoopSignals(limit: Int = 4) -> (directAddressCount: Int, loopDetected: Bool) {
     let entries = recentPieceDialogueEntries(limit: limit)
     let directAddressCount = entries.reduce(into: 0) { count, entry in
@@ -8130,6 +8140,52 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     }
     let signals = recentPieceDialogueLoopSignals()
     return signals.loopDetected || signals.directAddressCount >= 2
+  }
+
+  private func firstPersonEmergencyPieceVoiceLine(
+    for plan: PieceVoiceRequestPlan,
+    avoiding additionalLines: [String] = []
+  ) -> String {
+    let options: [String]
+    switch plan.speaker {
+    case .pawn:
+      options = [
+        "I push forward and make this square mine.",
+        "I want blood, and I want it up close.",
+        "I keep marching until this file breaks.",
+      ]
+    case .rook:
+      options = [
+        "I grind forward and crush what stands here.",
+        "I own this lane now, and I mean to keep it.",
+        "I hit this file like a falling wall.",
+      ]
+    case .knight:
+      options = [
+        "I choose my angle, then I strike from it.",
+        "I leap where I please and call it elegance.",
+        "I turn one jump into real trouble.",
+      ]
+    case .bishop:
+      options = [
+        "I bring judgment down this diagonal myself.",
+        "I keep my faith and fire through it.",
+        "I claim this line in righteous force.",
+      ]
+    case .queen:
+      options = [
+        "I arrive, and the board starts obeying me.",
+        "I clean this mess up because clearly I must.",
+        "I make the threat, and they live with it.",
+      ]
+    case .king:
+      options = [
+        "I step carefully because I intend to survive this.",
+        "I move, and the whole fight bends around me.",
+        "I keep the crown by staying alive one move longer.",
+      ]
+    }
+    return pickDistinctPieceVoiceOption(options, for: plan.speaker, extraAvoiding: additionalLines)
   }
 
   private func autonomousDialoguePayload(
@@ -8358,6 +8414,13 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   ) {
     var resolvedText = text
     var resolvedStatusPrefix = statusPrefix
+    if !isFirstPersonPieceVoiceLine(resolvedText) {
+      appendGeminiDebug(
+        "Suppressed non-first-person piece line for \(plan.speaker.displayName.lowercased()); using a first-person local fallback."
+      )
+      resolvedText = firstPersonEmergencyPieceVoiceLine(for: plan, avoiding: [resolvedText])
+      resolvedStatusPrefix = "Fallback"
+    }
     if shouldSuppressLoopLikePieceLine(resolvedText) {
       appendGeminiDebug(
         "Suppressed loop-like direct-address piece line for \(plan.speaker.displayName.lowercased()); using a loop-safe local fallback."
