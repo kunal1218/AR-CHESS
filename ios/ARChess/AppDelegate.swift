@@ -568,6 +568,8 @@ private struct GeminiPieceVoiceLineRequestPayload: Encodable {
   let eval_delta: Int?
   let position_state: String
   let move_quality: String
+  let piece_move_count: Int
+  let underutilized_reason: String?
 }
 
 private struct GeminiPassiveNarratorLineRequestPayload: Encodable {
@@ -690,6 +692,7 @@ private enum AutonomousDialogueSpeakerClass: String {
 private enum PieceDialogueMode: String {
   case historyReactive = "history_reactive"
   case independent
+  case underutilizedSnark = "underutilized_snark"
 }
 
 private enum PassiveNarratorDialogueMode: String {
@@ -735,6 +738,8 @@ private struct GeminiPieceVoiceLineContext {
   let evalDelta: Int?
   let positionState: PieceVoicePositionState
   let moveQuality: PieceVoiceMoveQuality
+  let pieceMoveCount: Int
+  let underutilizedReason: String?
 }
 
 private enum PassiveNarratorPhase: String {
@@ -2631,7 +2636,9 @@ private final class GeminiHintService {
         eval_after: context.evalAfter,
         eval_delta: context.evalDelta,
         position_state: context.positionState.rawValue,
-        move_quality: context.moveQuality.rawValue
+        move_quality: context.moveQuality.rawValue,
+        piece_move_count: context.pieceMoveCount,
+        underutilized_reason: context.underutilizedReason
       )
     )
 
@@ -6291,6 +6298,9 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   // so the first eligible post-narrator move starts at 10%.
   private static let narratorChanceRampIncrement = 0.10
   private static let ambientPieceVoiceLineChance = 0.35
+  private static let underutilizedSnarkEvalDeltaThreshold = 40
+  private static let underutilizedSnarkTriggerChance = 0.75
+  private static let underutilizedSnarkPoolSize = 5
   private static let defaultPieceHistoryReactiveChancePercent = 60
   private static let defaultNarratorPieceReactiveChancePercent = 40
   private static let pieceDialogueHistoryWindow = 4
@@ -6328,7 +6338,9 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     evalAfter: 18,
     evalDelta: 18,
     positionState: .equal,
-    moveQuality: .aggressive
+    moveQuality: .aggressive,
+    pieceMoveCount: 0,
+    underutilizedReason: nil
   )
 
   struct ReactionCue {
@@ -6394,6 +6406,14 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     let resetsNarratorRamp: Bool
     let marksOpeningNarrationDelivered: Bool
     let reason: String
+  }
+
+  private struct UnderutilizedPieceCandidate {
+    let square: BoardSquare
+    let piece: ChessPieceState
+    let moveCount: Int
+    let mobility: Int
+    let underutilizedReason: String
   }
 
   private struct PendingGeneratedNarration {
@@ -6476,6 +6496,9 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   private var queuedAutomaticCommentaryDecision: AutomaticCommentaryDecision?
   private var liveNarratorPlaybackOwnsCaption = false
   private var autonomousDialogueMemory: [AutonomousDialogueMemoryEntry] = []
+  private var trackedPieceInstanceIDsBySquare: [BoardSquare: String] = [:]
+  private var trackedPieceMoveCountsByID: [String: Int] = [:]
+  private var nextTrackedPieceInstanceSerial = 0
 
   init(narrator: NarratorType = .silky) {
     self.narrator = narrator
@@ -6710,6 +6733,9 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     pieceDialogueModeStatusText = "Piece dialogue mode: waiting for a line."
     narratorDialogueModeStatusText = "Narrator dialogue mode: waiting for a line."
     autonomousDialogueMemory = []
+    trackedPieceInstanceIDsBySquare = [:]
+    trackedPieceMoveCountsByID = [:]
+    nextTrackedPieceInstanceSerial = 0
     latestAutomaticCommentaryRequestID = 0
     queuedAutomaticCommentaryDecision = nil
     liveNarratorPlaybackOwnsCaption = false
@@ -6943,6 +6969,8 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   }
 
   private func triggerAutomaticCommentary(for trigger: AutomaticCommentaryTrigger) {
+    prepareAutomaticCommentaryState(for: trigger)
+
     // Passive automatic commentary is mutually exclusive per event: narrator, piece, or silence.
     // The mic-driven coach flow remains separate and intentionally untouched.
     let decision = decideCommentaryEvent(for: trigger)
@@ -6951,6 +6979,89 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       return
     }
     applyAutomaticCommentaryDecision(decision)
+  }
+
+  private func prepareAutomaticCommentaryState(for trigger: AutomaticCommentaryTrigger) {
+    switch trigger {
+    case .opening(let state):
+      ensurePieceMoveTrackingMatches(state)
+    case .move(let move, let beforeState, let afterState):
+      ensurePieceMoveTrackingMatches(beforeState)
+      applyMoveToPieceTracking(move: move, after: afterState)
+    }
+  }
+
+  private func ensurePieceMoveTrackingMatches(_ state: ChessGameState) {
+    let occupiedSquares = Set(state.board.keys)
+    let trackedSquares = Set(trackedPieceInstanceIDsBySquare.keys)
+    guard occupiedSquares == trackedSquares else {
+      rebuildPieceMoveTracking(for: state)
+      return
+    }
+
+    for square in occupiedSquares where trackedPieceInstanceIDsBySquare[square] == nil {
+      rebuildPieceMoveTracking(for: state)
+      return
+    }
+  }
+
+  private func rebuildPieceMoveTracking(for state: ChessGameState) {
+    trackedPieceInstanceIDsBySquare = [:]
+    trackedPieceMoveCountsByID = [:]
+
+    let orderedSquares = state.board.keys.sorted {
+      if $0.rank == $1.rank {
+        return $0.file < $1.file
+      }
+      return $0.rank < $1.rank
+    }
+
+    for square in orderedSquares {
+      let pieceID = makeTrackedPieceInstanceID()
+      trackedPieceInstanceIDsBySquare[square] = pieceID
+      trackedPieceMoveCountsByID[pieceID] = 0
+    }
+  }
+
+  private func makeTrackedPieceInstanceID() -> String {
+    nextTrackedPieceInstanceSerial += 1
+    return "piece_\(nextTrackedPieceInstanceSerial)"
+  }
+
+  private func applyMoveToPieceTracking(move: ChessMove, after afterState: ChessGameState) {
+    guard let movingPieceID = trackedPieceInstanceIDsBySquare.removeValue(forKey: move.from) else {
+      rebuildPieceMoveTracking(for: afterState)
+      return
+    }
+
+    if let capturedSquare = trackingCapturedSquare(for: move) {
+      trackedPieceInstanceIDsBySquare.removeValue(forKey: capturedSquare)
+    }
+
+    trackedPieceMoveCountsByID[movingPieceID, default: 0] += 1
+    trackedPieceInstanceIDsBySquare[move.to] = movingPieceID
+
+    if let rookMove = move.rookMove,
+       let rookID = trackedPieceInstanceIDsBySquare.removeValue(forKey: rookMove.from) {
+      trackedPieceMoveCountsByID[rookID, default: 0] += 1
+      trackedPieceInstanceIDsBySquare[rookMove.to] = rookID
+    }
+
+    let survivingSquares = Set(afterState.board.keys)
+    trackedPieceInstanceIDsBySquare = Dictionary(
+      uniqueKeysWithValues: trackedPieceInstanceIDsBySquare.filter { survivingSquares.contains($0.key) }
+    )
+
+    if Set(trackedPieceInstanceIDsBySquare.keys) != survivingSquares {
+      rebuildPieceMoveTracking(for: afterState)
+    }
+  }
+
+  private func trackingCapturedSquare(for move: ChessMove) -> BoardSquare? {
+    if move.isEnPassant {
+      return BoardSquare(file: move.to.file, rank: move.from.rank)
+    }
+    return move.captured == nil ? nil : move.to
   }
 
   private func decideCommentaryEvent(for trigger: AutomaticCommentaryTrigger) -> AutomaticCommentaryDecision {
@@ -6984,7 +7095,8 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
             move: move,
             before: beforeState,
             after: afterState,
-            allowAmbient: false
+            allowAmbient: false,
+            allowUnderutilizedSnark: false
           ),
           piecePriority: .normal,
           incrementsNarratorRamp: false,
@@ -7032,20 +7144,24 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       }
 
       // When the narrator does not win a normal move, the moved piece now always gets the line.
+      let piecePlan = makePieceVoiceRequestPlan(
+        move: move,
+        before: beforeState,
+        after: afterState,
+        allowAmbient: false,
+        allowUnderutilizedSnark: true
+      )
       return AutomaticCommentaryDecision(
         kind: .piece,
         narratorContext: nil,
-        piecePlan: makePieceVoiceRequestPlan(
-          move: move,
-          before: beforeState,
-          after: afterState,
-          allowAmbient: false
-        ),
+        piecePlan: piecePlan,
         piecePriority: .normal,
         incrementsNarratorRamp: true,
         resetsNarratorRamp: false,
         marksOpeningNarrationDelivered: false,
-        reason: "Narrator passed; the moved piece takes the line."
+        reason: piecePlan.context.dialogueMode == .underutilizedSnark
+          ? "Narrator passed; a neglected piece cuts in with underutilized snark."
+          : "Narrator passed; the moved piece takes the line."
       )
     }
   }
@@ -7466,11 +7582,13 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     appendGeminiDebug("Automatic commentary chose piece: \(reason)")
     appendGeminiDebug("Triggering Gemini piece voice for \(plan.label).")
     appendGeminiDebug(
-      "Piece voice context piece=\(plan.speaker.displayName.lowercased()) mode=\(plan.context.contextMode.rawValue) " +
+      "Piece voice context piece=\(plan.speaker.displayName.lowercased()) context=\(plan.context.contextMode.rawValue) " +
+        "dialogue=\(plan.context.dialogueMode.rawValue) " +
         "move=\(plan.context.fromSquare.algebraic)->\(plan.context.toSquare.algebraic) " +
         "capture=\(plan.context.isCapture) check=\(plan.context.isCheck) nearKing=\(plan.context.isNearEnemyKing) " +
         "attacked=\(plan.context.attackerCount) defended=\(plan.context.defenderCount) " +
-        "state=\(plan.context.positionState.rawValue) quality=\(plan.context.moveQuality.rawValue)"
+        "state=\(plan.context.positionState.rawValue) quality=\(plan.context.moveQuality.rawValue)" +
+        (plan.context.underutilizedReason.map { " cue=\($0)" } ?? "")
     )
 
     automaticCommentaryRequestTask = Task { @MainActor [weak self] in
@@ -7723,7 +7841,8 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     move: ChessMove,
     before beforeState: ChessGameState,
     after afterState: ChessGameState,
-    allowAmbient: Bool
+    allowAmbient: Bool,
+    allowUnderutilizedSnark: Bool
   ) -> PieceVoiceRequestPlan {
     if allowAmbient,
        shouldTriggerAmbientPieceVoiceLine(),
@@ -7755,6 +7874,15 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       )
     }
 
+    if allowUnderutilizedSnark,
+       let underutilizedPlan = makeUnderutilizedPieceVoiceRequestPlan(
+        move: move,
+        before: beforeState,
+        after: afterState
+       ) {
+      return underutilizedPlan
+    }
+
     let speaker = personalitySpeaker(for: move.piece.kind)
     let recentLines = recentPieceVoiceLines(for: speaker)
     let pieceHistory = recentPieceDialogueHistory()
@@ -7777,6 +7905,244 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       context: context,
       label: "\(speaker.displayName.lowercased()) moved \(move.from.algebraic)-\(move.to.algebraic)"
     )
+  }
+
+  private func makeUnderutilizedPieceVoiceRequestPlan(
+    move: ChessMove,
+    before beforeState: ChessGameState,
+    after afterState: ChessGameState
+  ) -> PieceVoiceRequestPlan? {
+    let movedPieceContext = buildPieceVoiceLineContext(
+      speakingSquare: move.to,
+      piece: move.piece,
+      contextMode: .moved,
+      before: beforeState,
+      after: afterState,
+      referenceMove: move
+    )
+
+    guard let evalDelta = movedPieceContext.evalDelta,
+          abs(evalDelta) <= Self.underutilizedSnarkEvalDeltaThreshold else {
+      return nil
+    }
+
+    // Quiet moves are the moments when neglected pieces are most likely to cut in with snark.
+    guard Double.random(in: 0..<1) < Self.underutilizedSnarkTriggerChance else {
+      return nil
+    }
+
+    let eligibleCandidates = underutilizedPieceCandidates(
+      in: afterState,
+      for: move.piece.color,
+      excluding: move.to
+    )
+    let pool = Array(eligibleCandidates.prefix(Self.underutilizedSnarkPoolSize))
+    guard let selected = selectWeightedUnderutilizedPieceCandidate(from: pool) else {
+      return nil
+    }
+
+    let speaker = personalitySpeaker(for: selected.piece.kind)
+    let recentLines = recentPieceVoiceLines(for: speaker)
+    pieceDialogueModeStatusText = (
+      "Piece dialogue mode: underutilized snark from \(speaker.displayName.lowercased()) on \(selected.square.algebraic)."
+    )
+
+    let context = buildPieceVoiceLineContext(
+      speakingSquare: selected.square,
+      piece: selected.piece,
+      contextMode: .ambient,
+      before: beforeState,
+      after: afterState,
+      referenceMove: move,
+      recentLines: recentLines,
+      dialogueMode: .underutilizedSnark,
+      pieceMoveCount: selected.moveCount,
+      underutilizedReason: selected.underutilizedReason
+    )
+    return PieceVoiceRequestPlan(
+      speaker: speaker,
+      context: context,
+      label: "\(speaker.displayName.lowercased()) snarking from \(selected.square.algebraic)"
+    )
+  }
+
+  private func underutilizedPieceCandidates(
+    in state: ChessGameState,
+    for color: ChessColor,
+    excluding movedSquare: BoardSquare
+  ) -> [UnderutilizedPieceCandidate] {
+    let speakerState = stateByReplacingTurn(in: state, with: color)
+
+    return state.board
+      .compactMap { square, piece -> UnderutilizedPieceCandidate? in
+        guard piece.color == color,
+              piece.kind != .king,
+              square != movedSquare,
+              let pieceID = trackedPieceInstanceIDsBySquare[square] else {
+          return nil
+        }
+
+        let moveCount = trackedPieceMoveCountsByID[pieceID, default: 0]
+        let mobility = speakerState.legalMoves(from: square).count
+        let reason = underutilizedReason(
+          for: square,
+          piece: piece,
+          moveCount: moveCount,
+          mobility: mobility,
+          in: state
+        )
+        return UnderutilizedPieceCandidate(
+          square: square,
+          piece: piece,
+          moveCount: moveCount,
+          mobility: mobility,
+          underutilizedReason: reason
+        )
+      }
+      .sorted { left, right in
+        if left.moveCount != right.moveCount {
+          return left.moveCount < right.moveCount
+        }
+        if left.mobility != right.mobility {
+          return left.mobility < right.mobility
+        }
+        if left.piece.kind == .pawn, right.piece.kind != .pawn {
+          return false
+        }
+        if left.piece.kind != .pawn, right.piece.kind == .pawn {
+          return true
+        }
+        if left.square.rank == right.square.rank {
+          return left.square.file < right.square.file
+        }
+        return left.square.rank < right.square.rank
+      }
+  }
+
+  private func selectWeightedUnderutilizedPieceCandidate(
+    from candidates: [UnderutilizedPieceCandidate]
+  ) -> UnderutilizedPieceCandidate? {
+    guard !candidates.isEmpty else {
+      return nil
+    }
+
+    let weightedCandidates = candidates.map { candidate in
+      (candidate: candidate, weight: underutilizedPieceWeight(for: candidate.piece.kind))
+    }
+    let totalWeight = weightedCandidates.reduce(0) { $0 + $1.weight }
+    guard totalWeight > 0 else {
+      return candidates.randomElement()
+    }
+
+    var threshold = Double.random(in: 0..<totalWeight)
+    for candidate in weightedCandidates {
+      threshold -= candidate.weight
+      if threshold <= 0 {
+        return candidate.candidate
+      }
+    }
+
+    return weightedCandidates.last?.candidate
+  }
+
+  private func underutilizedPieceWeight(for kind: ChessPieceKind) -> Double {
+    // Non-pawns are intentionally favored so idle minors and rooks speak more often than reserve pawns.
+    switch kind {
+    case .pawn:
+      return 1.0
+    case .knight, .bishop:
+      return 3.2
+    case .rook:
+      return 3.6
+    case .queen:
+      return 2.8
+    case .king:
+      return 0.0
+    }
+  }
+
+  private func underutilizedReason(
+    for square: BoardSquare,
+    piece: ChessPieceState,
+    moveCount: Int,
+    mobility: Int,
+    in state: ChessGameState
+  ) -> String {
+    let isBackRank = piece.color == .white ? square.rank == 0 : square.rank == 7
+    let ownBlockersAhead = ownBlockersInFront(of: square, piece: piece, in: state)
+
+    switch piece.kind {
+    case .pawn:
+      if moveCount == 0 {
+        return "still waiting for the march order"
+      }
+      return "left idle while the battle keeps moving"
+    case .knight:
+      if moveCount == 0 {
+        return "kept in reserve while the fight begins"
+      }
+      if mobility <= 2 {
+        return "stabled without a proper jump"
+      }
+      return "left waiting while clumsier pieces get the glory"
+    case .bishop:
+      if mobility <= 2 || ownBlockersAhead >= 1 {
+        return "boxed in with no clean diagonal"
+      }
+      return "left preaching from the back while the lines stay closed"
+    case .rook:
+      if isBackRank {
+        return mobility <= 2 ? "stuck on the back rank with no open file" : "kept on the back rank without a real file"
+      }
+      return mobility <= 2 ? "waiting for an open file" : "left idle while the files stay shut"
+    case .queen:
+      if moveCount == 0 {
+        return "left on the bench while lesser pieces fumble"
+      }
+      return mobility <= 3 ? "stuck behind my own traffic" : "kept waiting while others make a meal of this"
+    case .king:
+      return "left sulking behind the line"
+    }
+  }
+
+  private func ownBlockersInFront(
+    of square: BoardSquare,
+    piece: ChessPieceState,
+    in state: ChessGameState
+  ) -> Int {
+    switch piece.kind {
+    case .pawn:
+      let direction = piece.color == .white ? 1 : -1
+      guard let oneForward = square.offset(file: 0, rank: direction),
+            let blocker = state.piece(at: oneForward),
+            blocker.color == piece.color else {
+        return 0
+      }
+      return 1
+    case .bishop:
+      return [(-1, 1), (1, 1), (-1, -1), (1, -1)].reduce(0) { count, delta in
+        guard let target = square.offset(file: delta.0, rank: delta.1),
+              let blocker = state.piece(at: target),
+              blocker.color == piece.color else {
+          return count
+        }
+        return count + 1
+      }
+    case .rook:
+      return [(0, 1), (0, -1), (-1, 0), (1, 0)].reduce(0) { count, delta in
+        guard let target = square.offset(file: delta.0, rank: delta.1),
+              let blocker = state.piece(at: target),
+              blocker.color == piece.color else {
+          return count
+        }
+        return count + 1
+      }
+    case .queen:
+      return ownBlockersInFront(of: square, piece: ChessPieceState(color: piece.color, kind: .rook), in: state)
+        + ownBlockersInFront(of: square, piece: ChessPieceState(color: piece.color, kind: .bishop), in: state)
+    case .knight, .king:
+      return 0
+    }
   }
 
   private func shouldTriggerAmbientPieceVoiceLine() -> Bool {
@@ -7874,7 +8240,9 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     recentLines: [String] = [],
     dialogueMode: PieceDialogueMode = .independent,
     pieceDialogueHistory: [GeminiDialogueUtterancePayload] = [],
-    latestPieceLine: GeminiDialogueUtterancePayload? = nil
+    latestPieceLine: GeminiDialogueUtterancePayload? = nil,
+    pieceMoveCount: Int = 0,
+    underutilizedReason: String? = nil
   ) -> GeminiPieceVoiceLineContext {
     let moverColor = piece.color
     let opponent = moverColor.opponent
@@ -7977,7 +8345,9 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
         isAttacked: isAttacked,
         isRetreat: isRetreat,
         isForkThreat: isForkThreat
-      )
+      ),
+      pieceMoveCount: pieceMoveCount,
+      underutilizedReason: underutilizedReason
     )
   }
 
@@ -8605,6 +8975,84 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     avoiding additionalLines: [String] = []
   ) -> String {
     let context = plan.context
+    let underutilizedCue = context.underutilizedReason?.lowercased() ?? ""
+
+    if context.dialogueMode == .underutilizedSnark {
+      switch plan.speaker {
+      case .pawn:
+        return pickDistinctPieceVoiceOption(
+          [
+            "Point me at something worth dying for.",
+            "I am still here waiting for a proper march.",
+            "I did not join this war to rot in place.",
+          ],
+          for: plan.speaker,
+          extraAvoiding: additionalLines
+        )
+      case .rook:
+        return pickDistinctPieceVoiceOption(
+          underutilizedCue.contains("file")
+            ? [
+              "I have no file and no fight.",
+              "I am still caged behind a dead file.",
+              "Give me a file or stop pretending I matter.",
+            ]
+            : [
+              "I am wasting away on the back rank.",
+              "I was built for files, not bench duty.",
+              "I am all tower and no battlefield.",
+            ],
+          for: plan.speaker,
+          extraAvoiding: additionalLines
+        )
+      case .knight:
+        return pickDistinctPieceVoiceOption(
+          [
+            "I am a noble steed, wasted in reserve.",
+            "I remain leashed while plainer creatures blunder ahead.",
+            "I was promised glory, not storage.",
+          ],
+          for: plan.speaker,
+          extraAvoiding: additionalLines
+        )
+      case .bishop:
+        return pickDistinctPieceVoiceOption(
+          underutilizedCue.contains("diagonal")
+            ? [
+              "I have had ample time to study blocked diagonals.",
+              "My diagonal is sealed, and still I wait.",
+              "I preach to pawns because no line will open.",
+            ]
+            : [
+              "I have had plenty of time to read the good book back here.",
+              "I am all scripture and no battlefield.",
+              "Even I tire of blessing traffic.",
+            ],
+          for: plan.speaker,
+          extraAvoiding: additionalLines
+        )
+      case .queen:
+        return pickDistinctPieceVoiceOption(
+          [
+            "Must I win this from the bench?",
+            "I am still waiting while lesser pieces improvise.",
+            "I do adore being ignored until disaster arrives.",
+          ],
+          for: plan.speaker,
+          extraAvoiding: additionalLines
+        )
+      case .king:
+        return pickDistinctPieceVoiceOption(
+          [
+            "I am safer when forgotten, frankly.",
+            "I prefer neglect to catastrophe.",
+          ],
+          for: plan.speaker,
+          extraAvoiding: additionalLines
+        )
+      }
+    }
+
     let loopSignals = recentPieceDialogueLoopSignals()
     if context.dialogueMode == .historyReactive, context.latestPieceLine != nil {
       return pickDistinctPieceVoiceOption(

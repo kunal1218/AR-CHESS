@@ -666,6 +666,61 @@ def test_build_piece_voice_line_query_uses_piece_only_dialogue_history() -> None
     assert "Conversation loop detected: no" in query
 
 
+def test_build_piece_voice_line_query_supports_underutilized_snark_mode() -> None:
+    from main import GeminiPieceVoiceRequest, PieceDialoguePromptControls, build_piece_voice_line_query
+
+    payload = GeminiPieceVoiceRequest(
+        fen="r1bqkbnr/pppp1ppp/2n5/4p3/3PP3/5N2/PPP2PPP/RNBQKB1R w KQkq - 2 3",
+        piece_type="rook",
+        piece_color="white",
+        recent_lines=["I move once. The whole file shudders."],
+        dialogue_mode="underutilized_snark",
+        context_mode="ambient",
+        from_square="a1",
+        to_square="a1",
+        is_capture=False,
+        is_check=False,
+        is_near_enemy_king=False,
+        is_attacked=False,
+        is_attacked_by_multiple=False,
+        is_defended=True,
+        is_well_defended=True,
+        is_hanging=False,
+        is_pinned=False,
+        is_retreat=False,
+        is_aggressive_advance=False,
+        is_fork_threat=False,
+        attacker_count=0,
+        defender_count=2,
+        eval_before=12,
+        eval_after=18,
+        eval_delta=6,
+        position_state="equal",
+        move_quality="routine",
+        piece_move_count=0,
+        underutilized_reason="stuck on the back rank with no open file",
+    )
+
+    query = build_piece_voice_line_query(
+        payload,
+        prompt_controls=PieceDialoguePromptControls(
+            dialogue_intent="dismiss",
+            line_style="clipped",
+            focus_target="self",
+            emotional_flavor="smug",
+            avoid_direct_address=False,
+            conversation_loop_detected=False,
+        ),
+    )
+
+    assert "Dialogue mode: underutilized_snark" in query
+    assert "least-used pieces and you are finally speaking up" in query
+    assert "Do not sound like a coach" in query
+    assert "Piece move count so far: 0" in query
+    assert "Complaint cue: stuck on the back rank with no open file" in query
+    assert "You are not commenting on the move you just made." in query
+
+
 def test_build_piece_dialogue_prompt_controls_detects_ping_pong_loop() -> None:
     from main import GeminiPieceVoiceRequest, build_piece_dialogue_prompt_controls
 

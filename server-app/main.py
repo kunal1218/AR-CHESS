@@ -458,6 +458,8 @@ class GeminiPieceVoiceRequest(BaseModel):
     eval_delta: int | None = Field(default=None, ge=-100000, le=100000)
     position_state: str = Field(..., min_length=1, max_length=16)
     move_quality: str = Field(..., min_length=1, max_length=32)
+    piece_move_count: int = Field(default=0, ge=0, le=128)
+    underutilized_reason: str | None = Field(default=None, min_length=1, max_length=160)
 
     @field_validator("fen")
     @classmethod
@@ -500,8 +502,8 @@ class GeminiPieceVoiceRequest(BaseModel):
     @classmethod
     def validate_piece_dialogue_mode(cls, value: str) -> str:
         normalized = value.strip().lower()
-        if normalized not in {"history_reactive", "independent"}:
-            raise ValueError("dialogue_mode must be history_reactive or independent.")
+        if normalized not in {"history_reactive", "independent", "underutilized_snark"}:
+            raise ValueError("dialogue_mode must be history_reactive, independent, or underutilized_snark.")
         return normalized
 
     @field_validator("piece_dialogue_history")
@@ -532,6 +534,14 @@ class GeminiPieceVoiceRequest(BaseModel):
         if normalized not in {"moved", "ambient"}:
             raise ValueError("context_mode must be 'moved' or 'ambient'.")
         return normalized
+
+    @field_validator("underutilized_reason")
+    @classmethod
+    def validate_underutilized_reason(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = re.sub(r"\s+", " ", value).strip()
+        return normalized or None
 
     @field_validator("from_square", "to_square")
     @classmethod
@@ -1388,6 +1398,13 @@ def build_piece_voice_line_query(
         if controls.avoid_direct_address
         else ""
     )
+    if dialogue_mode == "underutilized_snark":
+        dialogue_instruction = (
+            "You are one of your side's least-used pieces and you are finally speaking up. "
+            "Complain about being ignored, underused, boxed in, idle, or left waiting. "
+            "Be snarky, character-accurate, concise, and lightly informative without sounding like a coach."
+        )
+        direct_address_instruction = "Do not directly address another piece by name or type. "
     piece_dialogue_history_text = ""
     latest_piece_line_text = ""
     if dialogue_mode == "history_reactive" and payload.piece_dialogue_history:
@@ -1420,6 +1437,14 @@ def build_piece_voice_line_query(
         dialogue_instruction = (
             "Pieces can hear other pieces, but never the narrator. "
             "Recent chatter is looping, so stay grounded in the board state and current battle instead of turning this into more back-and-forth."
+        )
+    underutilized_text = ""
+    if dialogue_mode == "underutilized_snark":
+        underutilized_text = (
+            "\nUnderutilized-piece snark context:\n"
+            f"- Piece move count so far: {payload.piece_move_count}\n"
+            f"- Complaint cue: {payload.underutilized_reason or 'left waiting for useful work'}\n"
+            "You are not commenting on the move you just made. You are complaining from where you sit.\n"
         )
     recent_lines_text = ""
     if payload.recent_lines:
@@ -1474,7 +1499,7 @@ def build_piece_voice_line_query(
         f"Focused piece personality: {piece_voice_personality_instructions(payload.piece_type)}\n"
         f"Dialogue mode: {dialogue_mode}\n"
         f"Context mode: {context_mode}\n"
-        f"Moved piece: {payload.piece_color} {payload.piece_type}\n"
+        f"Selected piece: {payload.piece_color} {payload.piece_type}\n"
         f"{move_line}\n"
         f"Capture: {capture_text}\n"
         f"Check: {check_text}\n"
@@ -1501,6 +1526,7 @@ def build_piece_voice_line_query(
         f"Emotional flavor: {controls.emotional_flavor}\n"
         f"Avoid direct address: {'yes' if controls.avoid_direct_address else 'no'}\n"
         f"Conversation loop detected: {'yes' if controls.conversation_loop_detected else 'no'}"
+        f"{underutilized_text}"
         f"{piece_dialogue_history_text}"
         f"{latest_piece_line_text}"
         f"{recent_lines_text}"
@@ -2954,7 +2980,7 @@ async def create_gemini_passive_commentary_line(payload: GeminiPassiveNarratorRe
 async def create_gemini_piece_voice_line(payload: GeminiPieceVoiceRequest) -> dict[str, Any]:
     prompt_controls = build_piece_dialogue_prompt_controls(payload)
     query = build_piece_voice_line_query(payload, prompt_controls=prompt_controls)
-    initial_temperature = 1.2 if payload.dialogue_mode == "history_reactive" else None
+    initial_temperature = 1.2 if payload.dialogue_mode in {"history_reactive", "underutilized_snark"} else None
 
     try:
         raw_candidates = await fetch_gemini_piece_voice_line_candidates(
