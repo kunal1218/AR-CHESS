@@ -591,7 +591,7 @@ def test_build_piece_voice_line_query_supports_ambient_piece_context() -> None:
 
 
 def test_build_piece_voice_line_query_uses_piece_only_dialogue_history() -> None:
-    from main import GeminiPieceVoiceRequest
+    from main import GeminiPieceVoiceRequest, PieceDialoguePromptControls, build_piece_voice_line_query
 
     payload = GeminiPieceVoiceRequest(
         fen="r1bqkbnr/pppp1ppp/2n5/4p3/3PP3/5N2/PPP2PPP/RNBQKB1R w KQkq - 2 3",
@@ -639,14 +639,185 @@ def test_build_piece_voice_line_query_uses_piece_only_dialogue_history() -> None
         move_quality="tactical",
     )
 
-    query = build_piece_voice_line_query(payload)
+    query = build_piece_voice_line_query(
+        payload,
+        prompt_controls=PieceDialoguePromptControls(
+            dialogue_intent="mock",
+            line_style="taunting",
+            avoid_direct_address=False,
+            conversation_loop_detected=False,
+        ),
+    )
 
     assert "Dialogue mode: history_reactive" in query
     assert "Pieces can hear other pieces, but never the narrator." in query
     assert "Recent piece-only battlefield chatter you may react to:" in query
     assert "White Pawn on e4" in query
-    assert "Latest piece line to answer right now:" in query
-    assert "Do not just fall back to a generic stock slogan." in query
+    assert "Most recent piece line in the air:" in query
+    assert "React to recent battlefield chatter if appropriate" in query
+    assert "Dialogue intent: mock" in query
+    assert "Line style: taunting" in query
+    assert "Avoid direct address: no" in query
+    assert "Conversation loop detected: no" in query
+
+
+def test_build_piece_dialogue_prompt_controls_detects_ping_pong_loop() -> None:
+    from main import GeminiPieceVoiceRequest, build_piece_dialogue_prompt_controls
+
+    payload = GeminiPieceVoiceRequest(
+        fen="r1bqkbnr/pppp1ppp/2n5/4p3/3PP3/5N2/PPP2PPP/RNBQKB1R w KQkq - 2 3",
+        piece_type="bishop",
+        piece_color="white",
+        dialogue_mode="history_reactive",
+        piece_dialogue_history=[
+            {
+                "speaker_class": "piece",
+                "piece_type": "pawn",
+                "piece_color": "white",
+                "piece_identity": "White Pawn on e4",
+                "text": "Ok knight, keep up.",
+            },
+            {
+                "speaker_class": "piece",
+                "piece_type": "knight",
+                "piece_color": "black",
+                "piece_identity": "Black Knight on c6",
+                "text": "Listen pawn, you are late.",
+            },
+            {
+                "speaker_class": "piece",
+                "piece_type": "pawn",
+                "piece_color": "white",
+                "piece_identity": "White Pawn on e4",
+                "text": "Ok knight, march faster.",
+            },
+            {
+                "speaker_class": "piece",
+                "piece_type": "knight",
+                "piece_color": "black",
+                "piece_identity": "Black Knight on c6",
+                "text": "Listen pawn, do not lecture me.",
+            },
+        ],
+        latest_piece_line={
+            "speaker_class": "piece",
+            "piece_type": "knight",
+            "piece_color": "black",
+            "piece_identity": "Black Knight on c6",
+            "text": "Listen pawn, do not lecture me.",
+        },
+        context_mode="moved",
+        from_square="c1",
+        to_square="g5",
+        is_capture=False,
+        is_check=False,
+        is_near_enemy_king=False,
+        is_attacked=False,
+        is_attacked_by_multiple=False,
+        is_defended=True,
+        is_well_defended=False,
+        is_hanging=False,
+        is_pinned=False,
+        is_retreat=False,
+        is_aggressive_advance=True,
+        is_fork_threat=False,
+        attacker_count=0,
+        defender_count=1,
+        eval_before=12,
+        eval_after=35,
+        eval_delta=23,
+        position_state="equal",
+        move_quality="strong",
+    )
+
+    controls = build_piece_dialogue_prompt_controls(payload)
+
+    assert controls.dialogue_intent in {
+        "threaten",
+        "mock",
+        "boast",
+        "warn",
+        "panic",
+        "celebrate",
+        "command",
+        "dismiss",
+    }
+    assert controls.line_style in {
+        "clipped",
+        "dramatic",
+        "cold",
+        "taunting",
+        "grim",
+        "battlefield_command",
+    }
+    assert controls.avoid_direct_address is True
+    assert controls.conversation_loop_detected is True
+
+
+def test_build_piece_voice_line_query_can_suppress_direct_address_loops() -> None:
+    from main import GeminiPieceVoiceRequest, PieceDialoguePromptControls, build_piece_voice_line_query
+
+    payload = GeminiPieceVoiceRequest(
+        fen="r1bqkbnr/pppp1ppp/2n5/4p3/3PP3/5N2/PPP2PPP/RNBQKB1R w KQkq - 2 3",
+        piece_type="bishop",
+        piece_color="white",
+        dialogue_mode="history_reactive",
+        piece_dialogue_history=[
+            {
+                "speaker_class": "piece",
+                "piece_type": "pawn",
+                "piece_color": "white",
+                "piece_identity": "White Pawn on e4",
+                "text": "Ok knight, keep up.",
+            }
+        ],
+        latest_piece_line={
+            "speaker_class": "piece",
+            "piece_type": "pawn",
+            "piece_color": "white",
+            "piece_identity": "White Pawn on e4",
+            "text": "Ok knight, keep up.",
+        },
+        context_mode="moved",
+        from_square="c1",
+        to_square="g5",
+        is_capture=False,
+        is_check=False,
+        is_near_enemy_king=False,
+        is_attacked=False,
+        is_attacked_by_multiple=False,
+        is_defended=True,
+        is_well_defended=False,
+        is_hanging=False,
+        is_pinned=False,
+        is_retreat=False,
+        is_aggressive_advance=True,
+        is_fork_threat=False,
+        attacker_count=0,
+        defender_count=1,
+        eval_before=12,
+        eval_after=35,
+        eval_delta=23,
+        position_state="equal",
+        move_quality="strong",
+    )
+
+    query = build_piece_voice_line_query(
+        payload,
+        prompt_controls=PieceDialoguePromptControls(
+            dialogue_intent="dismiss",
+            line_style="grim",
+            avoid_direct_address=True,
+            conversation_loop_detected=True,
+        ),
+    )
+
+    assert "Avoid directly addressing another piece by name or type." in query
+    assert "Recent chatter is looping" in query
+    assert "Dialogue intent: dismiss" in query
+    assert "Line style: grim" in query
+    assert "Avoid direct address: yes" in query
+    assert "Conversation loop detected: yes" in query
 
 
 def test_build_passive_narrator_line_query_includes_story_context() -> None:

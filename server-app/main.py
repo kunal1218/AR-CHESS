@@ -2,9 +2,11 @@ import asyncio
 import json
 import logging
 import os
+import random
 import re
 import uuid
 from contextlib import suppress
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlparse
@@ -43,9 +45,44 @@ UCI_MOVE_PATTERN = re.compile(r"^[a-h][1-8][a-h][1-8][qrbn]?$", re.IGNORECASE)
 ACTIVE_TICKET_STATUSES = ("queued", "matched")
 PIECE_VOICE_MIN_WORDS = 3
 PIECE_VOICE_MIN_CHARACTERS = 10
-PIECE_VOICE_MAX_WORDS = 12
+PIECE_VOICE_MAX_WORDS = 14
+PIECE_DIALOGUE_INTENTS = (
+    "threaten",
+    "mock",
+    "boast",
+    "warn",
+    "panic",
+    "celebrate",
+    "command",
+    "dismiss",
+)
+PIECE_LINE_STYLES = (
+    "clipped",
+    "dramatic",
+    "cold",
+    "taunting",
+    "grim",
+    "battlefield_command",
+)
+PIECE_DIRECT_ADDRESS_LEADIN_PATTERN = re.compile(
+    r"^(?:ok(?:ay)?|listen|bold words|easy there|quiet|steady|careful|hey|look|look here)\s+"
+    r"(?:(?:white|black)\s+)?(?:pawn|knight|bishop|rook|queen|king)\b",
+    re.IGNORECASE,
+)
+PIECE_DIRECT_ADDRESS_NAME_PATTERN = re.compile(
+    r"^(?:(?:white|black)\s+)?(?:pawn|knight|bishop|rook|queen|king)\b[,:]",
+    re.IGNORECASE,
+)
 
 app = FastAPI(title="AR Chess Server", version="0.3.0")
+
+
+@dataclass(frozen=True)
+class PieceDialoguePromptControls:
+    dialogue_intent: str
+    line_style: str
+    avoid_direct_address: bool
+    conversation_loop_detected: bool
 
 
 class EnqueueMatchmakingRequest(BaseModel):
@@ -977,6 +1014,70 @@ def is_passive_narrator_line_repetitive(text: str, recent_lines: list[str]) -> b
     return candidate_key in recent_keys
 
 
+def sample_piece_dialogue_intent() -> str:
+    # Lightweight intent sampling nudges the piece path away from deterministic stock phrasing.
+    return random.choice(PIECE_DIALOGUE_INTENTS)
+
+
+def sample_piece_line_style() -> str:
+    # A second tiny stochastic control changes phrasing rhythm without changing board grounding.
+    return random.choice(PIECE_LINE_STYLES)
+
+
+def is_piece_direct_address_line(text: str) -> bool:
+    normalized = re.sub(r"\s+", " ", text).strip()
+    if not normalized:
+        return False
+    return bool(
+        PIECE_DIRECT_ADDRESS_LEADIN_PATTERN.match(normalized)
+        or PIECE_DIRECT_ADDRESS_NAME_PATTERN.match(normalized)
+    )
+
+
+def piece_dialogue_speaker_key(entry: GeminiDialogueUtterance) -> str:
+    if entry.piece_identity:
+        return entry.piece_identity.lower()
+    return f"{entry.piece_color or 'unknown'}:{entry.piece_type or 'piece'}"
+
+
+def has_piece_conversation_loop(history: list[GeminiDialogueUtterance]) -> bool:
+    recent_history = history[-4:]
+    if len(recent_history) < 4:
+        return False
+
+    speaker_keys = [piece_dialogue_speaker_key(entry) for entry in recent_history]
+    return (
+        len(set(speaker_keys)) == 2
+        and speaker_keys[0] == speaker_keys[2]
+        and speaker_keys[1] == speaker_keys[3]
+        and speaker_keys[0] != speaker_keys[1]
+    )
+
+
+def build_piece_dialogue_prompt_controls(payload: GeminiPieceVoiceRequest) -> PieceDialoguePromptControls:
+    recent_piece_history = payload.piece_dialogue_history[-4:]
+
+    # If recent piece chatter is repeatedly direct-addressing another piece, push the next line
+    # away from "Ok pawn..." loops.
+    recent_direct_address_count = sum(
+        1 for entry in recent_piece_history if is_piece_direct_address_line(entry.text)
+    )
+    avoid_direct_address = recent_direct_address_count > 0
+
+    # Cheap ping-pong detection: repeated A/B alternation or multiple recent direct-address lines
+    # means the next reactive line should pivot back to the board instead of escalating the loop.
+    conversation_loop_detected = payload.dialogue_mode == "history_reactive" and (
+        has_piece_conversation_loop(recent_piece_history) or recent_direct_address_count >= 2
+    )
+
+    return PieceDialoguePromptControls(
+        dialogue_intent=sample_piece_dialogue_intent(),
+        line_style=sample_piece_line_style(),
+        avoid_direct_address=avoid_direct_address,
+        conversation_loop_detected=conversation_loop_detected,
+    )
+
+
 def build_gemini_user_query(payload: GeminiHintRequest) -> str:
     piece_name = payload.moving_piece or "piece"
     capture_text = "yes" if payload.is_capture else "no"
@@ -1019,7 +1120,11 @@ def build_gemini_coach_query() -> str:
     )
 
 
-def build_piece_voice_line_query(payload: GeminiPieceVoiceRequest) -> str:
+def build_piece_voice_line_query(
+    payload: GeminiPieceVoiceRequest,
+    prompt_controls: PieceDialoguePromptControls | None = None,
+) -> str:
+    controls = prompt_controls or build_piece_dialogue_prompt_controls(payload)
     eval_before = "unknown" if payload.eval_before is None else str(payload.eval_before)
     eval_after = "unknown" if payload.eval_after is None else str(payload.eval_after)
     eval_delta = "unknown" if payload.eval_delta is None else str(payload.eval_delta)
@@ -1051,6 +1156,11 @@ def build_piece_voice_line_query(payload: GeminiPieceVoiceRequest) -> str:
         "Say something fresh and independent from prior dialogue. "
         "Stay grounded in the board state and your personality, but do not build on earlier talk."
     )
+    direct_address_instruction = (
+        "Avoid directly addressing another piece by name or type. "
+        if controls.avoid_direct_address
+        else ""
+    )
     piece_dialogue_history_text = ""
     latest_piece_line_text = ""
     if dialogue_mode == "history_reactive" and payload.piece_dialogue_history:
@@ -1067,21 +1177,22 @@ def build_piece_voice_line_query(payload: GeminiPieceVoiceRequest) -> str:
         )
         dialogue_instruction = (
             "Pieces can hear other pieces, but never the narrator. "
-            "Make this line feel like part of that battlefield conversation while still reacting to the current board state."
+            "React to recent battlefield chatter if appropriate, but do not simply mirror or repeat prior phrasing. "
+            "You may escalate, dismiss, pivot back to the battle, or introduce a new angle."
         )
     if dialogue_mode == "history_reactive" and payload.latest_piece_line is not None:
         latest_piece = payload.latest_piece_line
         latest_piece_line_text = (
-            "\nLatest piece line to answer right now:\n"
+            "\nMost recent piece line in the air:\n"
             f"- {latest_piece.piece_color} {latest_piece.piece_type}"
             + (f" ({latest_piece.piece_identity})" if latest_piece.piece_identity else "")
             + f": {latest_piece.text}\n"
-            "Reply to that line directly in spirit. Mock it, challenge it, escalate it, contradict it, or answer it with grim approval. "
-            "Do not ignore it. Do not just fall back to a generic stock slogan.\n"
+            "Let it shape the tone if useful, but do not turn this into a literal ping-pong reply chain.\n"
         )
+    if dialogue_mode == "history_reactive" and controls.conversation_loop_detected:
         dialogue_instruction = (
             "Pieces can hear other pieces, but never the narrator. "
-            "This line should sound like a direct battlefield reply to the latest piece-spoken line while still matching the current move and board state."
+            "Recent chatter is looping, so stay grounded in the board state and current battle instead of turning this into more back-and-forth."
         )
     recent_lines_text = ""
     if payload.recent_lines:
@@ -1101,7 +1212,8 @@ def build_piece_voice_line_query(payload: GeminiPieceVoiceRequest) -> str:
         "and whether the move was strong, desperate, defensive, aggressive, or poor. "
         f"{context_instruction} "
         f"{dialogue_instruction} "
-        "Keep the line short, vivid, punchy, and freshly phrased. Aim for 5 to 10 words. Minimum 3 words. Maximum 12 words. "
+        f"{direct_address_instruction}"
+        "Keep the line short, vivid, punchy, and freshly phrased. Preferred length: 4 to 12 words. Maximum: 14 words. "
         "Return exactly one complete sentence, not a fragment. End the sentence with a period, exclamation point, or question mark. "
         "Do not return a single word, single letter, grunt, or filler fragment. "
         "Prefer novel wording over signature catchphrases. "
@@ -1153,7 +1265,11 @@ def build_piece_voice_line_query(payload: GeminiPieceVoiceRequest) -> str:
         f"Move quality: {payload.move_quality}\n"
         f"Eval before: {eval_before}\n"
         f"Eval after: {eval_after}\n"
-        f"Eval delta: {eval_delta}"
+        f"Eval delta: {eval_delta}\n"
+        f"Dialogue intent: {controls.dialogue_intent}\n"
+        f"Line style: {controls.line_style}\n"
+        f"Avoid direct address: {'yes' if controls.avoid_direct_address else 'no'}\n"
+        f"Conversation loop detected: {'yes' if controls.conversation_loop_detected else 'no'}"
         f"{piece_dialogue_history_text}"
         f"{latest_piece_line_text}"
         f"{recent_lines_text}"
@@ -1297,14 +1413,18 @@ def gemini_fallback_passive_narrator_line(payload: GeminiPassiveNarratorRequest)
 
     return "The board stays calm on the surface, but the pressure keeps building."
 
-def build_piece_voice_line_retry_query(payload: GeminiPieceVoiceRequest, previous_response: str) -> str:
+def build_piece_voice_line_retry_query(
+    payload: GeminiPieceVoiceRequest,
+    previous_response: str,
+    prompt_controls: PieceDialoguePromptControls | None = None,
+) -> str:
     trimmed_previous = re.sub(r"\s+", " ", previous_response).strip()
     return (
-        build_piece_voice_line_query(payload)
+        build_piece_voice_line_query(payload, prompt_controls=prompt_controls)
         + "\n\n"
         + "Your previous answer was unusable for the app. "
         + "Return exactly one fresh in-character line right now. "
-        + "It must be vivid and specific, with 3 to 12 words. "
+        + "It must be vivid and specific, ideally 4 to 12 words and never more than 14. "
         + "It must be one complete sentence ending with punctuation. "
         + "Do not return a single word, single letter, grunt, or generic filler. "
         + "Do not reuse the previous wording. "
@@ -1313,10 +1433,14 @@ def build_piece_voice_line_retry_query(payload: GeminiPieceVoiceRequest, previou
     )
 
 
-def build_piece_voice_line_duplicate_retry_query(payload: GeminiPieceVoiceRequest, previous_response: str) -> str:
+def build_piece_voice_line_duplicate_retry_query(
+    payload: GeminiPieceVoiceRequest,
+    previous_response: str,
+    prompt_controls: PieceDialoguePromptControls | None = None,
+) -> str:
     trimmed_previous = re.sub(r"\s+", " ", previous_response).strip()
     return (
-        build_piece_voice_line_query(payload)
+        build_piece_voice_line_query(payload, prompt_controls=prompt_controls)
         + "\n\n"
         + "Your previous answer repeated recent wording. "
         + "Return a fresh alternative with noticeably different phrasing right now. "
@@ -1327,14 +1451,18 @@ def build_piece_voice_line_duplicate_retry_query(payload: GeminiPieceVoiceReques
     )
 
 
-def build_piece_voice_line_repair_query(payload: GeminiPieceVoiceRequest, previous_response: str) -> str:
+def build_piece_voice_line_repair_query(
+    payload: GeminiPieceVoiceRequest,
+    previous_response: str,
+    prompt_controls: PieceDialoguePromptControls | None = None,
+) -> str:
     trimmed_previous = re.sub(r"\s+", " ", previous_response).strip()
     return (
-        build_piece_voice_line_query(payload)
+        build_piece_voice_line_query(payload, prompt_controls=prompt_controls)
         + "\n\n"
         + "The last answer came back as an incomplete fragment. Rewrite it into exactly one finished in-character sentence. "
         + "Keep the same piece personality and board context, but make it feel complete and speakable. "
-        + "Use 4 to 8 words when possible, and never exceed 12. End with punctuation. "
+        + "Prefer 4 to 12 words when possible, and never exceed 14. End with punctuation. "
         + "Do not output labels, quotes, headings, or explanations. "
         + f"Incomplete fragment to repair: {trimmed_previous or '(empty)'}"
     )
@@ -2553,7 +2681,8 @@ async def create_gemini_passive_commentary_line(payload: GeminiPassiveNarratorRe
 
 @app.post("/v1/gemini/piece-voice-line", response_model=GeminiPieceVoiceResponse)
 async def create_gemini_piece_voice_line(payload: GeminiPieceVoiceRequest) -> dict[str, Any]:
-    query = build_piece_voice_line_query(payload)
+    prompt_controls = build_piece_dialogue_prompt_controls(payload)
+    query = build_piece_voice_line_query(payload, prompt_controls=prompt_controls)
     initial_temperature = 1.2 if payload.dialogue_mode == "history_reactive" else None
 
     try:
@@ -2561,17 +2690,29 @@ async def create_gemini_piece_voice_line(payload: GeminiPieceVoiceRequest) -> di
         line = normalize_piece_voice_line_text(sanitize_piece_voice_line_text(raw_line))
 
         if is_piece_voice_line_repetitive(line, payload.recent_lines):
-            duplicate_retry_query = build_piece_voice_line_duplicate_retry_query(payload, raw_line)
+            duplicate_retry_query = build_piece_voice_line_duplicate_retry_query(
+                payload,
+                raw_line,
+                prompt_controls=prompt_controls,
+            )
             raw_line = await fetch_gemini_piece_voice_line_text(duplicate_retry_query, temperature=1.2)
             line = normalize_piece_voice_line_text(sanitize_piece_voice_line_text(raw_line))
 
         if not is_complete_piece_voice_line_text(line):
-            retry_query = build_piece_voice_line_retry_query(payload, raw_line)
+            retry_query = build_piece_voice_line_retry_query(
+                payload,
+                raw_line,
+                prompt_controls=prompt_controls,
+            )
             raw_line = await fetch_gemini_piece_voice_line_text(retry_query, temperature=1.0)
             line = normalize_piece_voice_line_text(sanitize_piece_voice_line_text(raw_line))
 
         if not is_complete_piece_voice_line_text(line):
-            repair_query = build_piece_voice_line_repair_query(payload, raw_line)
+            repair_query = build_piece_voice_line_repair_query(
+                payload,
+                raw_line,
+                prompt_controls=prompt_controls,
+            )
             raw_line = await fetch_gemini_piece_voice_line_text(repair_query, temperature=0.7)
             line = normalize_piece_voice_line_text(sanitize_piece_voice_line_text(raw_line))
     except GeminiLiveConfigurationError as exc:

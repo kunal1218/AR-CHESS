@@ -6286,10 +6286,10 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   private static let preferredHardTimeoutMs = 600
   private static let substantialGainThreshold = 120
   private static let substantialDropThreshold = -140
-  // The passive narrator ramps by 20 percentage points after each normal move where the
+  // The passive narrator ramps by 10 percentage points after each normal move where the
   // narrator stays silent. We evaluate the next move at `(storedTurns + 1) * increment`
-  // so the first eligible post-narrator move starts at 20%.
-  private static let narratorChanceRampIncrement = 0.20
+  // so the first eligible post-narrator move starts at 10%.
+  private static let narratorChanceRampIncrement = 0.10
   private static let ambientPieceVoiceLineChance = 0.35
   private static let defaultPieceHistoryReactiveChancePercent = 60
   private static let defaultNarratorPieceReactiveChancePercent = 40
