@@ -6298,8 +6298,8 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   // so the first eligible post-narrator move starts at 10%.
   private static let narratorChanceRampIncrement = 0.10
   private static let ambientPieceVoiceLineChance = 0.35
-  private static let underutilizedSnarkEvalDeltaThreshold = 40
-  private static let underutilizedSnarkTriggerChance = 0.75
+  private static let underutilizedSnarkMinimumMovesPerPlayer = 10
+  private static let underutilizedSnarkTriggerChance = 0.25
   private static let underutilizedSnarkPoolSize = 5
   private static let defaultPieceHistoryReactiveChancePercent = 60
   private static let defaultNarratorPieceReactiveChancePercent = 40
@@ -7912,21 +7912,11 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     before beforeState: ChessGameState,
     after afterState: ChessGameState
   ) -> PieceVoiceRequestPlan? {
-    let movedPieceContext = buildPieceVoiceLineContext(
-      speakingSquare: move.to,
-      piece: move.piece,
-      contextMode: .moved,
-      before: beforeState,
-      after: afterState,
-      referenceMove: move
-    )
-
-    guard let evalDelta = movedPieceContext.evalDelta,
-          abs(evalDelta) <= Self.underutilizedSnarkEvalDeltaThreshold else {
+    guard hasReachedUnderutilizedSnarkMoveFloor(after: afterState) else {
       return nil
     }
 
-    // Quiet moves are the moments when neglected pieces are most likely to cut in with snark.
+    // Once both players have reached the minimum move count, neglected pieces occasionally cut in.
     guard Double.random(in: 0..<1) < Self.underutilizedSnarkTriggerChance else {
       return nil
     }
@@ -7964,6 +7954,21 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       context: context,
       label: "\(speaker.displayName.lowercased()) snarking from \(selected.square.algebraic)"
     )
+  }
+
+  private func hasReachedUnderutilizedSnarkMoveFloor(after state: ChessGameState) -> Bool {
+    movesPlayedBy(.white, in: state) >= Self.underutilizedSnarkMinimumMovesPerPlayer
+      && movesPlayedBy(.black, in: state) >= Self.underutilizedSnarkMinimumMovesPerPlayer
+  }
+
+  private func movesPlayedBy(_ color: ChessColor, in state: ChessGameState) -> Int {
+    let completedFullMoves = max(0, state.fullmoveNumber - 1)
+    switch color {
+    case .white:
+      return completedFullMoves + (state.turn == .black ? 1 : 0)
+    case .black:
+      return completedFullMoves
+    }
   }
 
   private func underutilizedPieceCandidates(
