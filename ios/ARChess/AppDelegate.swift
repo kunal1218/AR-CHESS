@@ -8078,6 +8078,60 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       .trimmingCharacters(in: .whitespacesAndNewlines)
   }
 
+  private func recentPieceDialogueEntries(limit: Int = 4) -> [AutonomousDialogueMemoryEntry] {
+    Array(
+      autonomousDialogueMemory
+        .filter { $0.speakerClass == .piece }
+        .suffix(limit)
+    )
+  }
+
+  private func pieceDialogueSpeakerKey(_ entry: AutonomousDialogueMemoryEntry) -> String {
+    if let identity = entry.pieceIdentity?.lowercased(), !identity.isEmpty {
+      return identity
+    }
+    let color = entry.pieceColor?.displayName.lowercased() ?? "unknown"
+    let type = entry.pieceType?.displayName.lowercased() ?? entry.speakerName.lowercased()
+    return "\(color):\(type)"
+  }
+
+  private func isDirectAddressPieceLine(_ text: String) -> Bool {
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else {
+      return false
+    }
+
+    let leadInPattern =
+      #"^(?:ok(?:ay)?|listen|bold words|easy there|quiet|steady|careful|hey|look|look here|say what)\s+(?:(?:white|black)\s+)?(?:pawn|knight|bishop|rook|queen|king)\b"#
+    let namePattern = #"^(?:(?:white|black)\s+)?(?:pawn|knight|bishop|rook|queen|king)\b[,:]"#
+    return trimmed.range(of: leadInPattern, options: [.regularExpression, .caseInsensitive]) != nil
+      || trimmed.range(of: namePattern, options: [.regularExpression, .caseInsensitive]) != nil
+  }
+
+  private func recentPieceDialogueLoopSignals(limit: Int = 4) -> (directAddressCount: Int, loopDetected: Bool) {
+    let entries = recentPieceDialogueEntries(limit: limit)
+    let directAddressCount = entries.reduce(into: 0) { count, entry in
+      if isDirectAddressPieceLine(entry.text) {
+        count += 1
+      }
+    }
+    let speakerKeys = entries.map(pieceDialogueSpeakerKey)
+    let loopDetected = entries.count >= 4
+      && Set(speakerKeys).count == 2
+      && speakerKeys[0] == speakerKeys[2]
+      && speakerKeys[1] == speakerKeys[3]
+      && speakerKeys[0] != speakerKeys[1]
+    return (directAddressCount, loopDetected)
+  }
+
+  private func shouldSuppressLoopLikePieceLine(_ text: String) -> Bool {
+    guard isDirectAddressPieceLine(text) else {
+      return false
+    }
+    let signals = recentPieceDialogueLoopSignals()
+    return signals.loopDetected || signals.directAddressCount >= 2
+  }
+
   private func autonomousDialoguePayload(
     from entry: AutonomousDialogueMemoryEntry
   ) -> GeminiDialogueUtterancePayload? {
@@ -8304,6 +8358,13 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   ) {
     var resolvedText = text
     var resolvedStatusPrefix = statusPrefix
+    if shouldSuppressLoopLikePieceLine(resolvedText) {
+      appendGeminiDebug(
+        "Suppressed loop-like direct-address piece line for \(plan.speaker.displayName.lowercased()); using a loop-safe local fallback."
+      )
+      resolvedText = fallbackPieceVoiceLine(for: plan, avoiding: [resolvedText])
+      resolvedStatusPrefix = "Fallback"
+    }
     if hasRecentPieceVoiceLine(resolvedText, for: plan.speaker) {
       appendGeminiDebug(
         "Piece voice line repeated recent wording for \(plan.speaker.displayName.lowercased()); using a varied local fallback."
@@ -8481,15 +8542,22 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     avoiding additionalLines: [String] = []
   ) -> String {
     let context = plan.context
-    if context.dialogueMode == .historyReactive, let latestPieceLine = context.latestPieceLine {
-      let reactingTo = latestPieceLine.piece_type?.capitalized ?? "piece"
+    let loopSignals = recentPieceDialogueLoopSignals()
+    if context.dialogueMode == .historyReactive, context.latestPieceLine != nil {
       return pickDistinctPieceVoiceOption(
-        [
-          "Keep talking, \(reactingTo). I answer with steel.",
-          "Boast all you want, \(reactingTo). I move louder.",
-          "Your speech is cheap, \(reactingTo). My move is not.",
-          "Say it again, \(reactingTo). I dare you.",
-        ],
+        loopSignals.loopDetected || loopSignals.directAddressCount > 0
+          ? [
+            "Enough chatter. The board answers now.",
+            "The talk loops. The battle does not.",
+            "Words stall. The position keeps moving.",
+            "Let the move speak louder than the noise.",
+          ]
+          : [
+            "Talk is cheap. The board answers now.",
+            "The chatter is noted. The move matters more.",
+            "Words travel fast. Steel travels farther.",
+            "The square changes hands while the boasting continues.",
+          ],
         for: plan.speaker,
         extraAvoiding: additionalLines
       )
