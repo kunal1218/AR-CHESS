@@ -7090,6 +7090,10 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
         guard let self else {
           return
         }
+        let cacheSource = preparedLine.cacheHit ? "cache hit" : "fresh synth"
+        self.appendGeminiDebug(
+          "Piper ready for \(request.line.speakerType.rawValue) using \(preparedLine.resolvedSpeakerType.rawValue) voice (\(cacheSource))."
+        )
         if preparedLine.usedFallbackVoice {
           self.appendGeminiDebug(
             "Piper fell back from \(request.line.speakerType.rawValue) to \(preparedLine.resolvedSpeakerType.rawValue) because the configured voice model was unavailable."
@@ -11144,14 +11148,14 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
         line: text,
         imageAssetName: "GeminiNarratorPortrait"
       )
-      pieceVoiceStatusText = "Speaking narrator line."
+      pieceVoiceStatusText = "Speaking narrator line via Piper."
     case .pieceVoice(let speaker):
       speechLine = PiperAutomaticSpeaker.SpeechLine(
         speakerType: speaker.piperSpeakerType,
         text: text
       )
       caption = Caption(speaker: speaker, line: text)
-      pieceVoiceStatusText = "Speaking \(speaker.displayName) voice."
+      pieceVoiceStatusText = "Speaking \(speaker.displayName) voice via Piper."
     case .gemini:
       return false
     }

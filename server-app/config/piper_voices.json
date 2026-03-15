@@ -1,5 +1,5 @@
 {
-  "binary_path": "piper/bin/piper",
+  "binary_path": "piper",
   "cache_dir": ".cache/piper",
   "default_speaker_type": "narrator",
   "voices": {
@@ -12,8 +12,8 @@
       "config_path": "piper/voices/rook/rook.onnx.json"
     },
     "knight": {
-      "model_path": "piper/voices/knight/en_US-lessac-medium.onnx",
-      "config_path": "piper/voices/knight/en_US-lessac-medium.onnx.json"
+      "model_path": "piper/voices/knight/en_US-lessac-high.onnx",
+      "config_path": "piper/voices/knight/en_US-lessac-high.onnx.json"
     },
     "bishop": {
       "model_path": "piper/voices/bishop/bishop.onnx",

@@ -31,6 +31,7 @@ Backend owned by Person 1.
   - `PIPER_BINARY_PATH` (optional override for the Piper executable path)
   - `PIPER_CACHE_DIR` (optional override for the generated wav cache directory)
   - `PIPER_TTS_TIMEOUT_SECONDS` (optional, default `20`)
+  - install the local executable with `pip install -r requirements.txt` so `piper` is available in the backend virtualenv
 - Gemini 3 models are not currently supported on the Live API. If you add a non-Live Gemini path later, keep it on a separate model config instead of pointing `GEMINI_LIVE_MODEL` at Gemini 3.
 
 ## Health ping
@@ -128,6 +129,8 @@ Matchmaking uses Postgres transactions and `FOR UPDATE SKIP LOCKED` so two queue
   - Returns the cached wav file for playback in the client.
 - Voice paths live in `server-app/config/piper_voices.json`.
 - Generated wav files are cached under `server-app/.cache/piper/` by default.
+- Download the distinct knight voice with `server-app/scripts/download_piper_knight_voice.sh`.
+- The repo’s default iOS `ARChessAPIBaseURL` currently points at Railway, so local Piper testing requires pointing the app at your local backend instead of the hosted backend.
 
 ## Verify locally
 

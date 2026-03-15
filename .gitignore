@@ -7,6 +7,7 @@ __pycache__/
 
 server-app/.ruff_cache/
 server-app/.cache/
+server-app/piper/
 
 legacy/old-client/.gradle/
 legacy/old-client/.kotlin/

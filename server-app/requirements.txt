@@ -6,4 +6,6 @@ websockets==16.0
 chess>=1.11,<2
 pytest==9.0.2
 httpx==0.28.1
+piper-tts==1.4.1
+pathvalidate==3.3.1
 ruff==0.15.4
