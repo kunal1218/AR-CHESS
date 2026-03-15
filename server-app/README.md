@@ -130,6 +130,8 @@ Matchmaking uses Postgres transactions and `FOR UPDATE SKIP LOCKED` so two queue
 - Voice paths live in `server-app/config/piper_voices.json`.
 - Generated wav files are cached under `server-app/.cache/piper/` by default.
 - Download the distinct knight voice with `server-app/scripts/download_piper_knight_voice.sh`.
+- Download a broader in-app audition set with `server-app/scripts/download_piper_audition_voices.sh`.
+- The curated audition list lives in `server-app/config/piper_audition_voices.txt`, and the Voice Lab will automatically show any downloaded `.onnx` + `.onnx.json` pairs under `server-app/piper/voices/`.
 - The repo’s default iOS `ARChessAPIBaseURL` currently points at Railway, so local Piper testing requires pointing the app at your local backend instead of the hosted backend.
 
 ## Verify locally
