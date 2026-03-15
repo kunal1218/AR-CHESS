@@ -7393,6 +7393,12 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     case automaticPlayback(UUID)
   }
 
+  private enum AutomaticPlaybackSource {
+    case none
+    case geminiPassiveNarrator
+    case piperAutomatic
+  }
+
   @Published private(set) var caption: Caption?
   @Published private(set) var analysisStatus = "Waiting for AR tracking to settle before warming Stockfish..."
   @Published private(set) var latestAssessment = "Waiting for initial analysis."
@@ -7468,6 +7474,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   private var turnsSinceNarratorLine = 0
   private var openingNarrationDelivered = false
   private var queuedAutomaticCommentaryDecision: AutomaticCommentaryDecision?
+  private var activeAutomaticPlaybackSource: AutomaticPlaybackSource = .none
   private var liveNarratorPlaybackOwnsCaption = false
   private var activePassiveAutomaticPlaybackRecord: AutomaticDialoguePlaybackRecord?
   private var activePassiveAutomaticPlaybackDidStart = false
@@ -7489,6 +7496,9 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
         guard let self else {
           return
         }
+        guard self.activeAutomaticPlaybackSource == .geminiPassiveNarrator else {
+          return
+        }
         guard isActive,
               !self.activePassiveAutomaticPlaybackDidStart,
               let playbackRecord = self.activePassiveAutomaticPlaybackRecord else {
@@ -7503,6 +7513,9 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
         guard let self else {
           return
         }
+        guard self.activeAutomaticPlaybackSource == .geminiPassiveNarrator else {
+          return
+        }
         if !isBusy, self.liveNarratorPlaybackOwnsCaption {
           if self.activePassiveAutomaticPlaybackDidStart,
              let playbackRecord = self.activePassiveAutomaticPlaybackRecord {
@@ -7515,6 +7528,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
             self.clearCommentaryCaption(ifOwnedBy: .automaticPlayback(captionToken))
           }
           self.activeAutomaticPlaybackCaptionToken = nil
+          self.activeAutomaticPlaybackSource = .none
           self.flushPendingGeneratedNarrationIfPossible()
           self.flushQueuedAutomaticCommentaryDecisionIfPossible()
         }
@@ -7523,6 +7537,9 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     passiveNarratorLiveSpeaker.onLineFailure = { [weak self] request, message in
       Task { @MainActor [weak self] in
         guard let self else {
+          return
+        }
+        guard self.activeAutomaticPlaybackSource == .geminiPassiveNarrator else {
           return
         }
         self.appendGeminiDebug(
@@ -7536,6 +7553,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
           self.clearCommentaryCaption(ifOwnedBy: .automaticPlayback(captionToken))
         }
         self.activeAutomaticPlaybackCaptionToken = nil
+        self.activeAutomaticPlaybackSource = .none
         switch request.role {
         case .narrator:
           self.pieceVoiceStatusText = "Narrator Gemini Live unavailable. Using local fallback."
@@ -7566,6 +7584,9 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
         guard let self else {
           return
         }
+        guard self.activeAutomaticPlaybackSource == .piperAutomatic else {
+          return
+        }
         guard isActive,
               !self.activePassiveAutomaticPlaybackDidStart,
               let playbackRecord = self.activePassiveAutomaticPlaybackRecord else {
@@ -7580,6 +7601,9 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
         guard let self else {
           return
         }
+        guard self.activeAutomaticPlaybackSource == .piperAutomatic else {
+          return
+        }
         if !isBusy, self.liveNarratorPlaybackOwnsCaption {
           if self.activePassiveAutomaticPlaybackDidStart,
              let playbackRecord = self.activePassiveAutomaticPlaybackRecord {
@@ -7592,6 +7616,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
             self.clearCommentaryCaption(ifOwnedBy: .automaticPlayback(captionToken))
           }
           self.activeAutomaticPlaybackCaptionToken = nil
+          self.activeAutomaticPlaybackSource = .none
           self.flushPendingGeneratedNarrationIfPossible()
           self.flushQueuedAutomaticCommentaryDecisionIfPossible()
         }
@@ -7618,6 +7643,9 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
         guard let self else {
           return
         }
+        guard self.activeAutomaticPlaybackSource == .piperAutomatic else {
+          return
+        }
         self.appendGeminiDebug(
           "Piper automatic audio failed: \(message). Falling back to local speech."
         )
@@ -7629,6 +7657,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
           self.clearCommentaryCaption(ifOwnedBy: .automaticPlayback(captionToken))
         }
         self.activeAutomaticPlaybackCaptionToken = nil
+        self.activeAutomaticPlaybackSource = .none
 
         switch request.line.speakerType {
         case .narrator:
@@ -7860,6 +7889,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     nextTrackedPieceInstanceSerial = 0
     latestAutomaticCommentaryRequestID = 0
     queuedAutomaticCommentaryDecision = nil
+    activeAutomaticPlaybackSource = .none
     liveNarratorPlaybackOwnsCaption = false
     activePassiveAutomaticPlaybackRecord = nil
     activePassiveAutomaticPlaybackDidStart = false
@@ -11690,12 +11720,14 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       liveNarratorPlaybackOwnsCaption = false
       clearCommentaryCaption(ifOwnedBy: .automaticPlayback(captionToken))
       activeAutomaticPlaybackCaptionToken = nil
+      activeAutomaticPlaybackSource = .none
       return startLocalAutomaticNarratorUtterance(
         text: text,
         playbackRecord: playbackRecord
       )
     }
 
+    activeAutomaticPlaybackSource = .geminiPassiveNarrator
     activePassiveAutomaticPlaybackRecord = playbackRecord
     activePassiveAutomaticPlaybackDidStart = false
     liveNarratorPlaybackOwnsCaption = true
@@ -11750,6 +11782,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       liveNarratorPlaybackOwnsCaption = false
       clearCommentaryCaption(ifOwnedBy: .automaticPlayback(captionToken))
       activeAutomaticPlaybackCaptionToken = nil
+      activeAutomaticPlaybackSource = .none
       switch style {
       case .automaticNarrator:
         return startLocalAutomaticNarratorUtterance(
@@ -11767,6 +11800,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       }
     }
 
+    activeAutomaticPlaybackSource = .piperAutomatic
     activePassiveAutomaticPlaybackRecord = playbackRecord
     activePassiveAutomaticPlaybackDidStart = false
     liveNarratorPlaybackOwnsCaption = true
@@ -11793,6 +11827,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     text: String,
     playbackRecord: AutomaticDialoguePlaybackRecord? = nil
   ) -> Bool {
+    activeAutomaticPlaybackSource = .none
     liveNarratorPlaybackOwnsCaption = false
     let utterance = AVSpeechUtterance(string: text)
     utterance.voice = AVSpeechSynthesisVoice(language: "en-US")
@@ -11821,6 +11856,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     speaker: PersonalitySpeaker,
     playbackRecord: AutomaticDialoguePlaybackRecord? = nil
   ) -> Bool {
+    activeAutomaticPlaybackSource = .none
     let utterance = AVSpeechUtterance(string: text)
     utterance.voice = AVSpeechSynthesisVoice(language: "en-US")
     utterance.pitchMultiplier = min(max(speaker.defaultPitch, 0.5), 2.0)
