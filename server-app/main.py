@@ -16,8 +16,8 @@ from urllib.parse import urlparse
 import psycopg
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect, status
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect, status
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from services.gemini_live import (
@@ -32,6 +32,12 @@ from services.narrator_personality import (
     normalize_narrator,
 )
 from services.passive_narrator_live import PassiveNarratorLiveSession
+from services.piper_tts import (
+    PiperAudioNotFoundError,
+    PiperConfigurationError,
+    PiperSynthesisError,
+    PiperTTSService,
+)
 from services.socratic_coach import SocraticCoachSession
 from services.stockfish_engine import StockfishEngine
 
@@ -92,6 +98,7 @@ PASSIVE_NARRATOR_CHESS_ANCHOR_PATTERN = re.compile(
 )
 
 app = FastAPI(title="AR Chess Server", version="0.3.0")
+PIPER_TTS_SERVICE = PiperTTSService()
 
 
 @dataclass(frozen=True)
@@ -713,6 +720,36 @@ class GeminiPassiveNarratorRequest(BaseModel):
 
 class GeminiPassiveNarratorResponse(BaseModel):
     line: str
+
+
+class PiperTTSSpeakRequest(BaseModel):
+    speaker_type: str = Field(..., min_length=1, max_length=16)
+    text: str = Field(..., min_length=1, max_length=320)
+
+    @field_validator("speaker_type")
+    @classmethod
+    def validate_speaker_type(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"pawn", "rook", "knight", "bishop", "queen", "king", "narrator"}:
+            raise ValueError("speaker_type must be pawn, rook, knight, bishop, queen, king, or narrator.")
+        return normalized
+
+    @field_validator("text")
+    @classmethod
+    def validate_text(cls, value: str) -> str:
+        normalized = re.sub(r"\s+", " ", value).strip()
+        if not normalized:
+            raise ValueError("text must not be empty.")
+        return normalized
+
+
+class PiperTTSSpeakResponse(BaseModel):
+    speaker_type: str
+    resolved_speaker_type: str
+    cache_key: str
+    cache_hit: bool
+    used_fallback_voice: bool
+    audio_url: str
 
 
 GEMINI_HINT_SYSTEM_PROMPT = """
@@ -3053,6 +3090,45 @@ async def create_gemini_piece_voice_line(payload: GeminiPieceVoiceRequest) -> di
 
     record_piece_voice_global_usage(line)
     return {"line": line}
+
+
+@app.post("/v1/tts/piper/speak", response_model=PiperTTSSpeakResponse)
+async def create_piper_tts_audio(payload: PiperTTSSpeakRequest, request: Request) -> dict[str, Any]:
+    try:
+        result = await asyncio.to_thread(PIPER_TTS_SERVICE.synthesize, payload.speaker_type, payload.text)
+    except PiperConfigurationError as exc:
+        raise HTTPException(status_code=503, detail=f"Piper configuration error: {exc}") from exc
+    except PiperSynthesisError as exc:
+        raise HTTPException(status_code=503, detail=f"Piper synthesis failed: {exc}") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:  # pragma: no cover - integration guarded
+        logger.exception("Piper TTS request failed unexpectedly")
+        raise HTTPException(status_code=503, detail=f"Piper TTS failed: {exc}") from exc
+
+    return {
+        "speaker_type": result.requested_speaker_type,
+        "resolved_speaker_type": result.resolved_speaker_type,
+        "cache_key": result.cache_key,
+        "cache_hit": result.cache_hit,
+        "used_fallback_voice": result.used_fallback_voice,
+        "audio_url": str(request.url_for("get_piper_tts_audio", cache_key=result.cache_key)),
+    }
+
+
+@app.get("/v1/tts/piper/audio/{cache_key}", name="get_piper_tts_audio")
+async def get_piper_tts_audio(cache_key: str) -> FileResponse:
+    try:
+        audio_path = await asyncio.to_thread(PIPER_TTS_SERVICE.audio_path_for_cache_key, cache_key)
+    except (PiperAudioNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except PiperConfigurationError as exc:
+        raise HTTPException(status_code=503, detail=f"Piper configuration error: {exc}") from exc
+    except Exception as exc:  # pragma: no cover - integration guarded
+        logger.exception("Piper TTS audio fetch failed unexpectedly")
+        raise HTTPException(status_code=503, detail=f"Piper audio fetch failed: {exc}") from exc
+
+    return FileResponse(path=audio_path, media_type="audio/wav", filename=audio_path.name)
 
 
 @app.post("/v1/gemini/commentary", response_model=GeminiCoachResponse)

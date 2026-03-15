@@ -6,6 +6,7 @@ __pycache__/
 .env
 
 server-app/.ruff_cache/
+server-app/.cache/
 
 legacy/old-client/.gradle/
 legacy/old-client/.kotlin/

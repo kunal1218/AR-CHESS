@@ -1,0 +1,35 @@
+{
+  "binary_path": "piper/bin/piper",
+  "cache_dir": ".cache/piper",
+  "default_speaker_type": "narrator",
+  "voices": {
+    "pawn": {
+      "model_path": "piper/voices/pawn/pawn.onnx",
+      "config_path": "piper/voices/pawn/pawn.onnx.json"
+    },
+    "rook": {
+      "model_path": "piper/voices/rook/rook.onnx",
+      "config_path": "piper/voices/rook/rook.onnx.json"
+    },
+    "knight": {
+      "model_path": "piper/voices/knight/knight.onnx",
+      "config_path": "piper/voices/knight/knight.onnx.json"
+    },
+    "bishop": {
+      "model_path": "piper/voices/bishop/bishop.onnx",
+      "config_path": "piper/voices/bishop/bishop.onnx.json"
+    },
+    "queen": {
+      "model_path": "piper/voices/queen/queen.onnx",
+      "config_path": "piper/voices/queen/queen.onnx.json"
+    },
+    "king": {
+      "model_path": "piper/voices/king/king.onnx",
+      "config_path": "piper/voices/king/king.onnx.json"
+    },
+    "narrator": {
+      "model_path": "piper/voices/narrator/narrator.onnx",
+      "config_path": "piper/voices/narrator/narrator.onnx.json"
+    }
+  }
+}

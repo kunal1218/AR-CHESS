@@ -2,6 +2,7 @@ import sys
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -1300,6 +1301,52 @@ def test_create_gemini_piece_voice_line_returns_sanitized_line(monkeypatch) -> N
 
     assert response.status_code == 200
     assert response.json() == {"line": "Break them now."}
+
+
+def test_create_piper_tts_audio_returns_cached_metadata(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "main.PIPER_TTS_SERVICE.synthesize",
+        lambda speaker_type, text: SimpleNamespace(
+            requested_speaker_type=speaker_type,
+            resolved_speaker_type="rook",
+            cache_key="rook-rook-break-them-now-1234567890abcdef1234567890abcdef",
+            cache_hit=True,
+            used_fallback_voice=False,
+            audio_path=Path("/tmp/rook.wav"),
+        ),
+    )
+
+    client = TestClient(app)
+    response = client.post(
+        "/v1/tts/piper/speak",
+        json={
+            "speaker_type": "rook",
+            "text": "Break them now.",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "speaker_type": "rook",
+        "resolved_speaker_type": "rook",
+        "cache_key": "rook-rook-break-them-now-1234567890abcdef1234567890abcdef",
+        "cache_hit": True,
+        "used_fallback_voice": False,
+        "audio_url": "http://testserver/v1/tts/piper/audio/rook-rook-break-them-now-1234567890abcdef1234567890abcdef",
+    }
+
+
+def test_get_piper_tts_audio_returns_cached_wav(monkeypatch, tmp_path: Path) -> None:
+    audio_path = tmp_path / "rook.wav"
+    audio_path.write_bytes(b"RIFFfakewavdata")
+    monkeypatch.setattr("main.PIPER_TTS_SERVICE.audio_path_for_cache_key", lambda cache_key: audio_path)
+
+    client = TestClient(app)
+    response = client.get("/v1/tts/piper/audio/rook-rook-break-them-now-1234567890abcdef1234567890abcdef")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "audio/wav"
+    assert response.content == b"RIFFfakewavdata"
 
 
 def test_create_gemini_passive_commentary_line_returns_sanitized_line(monkeypatch) -> None:

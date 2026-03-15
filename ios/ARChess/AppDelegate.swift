@@ -611,6 +611,49 @@ private struct GeminiPassiveNarratorLineResponsePayload: Decodable {
   let line: String
 }
 
+private enum PiperSpeakerType: String {
+  case pawn
+  case rook
+  case knight
+  case bishop
+  case queen
+  case king
+  case narrator
+
+  var displayName: String {
+    switch self {
+    case .pawn:
+      return "Pawn"
+    case .rook:
+      return "Rook"
+    case .knight:
+      return "Knight"
+    case .bishop:
+      return "Bishop"
+    case .queen:
+      return "Queen"
+    case .king:
+      return "King"
+    case .narrator:
+      return "Narrator"
+    }
+  }
+}
+
+private struct PiperSpeakLineRequestPayload: Encodable {
+  let speaker_type: String
+  let text: String
+}
+
+private struct PiperSpeakLineResponsePayload: Decodable {
+  let speaker_type: String
+  let resolved_speaker_type: String
+  let cache_key: String
+  let cache_hit: Bool
+  let used_fallback_voice: Bool
+  let audio_url: String
+}
+
 private struct GeminiPieceRole: Decodable, Equatable, Hashable {
   let piece: String
   let square: String
@@ -2432,6 +2475,382 @@ private final class GeminiPassiveNarratorLiveSpeaker {
     queryItems.append(URLQueryItem(name: "narrator", value: narrator.rawValue))
     components?.queryItems = queryItems
     return components?.url
+  }
+}
+
+private struct PiperPreparedLine {
+  let requestedSpeakerType: PiperSpeakerType
+  let resolvedSpeakerType: PiperSpeakerType
+  let cacheKey: String
+  let cacheHit: Bool
+  let usedFallbackVoice: Bool
+  let localFileURL: URL
+}
+
+private final class PiperTTSService {
+  private static let logger = Logger(subsystem: "ARChess", category: "PiperTTSService")
+
+  private let apiBaseURL: URL?
+  private let session: URLSession
+  private let fileManager: FileManager
+  private let encoder = JSONEncoder()
+  private let decoder = JSONDecoder()
+
+  init(
+    apiBaseURL: URL? = AppRuntimeConfig.current.apiBaseURL,
+    session: URLSession = .shared,
+    fileManager: FileManager = .default
+  ) {
+    self.apiBaseURL = apiBaseURL
+    self.session = session
+    self.fileManager = fileManager
+  }
+
+  var isConfigured: Bool {
+    apiBaseURL != nil
+  }
+
+  func prepareCacheIfNeeded() {
+    let directory = cacheDirectory()
+    try? fileManager.createDirectory(at: directory, withIntermediateDirectories: true, attributes: nil)
+  }
+
+  func synthesizeLine(
+    speakerType: PiperSpeakerType,
+    text: String
+  ) async throws -> PiperPreparedLine {
+    guard let baseURL = apiBaseURL else {
+      throw NSError(
+        domain: "ARChess.PiperTTS",
+        code: -2001,
+        userInfo: [NSLocalizedDescriptionKey: "Piper TTS is disabled until ARChessAPIBaseURL is configured."]
+      )
+    }
+
+    let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmedText.isEmpty else {
+      throw NSError(
+        domain: "ARChess.PiperTTS",
+        code: -2002,
+        userInfo: [NSLocalizedDescriptionKey: "Piper TTS cannot speak an empty line."]
+      )
+    }
+
+    var request = URLRequest(
+      url: baseURL
+        .appendingPathComponent("v1")
+        .appendingPathComponent("tts")
+        .appendingPathComponent("piper")
+        .appendingPathComponent("speak")
+    )
+    request.httpMethod = "POST"
+    request.timeoutInterval = 20.0
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.setValue("application/json", forHTTPHeaderField: "Accept")
+    request.httpBody = try encoder.encode(
+      PiperSpeakLineRequestPayload(
+        speaker_type: speakerType.rawValue,
+        text: trimmedText
+      )
+    )
+
+    let (data, response) = try await session.data(for: request)
+    guard let httpResponse = response as? HTTPURLResponse else {
+      throw NSError(
+        domain: "ARChess.PiperTTS",
+        code: -2003,
+        userInfo: [NSLocalizedDescriptionKey: "Piper TTS metadata endpoint did not return HTTP."]
+      )
+    }
+
+    guard (200..<300).contains(httpResponse.statusCode) else {
+      let message = String(data: data, encoding: .utf8) ?? "Unexpected Piper TTS response."
+      throw NSError(
+        domain: "ARChess.PiperTTS",
+        code: httpResponse.statusCode,
+        userInfo: [NSLocalizedDescriptionKey: message]
+      )
+    }
+
+    let payload = try decoder.decode(PiperSpeakLineResponsePayload.self, from: data)
+    let sanitizedCacheKey = Self.sanitizeCacheKey(payload.cache_key)
+    let localFileURL = cacheDirectory().appendingPathComponent("\(sanitizedCacheKey).wav")
+    if !isPlayableAudioFile(at: localFileURL) {
+      let audioURL = try resolveAudioURL(payload.audio_url, apiBaseURL: baseURL)
+      try await downloadAudioIfNeeded(from: audioURL, to: localFileURL)
+    }
+
+    let requestedSpeaker = PiperSpeakerType(rawValue: payload.speaker_type) ?? speakerType
+    let resolvedSpeaker = PiperSpeakerType(rawValue: payload.resolved_speaker_type) ?? .narrator
+    return PiperPreparedLine(
+      requestedSpeakerType: requestedSpeaker,
+      resolvedSpeakerType: resolvedSpeaker,
+      cacheKey: sanitizedCacheKey,
+      cacheHit: payload.cache_hit,
+      usedFallbackVoice: payload.used_fallback_voice,
+      localFileURL: localFileURL
+    )
+  }
+
+  private func downloadAudioIfNeeded(from audioURL: URL, to destinationURL: URL) async throws {
+    try fileManager.createDirectory(at: cacheDirectory(), withIntermediateDirectories: true, attributes: nil)
+
+    if isPlayableAudioFile(at: destinationURL) {
+      return
+    }
+
+    let (temporaryURL, response) = try await session.download(from: audioURL)
+    guard let httpResponse = response as? HTTPURLResponse else {
+      throw NSError(
+        domain: "ARChess.PiperTTS",
+        code: -2004,
+        userInfo: [NSLocalizedDescriptionKey: "Piper audio endpoint did not return HTTP."]
+      )
+    }
+
+    guard (200..<300).contains(httpResponse.statusCode) else {
+      throw NSError(
+        domain: "ARChess.PiperTTS",
+        code: httpResponse.statusCode,
+        userInfo: [NSLocalizedDescriptionKey: "Piper audio download failed with status \(httpResponse.statusCode)."]
+      )
+    }
+
+    let stagingURL = destinationURL
+      .deletingLastPathComponent()
+      .appendingPathComponent("\(UUID().uuidString)-\(destinationURL.lastPathComponent)")
+    if fileManager.fileExists(atPath: stagingURL.path) {
+      try? fileManager.removeItem(at: stagingURL)
+    }
+
+    do {
+      try fileManager.copyItem(at: temporaryURL, to: stagingURL)
+    } catch {
+      Self.logger.error("Piper audio copy failed: \(error.localizedDescription, privacy: .public)")
+      throw error
+    }
+
+    if isPlayableAudioFile(at: destinationURL) {
+      try? fileManager.removeItem(at: stagingURL)
+      return
+    }
+
+    if fileManager.fileExists(atPath: destinationURL.path) {
+      try? fileManager.removeItem(at: destinationURL)
+    }
+    try fileManager.moveItem(at: stagingURL, to: destinationURL)
+  }
+
+  private func resolveAudioURL(_ rawValue: String, apiBaseURL: URL) throws -> URL {
+    if let directURL = URL(string: rawValue), directURL.scheme != nil {
+      return directURL
+    }
+
+    if let relativeURL = URL(string: rawValue, relativeTo: apiBaseURL)?.absoluteURL {
+      return relativeURL
+    }
+
+    throw NSError(
+      domain: "ARChess.PiperTTS",
+      code: -2005,
+      userInfo: [NSLocalizedDescriptionKey: "Piper audio_url could not be resolved."]
+    )
+  }
+
+  private func cacheDirectory() -> URL {
+    let root = fileManager.urls(for: .cachesDirectory, in: .userDomainMask).first
+      ?? URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+    return root.appendingPathComponent("PiperTTS", isDirectory: true)
+  }
+
+  private func isPlayableAudioFile(at fileURL: URL) -> Bool {
+    guard fileManager.fileExists(atPath: fileURL.path) else {
+      return false
+    }
+
+    let attributes = try? fileManager.attributesOfItem(atPath: fileURL.path)
+    let fileSize = (attributes?[.size] as? NSNumber)?.intValue ?? 0
+    return fileSize > 0
+  }
+
+  private static func sanitizeCacheKey(_ rawValue: String) -> String {
+    let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-"))
+    let filteredScalars = rawValue.unicodeScalars.filter { allowed.contains($0) }
+    let sanitized = String(String.UnicodeScalarView(filteredScalars))
+    return sanitized.isEmpty ? UUID().uuidString.lowercased() : sanitized.lowercased()
+  }
+}
+
+@MainActor
+private final class PiperAutomaticSpeaker: NSObject, AVAudioPlayerDelegate {
+  struct SpeechLine {
+    let speakerType: PiperSpeakerType
+    let text: String
+  }
+
+  struct PlaybackRequest {
+    let line: SpeechLine
+  }
+
+  private static let logger = Logger(subsystem: "ARChess", category: "PiperAutomaticSpeaker")
+
+  private let ttsService: PiperTTSService
+  private var currentTask: Task<Void, Never>?
+  private var audioPlayer: AVAudioPlayer?
+  private var currentRequest: PlaybackRequest?
+  private var isPreparing = false
+  private var isAudioPlaying = false
+
+  var onBusyStateChange: ((Bool) -> Void)?
+  var onPlaybackActivityChange: ((PlaybackRequest?, Bool) -> Void)?
+  var onVoicePrepared: ((PlaybackRequest, PiperPreparedLine) -> Void)?
+  var onLineFailure: ((PlaybackRequest, String) -> Void)?
+
+  init(ttsService: PiperTTSService = PiperTTSService()) {
+    self.ttsService = ttsService
+    super.init()
+  }
+
+  var isConfigured: Bool {
+    ttsService.isConfigured
+  }
+
+  var isBusy: Bool {
+    isPreparing || isAudioPlaying
+  }
+
+  func prepareIfNeeded() {
+    ttsService.prepareCacheIfNeeded()
+  }
+
+  func speakLine(_ line: SpeechLine) -> Bool {
+    let trimmedText = line.text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmedText.isEmpty, !isBusy else {
+      return false
+    }
+
+    currentRequest = PlaybackRequest(
+      line: SpeechLine(
+        speakerType: line.speakerType,
+        text: trimmedText
+      )
+    )
+    isPreparing = true
+    notifyBusyStateChange()
+
+    currentTask = Task { @MainActor [weak self] in
+      await self?.synthesizeAndPlayCurrentRequest()
+    }
+    return true
+  }
+
+  func stop() {
+    currentTask?.cancel()
+    currentTask = nil
+    let stoppedRequest = currentRequest
+    currentRequest = nil
+    isPreparing = false
+    audioPlayer?.stop()
+    audioPlayer = nil
+
+    if isAudioPlaying {
+      AmbientMusicController.shared.setSpeechActive(false)
+      onPlaybackActivityChange?(stoppedRequest, false)
+    }
+    isAudioPlaying = false
+    notifyBusyStateChange()
+  }
+
+  private func synthesizeAndPlayCurrentRequest() async {
+    guard let request = currentRequest else {
+      currentTask = nil
+      isPreparing = false
+      notifyBusyStateChange()
+      return
+    }
+
+    do {
+      let preparedLine = try await ttsService.synthesizeLine(
+        speakerType: request.line.speakerType,
+        text: request.line.text
+      )
+      guard !Task.isCancelled else {
+        currentTask = nil
+        isPreparing = false
+        notifyBusyStateChange()
+        return
+      }
+
+      try AudioSessionCoordinator.shared.activatePlaybackSession()
+      let player = try AVAudioPlayer(contentsOf: preparedLine.localFileURL)
+      player.delegate = self
+      player.prepareToPlay()
+      audioPlayer = player
+      onVoicePrepared?(request, preparedLine)
+      isPreparing = false
+      currentTask = nil
+
+      guard player.play() else {
+        throw NSError(
+          domain: "ARChess.PiperTTS",
+          code: -2006,
+          userInfo: [NSLocalizedDescriptionKey: "Piper audio player could not start playback."]
+        )
+      }
+
+      isAudioPlaying = true
+      AmbientMusicController.shared.setSpeechActive(true)
+      onPlaybackActivityChange?(request, true)
+      notifyBusyStateChange()
+    } catch is CancellationError {
+      currentTask = nil
+      isPreparing = false
+      notifyBusyStateChange()
+    } catch {
+      Self.logger.error("Piper automatic playback failed: \(error.localizedDescription, privacy: .public)")
+      currentTask = nil
+      isPreparing = false
+      audioPlayer = nil
+      let failedRequest = currentRequest
+      currentRequest = nil
+      if isAudioPlaying {
+        AmbientMusicController.shared.setSpeechActive(false)
+        onPlaybackActivityChange?(failedRequest, false)
+      }
+      isAudioPlaying = false
+      if let failedRequest {
+        onLineFailure?(failedRequest, error.localizedDescription)
+      }
+      notifyBusyStateChange()
+    }
+  }
+
+  func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
+    finishPlayback(failureMessage: flag ? nil : "Piper audio playback ended unsuccessfully.")
+  }
+
+  func audioPlayerDecodeErrorDidOccur(_ player: AVAudioPlayer, error: Error?) {
+    finishPlayback(failureMessage: error?.localizedDescription ?? "Piper audio decode failed.")
+  }
+
+  private func finishPlayback(failureMessage: String?) {
+    let finishedRequest = currentRequest
+    audioPlayer = nil
+    if isAudioPlaying {
+      AmbientMusicController.shared.setSpeechActive(false)
+      onPlaybackActivityChange?(finishedRequest, false)
+    }
+    isAudioPlaying = false
+    currentRequest = nil
+
+    if let failureMessage, let finishedRequest {
+      onLineFailure?(finishedRequest, failureMessage)
+    }
+    notifyBusyStateChange()
+  }
+
+  private func notifyBusyStateChange() {
+    onBusyStateChange?(isBusy)
   }
 }
 
@@ -4697,6 +5116,23 @@ private enum PersonalitySpeaker {
       return 0.98
     }
   }
+
+  var piperSpeakerType: PiperSpeakerType {
+    switch self {
+    case .pawn:
+      return .pawn
+    case .rook:
+      return .rook
+    case .knight:
+      return .knight
+    case .bishop:
+      return .bishop
+    case .queen:
+      return .queen
+    case .king:
+      return .king
+    }
+  }
 }
 
 private struct SpokenLine {
@@ -6489,6 +6925,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   private let synthesizer = AVSpeechSynthesizer()
   private let narrator: NarratorType
   private let passiveNarratorLiveSpeaker: GeminiPassiveNarratorLiveSpeaker
+  private let piperAutomaticSpeaker = PiperAutomaticSpeaker()
   private var utteranceCaptions: [ObjectIdentifier: Caption] = [:]
   private var utteranceStyles: [ObjectIdentifier: GeneratedNarrationStyle] = [:]
   private var utteranceAutomaticDialogueRecords: [ObjectIdentifier: AutomaticDialoguePlaybackRecord] = [:]
@@ -6615,6 +7052,88 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
         self.flushQueuedAutomaticCommentaryDecisionIfPossible()
       }
     }
+    piperAutomaticSpeaker.onPlaybackActivityChange = { [weak self] _, isActive in
+      Task { @MainActor [weak self] in
+        guard let self else {
+          return
+        }
+        guard isActive,
+              !self.activePassiveAutomaticPlaybackDidStart,
+              let playbackRecord = self.activePassiveAutomaticPlaybackRecord else {
+          return
+        }
+        self.activePassiveAutomaticPlaybackDidStart = true
+        self.beginAutomaticDialoguePlayback(playbackRecord)
+      }
+    }
+    piperAutomaticSpeaker.onBusyStateChange = { [weak self] isBusy in
+      Task { @MainActor [weak self] in
+        guard let self else {
+          return
+        }
+        if !isBusy, self.liveNarratorPlaybackOwnsCaption {
+          if self.activePassiveAutomaticPlaybackDidStart,
+             let playbackRecord = self.activePassiveAutomaticPlaybackRecord {
+            self.endAutomaticDialoguePlayback(playbackRecord)
+          }
+          self.activePassiveAutomaticPlaybackRecord = nil
+          self.activePassiveAutomaticPlaybackDidStart = false
+          self.liveNarratorPlaybackOwnsCaption = false
+          self.caption = nil
+          self.flushPendingGeneratedNarrationIfPossible()
+          self.flushQueuedAutomaticCommentaryDecisionIfPossible()
+        }
+      }
+    }
+    piperAutomaticSpeaker.onVoicePrepared = { [weak self] request, preparedLine in
+      Task { @MainActor [weak self] in
+        guard let self else {
+          return
+        }
+        if preparedLine.usedFallbackVoice {
+          self.appendGeminiDebug(
+            "Piper fell back from \(request.line.speakerType.rawValue) to \(preparedLine.resolvedSpeakerType.rawValue) because the configured voice model was unavailable."
+          )
+        }
+      }
+    }
+    piperAutomaticSpeaker.onLineFailure = { [weak self] request, message in
+      Task { @MainActor [weak self] in
+        guard let self else {
+          return
+        }
+        self.appendGeminiDebug(
+          "Piper automatic audio failed: \(message). Falling back to local speech."
+        )
+        let playbackRecord = self.activePassiveAutomaticPlaybackRecord
+        self.activePassiveAutomaticPlaybackRecord = nil
+        self.activePassiveAutomaticPlaybackDidStart = false
+        self.liveNarratorPlaybackOwnsCaption = false
+        self.caption = nil
+
+        switch request.line.speakerType {
+        case .narrator:
+          self.pieceVoiceStatusText = "Narrator Piper unavailable. Using local fallback."
+          _ = self.startLocalAutomaticNarratorUtterance(
+            text: request.line.text,
+            playbackRecord: playbackRecord
+          )
+        case .pawn, .rook, .knight, .bishop, .queen, .king:
+          guard let speaker = self.personalitySpeaker(for: request.line.speakerType) else {
+            self.pieceVoiceStatusText = "Piece Piper unavailable."
+            self.flushQueuedAutomaticCommentaryDecisionIfPossible()
+            return
+          }
+          self.pieceVoiceStatusText = "\(speaker.displayName) Piper unavailable. Using local fallback."
+          _ = self.startLocalPieceVoiceUtterance(
+            text: request.line.text,
+            speaker: speaker,
+            playbackRecord: playbackRecord
+          )
+        }
+        self.flushQueuedAutomaticCommentaryDecisionIfPossible()
+      }
+    }
   }
 
   func attachEngineHost(to view: UIView) {
@@ -6674,7 +7193,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
         try AudioSessionCoordinator.shared.activatePlaybackSession()
         _ = AVSpeechSynthesisVoice(language: "en-US")
         self.prewarmSpeechSynthesizerIfNeeded()
-        self.passiveNarratorLiveSpeaker.prewarmIfNeeded()
+        self.piperAutomaticSpeaker.prepareIfNeeded()
         self.hasPrewarmedSpeechPath = true
       } catch {
         return
@@ -6777,6 +7296,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
 
   func resetSession() {
     synthesizer.stopSpeaking(at: .immediate)
+    piperAutomaticSpeaker.stop()
     utteranceCaptions.removeAll()
     utteranceStyles.removeAll()
     utteranceAutomaticDialogueRecords.removeAll()
@@ -7365,7 +7885,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       return true
     }
 
-    if passiveNarratorLiveSpeaker.isBusy {
+    if piperAutomaticSpeaker.isBusy {
       return true
     }
 
@@ -8553,6 +9073,25 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       return .queen
     case .king:
       return .king
+    }
+  }
+
+  private func personalitySpeaker(for speakerType: PiperSpeakerType) -> PersonalitySpeaker? {
+    switch speakerType {
+    case .pawn:
+      return .pawn
+    case .rook:
+      return .rook
+    case .knight:
+      return .knight
+    case .bishop:
+      return .bishop
+    case .queen:
+      return .queen
+    case .king:
+      return .king
+    case .narrator:
+      return nil
     }
   }
 
@@ -10498,14 +11037,14 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       priority: priority,
       rawDuration: pieceAudioBusyDurationProvider?() ?? 0
     )
-    let passiveNarratorBusy = passiveNarratorLiveSpeaker.isBusy
-    if synthesizer.isSpeaking || pieceAudioBusyDuration > 0.05 || passiveNarratorBusy {
+    let piperBusy = piperAutomaticSpeaker.isBusy
+    if synthesizer.isSpeaking || pieceAudioBusyDuration > 0.05 || piperBusy {
       let retryDelay = max(pieceAudioBusyDuration, priority == .urgent ? 0.05 : 0.08)
       if case .pieceVoice(let speaker) = style {
         pieceVoiceStatusText = "Queued \(speaker.displayName) voice behind speech/SFX."
       }
       appendGeminiDebug(
-        "Queued \(generatedNarrationDebugLabel(style)) speech. synthesizer=\(synthesizer.isSpeaking) passive_live=\(passiveNarratorBusy) sfx_busy=\(String(format: "%.2f", pieceAudioBusyDuration)) retry=\(String(format: "%.2f", retryDelay))"
+        "Queued \(generatedNarrationDebugLabel(style)) speech. synthesizer=\(synthesizer.isSpeaking) piper_busy=\(piperBusy) sfx_busy=\(String(format: "%.2f", pieceAudioBusyDuration)) retry=\(String(format: "%.2f", retryDelay))"
       )
       queuePendingGeneratedNarration(
         text: sanitizedText,
@@ -10537,7 +11076,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
 
     switch style {
     case .automaticNarrator, .pieceVoice:
-      return startPassiveAutomaticLivePlayback(
+      return startPiperAutomaticPlayback(
         text: text,
         style: style,
         playbackRecord: playbackRecord
@@ -10586,19 +11125,20 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     return true
   }
 
-  private func startPassiveAutomaticLivePlayback(
+  private func startPiperAutomaticPlayback(
     text: String,
     style: GeneratedNarrationStyle,
     playbackRecord: AutomaticDialoguePlaybackRecord?
   ) -> Bool {
     maybeHighlightNarrationFocus(text)
 
-    let role: GeminiPassiveAutomaticSpeakerRole
-    let speakerName: String?
+    let speechLine: PiperAutomaticSpeaker.SpeechLine
     switch style {
     case .automaticNarrator:
-      role = .narrator
-      speakerName = nil
+      speechLine = PiperAutomaticSpeaker.SpeechLine(
+        speakerType: .narrator,
+        text: text
+      )
       caption = Caption(
         title: "Narrator",
         line: text,
@@ -10606,17 +11146,19 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       )
       pieceVoiceStatusText = "Speaking narrator line."
     case .pieceVoice(let speaker):
-      role = .piece
-      speakerName = speaker.displayName
+      speechLine = PiperAutomaticSpeaker.SpeechLine(
+        speakerType: speaker.piperSpeakerType,
+        text: text
+      )
       caption = Caption(speaker: speaker, line: text)
       pieceVoiceStatusText = "Speaking \(speaker.displayName) voice."
     case .gemini:
       return false
     }
 
-    appendGeminiDebug("Speech start: \(generatedNarrationDebugLabel(style)) via Gemini Live -> \(text)")
-    guard passiveNarratorLiveSpeaker.speak(line: text, role: role, speakerName: speakerName) else {
-      appendGeminiDebug("Gemini passive automatic audio unavailable right now; using local speech fallback.")
+    appendGeminiDebug("Speech start: \(generatedNarrationDebugLabel(style)) via Piper -> \(text)")
+    guard piperAutomaticSpeaker.speakLine(speechLine) else {
+      appendGeminiDebug("Piper automatic audio unavailable right now; using local speech fallback.")
       activePassiveAutomaticPlaybackRecord = nil
       activePassiveAutomaticPlaybackDidStart = false
       liveNarratorPlaybackOwnsCaption = false
@@ -10743,10 +11285,10 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       rawDuration: pieceAudioBusyDurationProvider?() ?? 0
     )
     guard !synthesizer.isSpeaking,
-          !passiveNarratorLiveSpeaker.isBusy,
+          !piperAutomaticSpeaker.isBusy,
           pieceAudioBusyDuration <= 0.05 else {
       appendGeminiDebug(
-        "Pending speech blocked for \(generatedNarrationDebugLabel(pendingGeneratedNarration.style)). synthesizer=\(synthesizer.isSpeaking) passive_live=\(passiveNarratorLiveSpeaker.isBusy) sfx_busy=\(String(format: "%.2f", pieceAudioBusyDuration))"
+        "Pending speech blocked for \(generatedNarrationDebugLabel(pendingGeneratedNarration.style)). synthesizer=\(synthesizer.isSpeaking) piper_busy=\(piperAutomaticSpeaker.isBusy) sfx_busy=\(String(format: "%.2f", pieceAudioBusyDuration))"
       )
       schedulePendingGeneratedNarrationFlush(after: max(pieceAudioBusyDuration, 0.08))
       return

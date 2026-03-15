@@ -26,6 +26,11 @@ Backend owned by Person 1.
   - `GEMINI_LIVE_MODEL` (optional, default `models/gemini-2.5-flash-native-audio-preview-12-2025`)
   - `GEMINI_LIVE_TEMPERATURE`, `GEMINI_LIVE_TOP_P`, `GEMINI_LIVE_TOP_K`, `GEMINI_LIVE_MAX_OUTPUT_TOKENS` (optional tuning)
   - `GEMINI_LIVE_TURN_TIMEOUT_SECONDS` (optional)
+- Piper TTS is local-only and reads:
+  - `PIPER_VOICES_CONFIG_PATH` (optional, defaults to `server-app/config/piper_voices.json`)
+  - `PIPER_BINARY_PATH` (optional override for the Piper executable path)
+  - `PIPER_CACHE_DIR` (optional override for the generated wav cache directory)
+  - `PIPER_TTS_TIMEOUT_SECONDS` (optional, default `20`)
 - Gemini 3 models are not currently supported on the Live API. If you add a non-Live Gemini path later, keep it on a separate model config instead of pointing `GEMINI_LIVE_MODEL` at Gemini 3.
 
 ## Health ping
@@ -106,6 +111,23 @@ Matchmaking uses Postgres transactions and `FOR UPDATE SKIP LOCKED` so two queue
   - Defaults to `models/gemini-2.5-flash-native-audio-preview-12-2025`, because the older `gemini-2.0-flash-live-001` model is shut down and Gemini 3 does not currently support the Live API.
   - Each turn is sent to Gemini as a structured packet with current FEN, recent move narrative, and the query text.
   - Turns are serialized to avoid interleaving.
+
+## Piper TTS
+
+- `POST /v1/tts/piper/speak`
+  - Request body:
+    - `speaker_type` (`pawn`, `rook`, `knight`, `bishop`, `queen`, `king`, `narrator`)
+    - `text`
+  - Returns:
+    - `cache_key`
+    - `cache_hit`
+    - `used_fallback_voice`
+    - `resolved_speaker_type`
+    - `audio_url`
+- `GET /v1/tts/piper/audio/{cache_key}`
+  - Returns the cached wav file for playback in the client.
+- Voice paths live in `server-app/config/piper_voices.json`.
+- Generated wav files are cached under `server-app/.cache/piper/` by default.
 
 ## Verify locally
 
