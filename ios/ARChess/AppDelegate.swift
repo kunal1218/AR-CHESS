@@ -494,8 +494,8 @@ private struct AppRuntimeConfig {
 
   init() {
     let sources = [
-      Bundle.main.object(forInfoDictionaryKey: "ARChessAPIBaseURL") as? String,
       ProcessInfo.processInfo.environment["AR_CHESS_API_BASE_URL"],
+      Bundle.main.object(forInfoDictionaryKey: "ARChessAPIBaseURL") as? String,
     ]
 
     var resolvedAPIBaseURL: URL?
@@ -11210,7 +11210,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     if let playbackRecord {
       utteranceAutomaticDialogueRecords[ObjectIdentifier(utterance)] = playbackRecord
     }
-    pieceVoiceStatusText = "Speaking narrator line."
+    pieceVoiceStatusText = "Speaking narrator line via local fallback."
     appendGeminiDebug("Speech start: Narrator (local fallback) -> \(text)")
     maybeHighlightNarrationFocus(text)
     synthesizer.speak(utterance)
@@ -11233,7 +11233,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     if let playbackRecord {
       utteranceAutomaticDialogueRecords[ObjectIdentifier(utterance)] = playbackRecord
     }
-    pieceVoiceStatusText = "Speaking \(speaker.displayName) voice."
+    pieceVoiceStatusText = "Speaking \(speaker.displayName) voice via local fallback."
     appendGeminiDebug("Speech start: \(speaker.displayName) piece voice (local fallback) -> \(text)")
     maybeHighlightNarrationFocus(text)
     synthesizer.speak(utterance)
