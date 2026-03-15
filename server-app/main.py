@@ -35,6 +35,7 @@ from services.passive_narrator_live import PassiveNarratorLiveSession
 from services.piper_tts import (
     PiperAudioNotFoundError,
     PiperConfigurationError,
+    PiperVoiceInventory,
     PiperSynthesisError,
     PiperTTSService,
 )
@@ -750,6 +751,66 @@ class PiperTTSSpeakResponse(BaseModel):
     cache_hit: bool
     used_fallback_voice: bool
     audio_url: str
+
+
+class PiperVoiceAuditionRequest(BaseModel):
+    voice_id: str = Field(..., min_length=1, max_length=256)
+    text: str = Field(..., min_length=1, max_length=200)
+
+    @field_validator("voice_id")
+    @classmethod
+    def validate_voice_id(cls, value: str) -> str:
+        normalized = re.sub(r"\s+", " ", value).strip()
+        if not normalized:
+            raise ValueError("voice_id must not be empty.")
+        return normalized
+
+    @field_validator("text")
+    @classmethod
+    def validate_audition_text(cls, value: str) -> str:
+        normalized = re.sub(r"\s+", " ", value).strip()
+        if not normalized:
+            raise ValueError("text must not be empty.")
+        return normalized[:200]
+
+
+class PiperVoiceResponse(BaseModel):
+    voice_id: str
+    name: str
+    language: str | None = None
+    quality: str | None = None
+    sample_rate: int | None = None
+    configured_speaker_types: list[str] = Field(default_factory=list)
+
+
+class PiperVoiceInventoryResponse(BaseModel):
+    default_speaker_type: str
+    speaker_assignments: dict[str, str | None]
+    voices: list[PiperVoiceResponse]
+
+
+class PiperVoiceAuditionResponse(BaseModel):
+    voice_id: str
+    cache_key: str
+    cache_hit: bool
+    audio_url: str
+
+
+class PiperVoiceAssignmentRequest(BaseModel):
+    voice_id: str = Field(..., min_length=1, max_length=256)
+
+    @field_validator("voice_id")
+    @classmethod
+    def validate_assignment_voice_id(cls, value: str) -> str:
+        normalized = re.sub(r"\s+", " ", value).strip()
+        if not normalized:
+            raise ValueError("voice_id must not be empty.")
+        return normalized
+
+
+class PiperVoiceAssignmentResponse(BaseModel):
+    speaker_type: str
+    assigned_voice_id: str | None = None
 
 
 GEMINI_HINT_SYSTEM_PROMPT = """
@@ -3097,6 +3158,37 @@ async def create_gemini_piece_voice_line(payload: GeminiPieceVoiceRequest) -> di
     return {"line": line}
 
 
+def _serialize_piper_voice_inventory(inventory: PiperVoiceInventory) -> dict[str, Any]:
+    return {
+        "default_speaker_type": inventory.default_speaker_type,
+        "speaker_assignments": inventory.speaker_assignments,
+        "voices": [
+            {
+                "voice_id": voice.voice_id,
+                "name": voice.name,
+                "language": voice.language,
+                "quality": voice.quality,
+                "sample_rate": voice.sample_rate,
+                "configured_speaker_types": list(voice.configured_speaker_types),
+            }
+            for voice in inventory.voices
+        ],
+    }
+
+
+@app.get("/v1/tts/piper/voices", response_model=PiperVoiceInventoryResponse)
+async def list_piper_tts_voices() -> dict[str, Any]:
+    try:
+        inventory = await asyncio.to_thread(PIPER_TTS_SERVICE.list_available_voices)
+    except PiperConfigurationError as exc:
+        raise HTTPException(status_code=503, detail=f"Piper configuration error: {exc}") from exc
+    except Exception as exc:  # pragma: no cover - integration guarded
+        logger.exception("Piper voice inventory request failed unexpectedly")
+        raise HTTPException(status_code=503, detail=f"Piper voice inventory failed: {exc}") from exc
+
+    return _serialize_piper_voice_inventory(inventory)
+
+
 @app.post("/v1/tts/piper/speak", response_model=PiperTTSSpeakResponse)
 async def create_piper_tts_audio(payload: PiperTTSSpeakRequest, request: Request) -> dict[str, Any]:
     try:
@@ -3118,6 +3210,52 @@ async def create_piper_tts_audio(payload: PiperTTSSpeakRequest, request: Request
         "cache_hit": result.cache_hit,
         "used_fallback_voice": result.used_fallback_voice,
         "audio_url": str(request.url_for("get_piper_tts_audio", cache_key=result.cache_key)),
+    }
+
+
+@app.post("/v1/tts/piper/audition", response_model=PiperVoiceAuditionResponse)
+async def create_piper_tts_audition(payload: PiperVoiceAuditionRequest, request: Request) -> dict[str, Any]:
+    try:
+        result = await asyncio.to_thread(PIPER_TTS_SERVICE.synthesize_audition, payload.voice_id, payload.text)
+    except PiperConfigurationError as exc:
+        raise HTTPException(status_code=503, detail=f"Piper configuration error: {exc}") from exc
+    except PiperSynthesisError as exc:
+        raise HTTPException(status_code=503, detail=f"Piper audition failed: {exc}") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:  # pragma: no cover - integration guarded
+        logger.exception("Piper audition request failed unexpectedly")
+        raise HTTPException(status_code=503, detail=f"Piper audition failed: {exc}") from exc
+
+    return {
+        "voice_id": result.voice_id,
+        "cache_key": result.cache_key,
+        "cache_hit": result.cache_hit,
+        "audio_url": str(request.url_for("get_piper_tts_audio", cache_key=result.cache_key)),
+    }
+
+
+@app.put(
+    "/v1/tts/piper/voices/assignments/{speaker_type}",
+    response_model=PiperVoiceAssignmentResponse,
+)
+async def assign_piper_tts_voice(
+    speaker_type: str,
+    payload: PiperVoiceAssignmentRequest,
+) -> dict[str, Any]:
+    try:
+        inventory = await asyncio.to_thread(PIPER_TTS_SERVICE.assign_voice, speaker_type, payload.voice_id)
+    except PiperConfigurationError as exc:
+        raise HTTPException(status_code=503, detail=f"Piper configuration error: {exc}") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:  # pragma: no cover - integration guarded
+        logger.exception("Piper voice assignment failed unexpectedly")
+        raise HTTPException(status_code=503, detail=f"Piper voice assignment failed: {exc}") from exc
+
+    return {
+        "speaker_type": speaker_type.strip().lower(),
+        "assigned_voice_id": inventory.speaker_assignments.get(speaker_type.strip().lower()),
     }
 
 

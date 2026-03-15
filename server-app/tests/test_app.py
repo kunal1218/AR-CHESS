@@ -1336,6 +1336,135 @@ def test_create_piper_tts_audio_returns_cached_metadata(monkeypatch) -> None:
     }
 
 
+def test_list_piper_tts_voices_returns_installed_voice_inventory(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "main.PIPER_TTS_SERVICE.list_available_voices",
+        lambda: SimpleNamespace(
+            default_speaker_type="narrator",
+            speaker_assignments={
+                "pawn": None,
+                "rook": "rook/en_US-lessac-medium",
+                "knight": "knight/en_US-lessac-medium",
+                "bishop": None,
+                "queen": None,
+                "king": None,
+                "narrator": "narrator/en_US-lessac-medium",
+            },
+            voices=[
+                SimpleNamespace(
+                    voice_id="knight/en_US-lessac-medium",
+                    name="en_US-lessac-medium",
+                    language="en-us",
+                    quality="medium",
+                    sample_rate=22050,
+                    configured_speaker_types=("knight",),
+                ),
+                SimpleNamespace(
+                    voice_id="rook/en_US-lessac-medium",
+                    name="en_US-lessac-medium",
+                    language="en-us",
+                    quality="medium",
+                    sample_rate=22050,
+                    configured_speaker_types=("rook",),
+                ),
+            ],
+        ),
+    )
+
+    client = TestClient(app)
+    response = client.get("/v1/tts/piper/voices")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "default_speaker_type": "narrator",
+        "speaker_assignments": {
+            "pawn": None,
+            "rook": "rook/en_US-lessac-medium",
+            "knight": "knight/en_US-lessac-medium",
+            "bishop": None,
+            "queen": None,
+            "king": None,
+            "narrator": "narrator/en_US-lessac-medium",
+        },
+        "voices": [
+            {
+                "voice_id": "knight/en_US-lessac-medium",
+                "name": "en_US-lessac-medium",
+                "language": "en-us",
+                "quality": "medium",
+                "sample_rate": 22050,
+                "configured_speaker_types": ["knight"],
+            },
+            {
+                "voice_id": "rook/en_US-lessac-medium",
+                "name": "en_US-lessac-medium",
+                "language": "en-us",
+                "quality": "medium",
+                "sample_rate": 22050,
+                "configured_speaker_types": ["rook"],
+            },
+        ],
+    }
+
+
+def test_create_piper_tts_audition_returns_cached_metadata(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "main.PIPER_TTS_SERVICE.synthesize_audition",
+        lambda voice_id, text: SimpleNamespace(
+            voice_id=voice_id,
+            cache_key="audition-knight-a-fast-test-line-1234567890abcdef1234567890abcdef",
+            cache_hit=False,
+            audio_path=Path("/tmp/knight-audition.wav"),
+        ),
+    )
+
+    client = TestClient(app)
+    response = client.post(
+        "/v1/tts/piper/audition",
+        json={
+            "voice_id": "knight/en_US-lessac-medium",
+            "text": "A fast test line.",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "voice_id": "knight/en_US-lessac-medium",
+        "cache_key": "audition-knight-a-fast-test-line-1234567890abcdef1234567890abcdef",
+        "cache_hit": False,
+        "audio_url": "http://testserver/v1/tts/piper/audio/audition-knight-a-fast-test-line-1234567890abcdef1234567890abcdef",
+    }
+
+
+def test_assign_piper_tts_voice_returns_updated_assignment(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "main.PIPER_TTS_SERVICE.assign_voice",
+        lambda speaker_type, voice_id: SimpleNamespace(
+            speaker_assignments={
+                "pawn": None,
+                "rook": None,
+                "knight": voice_id,
+                "bishop": None,
+                "queen": None,
+                "king": None,
+                "narrator": None,
+            }
+        ),
+    )
+
+    client = TestClient(app)
+    response = client.put(
+        "/v1/tts/piper/voices/assignments/knight",
+        json={"voice_id": "knight/en_US-lessac-high"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "speaker_type": "knight",
+        "assigned_voice_id": "knight/en_US-lessac-high",
+    }
+
+
 def test_get_piper_tts_audio_returns_cached_wav(monkeypatch, tmp_path: Path) -> None:
     audio_path = tmp_path / "rook.wav"
     audio_path.write_bytes(b"RIFFfakewavdata")

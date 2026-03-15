@@ -611,7 +611,7 @@ private struct GeminiPassiveNarratorLineResponsePayload: Decodable {
   let line: String
 }
 
-private enum PiperSpeakerType: String {
+private enum PiperSpeakerType: String, CaseIterable, Identifiable {
   case pawn
   case rook
   case knight
@@ -638,6 +638,8 @@ private enum PiperSpeakerType: String {
       return "Narrator"
     }
   }
+
+  var id: String { rawValue }
 }
 
 private struct PiperSpeakLineRequestPayload: Encodable {
@@ -652,6 +654,60 @@ private struct PiperSpeakLineResponsePayload: Decodable {
   let cache_hit: Bool
   let used_fallback_voice: Bool
   let audio_url: String
+}
+
+private struct PiperVoiceInventoryEntryPayload: Decodable, Hashable, Identifiable {
+  let voice_id: String
+  let name: String
+  let language: String?
+  let quality: String?
+  let sample_rate: Int?
+  let configured_speaker_types: [String]
+
+  var id: String { voice_id }
+
+  var displayName: String {
+    name
+      .replacingOccurrences(of: "_", with: " ")
+      .replacingOccurrences(of: "-", with: " ")
+  }
+
+  var metadataLine: String {
+    [
+      language?.uppercased(),
+      quality?.capitalized,
+      sample_rate.map { "\($0) Hz" }
+    ]
+    .compactMap { $0 }
+    .joined(separator: " • ")
+  }
+}
+
+private struct PiperVoiceInventoryResponsePayload: Decodable {
+  let default_speaker_type: String
+  let speaker_assignments: [String: String?]
+  let voices: [PiperVoiceInventoryEntryPayload]
+}
+
+private struct PiperVoiceAuditionRequestPayload: Encodable {
+  let voice_id: String
+  let text: String
+}
+
+private struct PiperVoiceAuditionResponsePayload: Decodable {
+  let voice_id: String
+  let cache_key: String
+  let cache_hit: Bool
+  let audio_url: String
+}
+
+private struct PiperVoiceAssignmentRequestPayload: Encodable {
+  let voice_id: String
+}
+
+private struct PiperVoiceAssignmentResponsePayload: Decodable {
+  let speaker_type: String
+  let assigned_voice_id: String?
 }
 
 private struct GeminiPieceRole: Decodable, Equatable, Hashable {
@@ -2487,6 +2543,13 @@ private struct PiperPreparedLine {
   let localFileURL: URL
 }
 
+private struct PiperAuditionPreparedLine {
+  let voiceID: String
+  let cacheKey: String
+  let cacheHit: Bool
+  let localFileURL: URL
+}
+
 private final class PiperTTSService {
   private static let logger = Logger(subsystem: "ARChess", category: "PiperTTSService")
 
@@ -2519,13 +2582,7 @@ private final class PiperTTSService {
     speakerType: PiperSpeakerType,
     text: String
   ) async throws -> PiperPreparedLine {
-    guard let baseURL = apiBaseURL else {
-      throw NSError(
-        domain: "ARChess.PiperTTS",
-        code: -2001,
-        userInfo: [NSLocalizedDescriptionKey: "Piper TTS is disabled until ARChessAPIBaseURL is configured."]
-      )
-    }
+    let baseURL = try requireBaseURL()
 
     let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !trimmedText.isEmpty else {
@@ -2590,6 +2647,118 @@ private final class PiperTTSService {
       usedFallbackVoice: payload.used_fallback_voice,
       localFileURL: localFileURL
     )
+  }
+
+  func fetchAvailableVoices() async throws -> PiperVoiceInventoryResponsePayload {
+    let baseURL = try requireBaseURL()
+    var request = URLRequest(
+      url: baseURL
+        .appendingPathComponent("v1")
+        .appendingPathComponent("tts")
+        .appendingPathComponent("piper")
+        .appendingPathComponent("voices")
+    )
+    request.httpMethod = "GET"
+    request.timeoutInterval = 20.0
+    request.setValue("application/json", forHTTPHeaderField: "Accept")
+
+    let (data, response) = try await session.data(for: request)
+    try validateHTTPResponse(response, data: data, fallbackMessage: "Piper voice inventory request failed.")
+    return try decoder.decode(PiperVoiceInventoryResponsePayload.self, from: data)
+  }
+
+  func synthesizeAuditionLine(
+    voiceID: String,
+    text: String
+  ) async throws -> PiperAuditionPreparedLine {
+    let baseURL = try requireBaseURL()
+    let trimmedVoiceID = voiceID.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmedVoiceID.isEmpty else {
+      throw NSError(
+        domain: "ARChess.PiperTTS",
+        code: -2007,
+        userInfo: [NSLocalizedDescriptionKey: "Piper audition requires a voice id."]
+      )
+    }
+
+    let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmedText.isEmpty else {
+      throw NSError(
+        domain: "ARChess.PiperTTS",
+        code: -2008,
+        userInfo: [NSLocalizedDescriptionKey: "Piper audition cannot speak an empty line."]
+      )
+    }
+
+    var request = URLRequest(
+      url: baseURL
+        .appendingPathComponent("v1")
+        .appendingPathComponent("tts")
+        .appendingPathComponent("piper")
+        .appendingPathComponent("audition")
+    )
+    request.httpMethod = "POST"
+    request.timeoutInterval = 20.0
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.setValue("application/json", forHTTPHeaderField: "Accept")
+    request.httpBody = try encoder.encode(
+      PiperVoiceAuditionRequestPayload(
+        voice_id: trimmedVoiceID,
+        text: trimmedText
+      )
+    )
+
+    let (data, response) = try await session.data(for: request)
+    try validateHTTPResponse(response, data: data, fallbackMessage: "Piper audition request failed.")
+
+    let payload = try decoder.decode(PiperVoiceAuditionResponsePayload.self, from: data)
+    let sanitizedCacheKey = Self.sanitizeCacheKey(payload.cache_key)
+    let localFileURL = cacheDirectory().appendingPathComponent("\(sanitizedCacheKey).wav")
+    if !isPlayableAudioFile(at: localFileURL) {
+      let audioURL = try resolveAudioURL(payload.audio_url, apiBaseURL: baseURL)
+      try await downloadAudioIfNeeded(from: audioURL, to: localFileURL)
+    }
+
+    return PiperAuditionPreparedLine(
+      voiceID: payload.voice_id,
+      cacheKey: sanitizedCacheKey,
+      cacheHit: payload.cache_hit,
+      localFileURL: localFileURL
+    )
+  }
+
+  func assignVoice(
+    _ voiceID: String,
+    to speakerType: PiperSpeakerType
+  ) async throws -> PiperVoiceAssignmentResponsePayload {
+    let baseURL = try requireBaseURL()
+    let trimmedVoiceID = voiceID.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmedVoiceID.isEmpty else {
+      throw NSError(
+        domain: "ARChess.PiperTTS",
+        code: -2009,
+        userInfo: [NSLocalizedDescriptionKey: "Piper assignment requires a voice id."]
+      )
+    }
+
+    var request = URLRequest(
+      url: baseURL
+        .appendingPathComponent("v1")
+        .appendingPathComponent("tts")
+        .appendingPathComponent("piper")
+        .appendingPathComponent("voices")
+        .appendingPathComponent("assignments")
+        .appendingPathComponent(speakerType.rawValue)
+    )
+    request.httpMethod = "PUT"
+    request.timeoutInterval = 20.0
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.setValue("application/json", forHTTPHeaderField: "Accept")
+    request.httpBody = try encoder.encode(PiperVoiceAssignmentRequestPayload(voice_id: trimmedVoiceID))
+
+    let (data, response) = try await session.data(for: request)
+    try validateHTTPResponse(response, data: data, fallbackMessage: "Piper voice assignment failed.")
+    return try decoder.decode(PiperVoiceAssignmentResponsePayload.self, from: data)
   }
 
   private func downloadAudioIfNeeded(from audioURL: URL, to destinationURL: URL) async throws {
@@ -2678,6 +2847,40 @@ private final class PiperTTSService {
     let filteredScalars = rawValue.unicodeScalars.filter { allowed.contains($0) }
     let sanitized = String(String.UnicodeScalarView(filteredScalars))
     return sanitized.isEmpty ? UUID().uuidString.lowercased() : sanitized.lowercased()
+  }
+
+  private func requireBaseURL() throws -> URL {
+    guard let baseURL = apiBaseURL else {
+      throw NSError(
+        domain: "ARChess.PiperTTS",
+        code: -2001,
+        userInfo: [NSLocalizedDescriptionKey: "Piper TTS is disabled until ARChessAPIBaseURL is configured."]
+      )
+    }
+    return baseURL
+  }
+
+  private func validateHTTPResponse(
+    _ response: URLResponse,
+    data: Data,
+    fallbackMessage: String
+  ) throws {
+    guard let httpResponse = response as? HTTPURLResponse else {
+      throw NSError(
+        domain: "ARChess.PiperTTS",
+        code: -2010,
+        userInfo: [NSLocalizedDescriptionKey: "Piper endpoint did not return HTTP."]
+      )
+    }
+
+    guard (200..<300).contains(httpResponse.statusCode) else {
+      let message = String(data: data, encoding: .utf8) ?? fallbackMessage
+      throw NSError(
+        domain: "ARChess.PiperTTS",
+        code: httpResponse.statusCode,
+        userInfo: [NSLocalizedDescriptionKey: message]
+      )
+    }
   }
 }
 
@@ -2851,6 +3054,286 @@ private final class PiperAutomaticSpeaker: NSObject, AVAudioPlayerDelegate {
 
   private func notifyBusyStateChange() {
     onBusyStateChange?(isBusy)
+  }
+}
+
+@MainActor
+private final class PiperVoiceAuditionStore: NSObject, ObservableObject, AVAudioPlayerDelegate {
+  static let builtInSamples = [
+    "The knight circles the king with elegant menace.",
+    "Rook useless.",
+    "Lots of time to read the good book back here.",
+    "Advance again and I split your line.",
+  ]
+
+  private static let logger = Logger(subsystem: "ARChess", category: "PiperVoiceAudition")
+
+  private let ttsService: PiperTTSService
+  private var previewTask: Task<Void, Never>?
+  private var audioPlayer: AVAudioPlayer?
+
+  @Published private(set) var voices: [PiperVoiceInventoryEntryPayload] = []
+  @Published private(set) var speakerAssignments: [PiperSpeakerType: String] = [:]
+  @Published private(set) var statusText = "Load installed Piper voices."
+  @Published private(set) var isLoadingVoices = false
+  @Published private(set) var isPreviewing = false
+  @Published private(set) var isAssigning = false
+  @Published var selectedVoiceID: String?
+  @Published var selectedSampleIndex = 0
+  @Published var customText = ""
+  @Published var autoPreviewOnVoiceChange = true
+
+  init(ttsService: PiperTTSService = PiperTTSService()) {
+    self.ttsService = ttsService
+    super.init()
+    self.ttsService.prepareCacheIfNeeded()
+  }
+
+  var selectedVoice: PiperVoiceInventoryEntryPayload? {
+    voices.first(where: { $0.voice_id == selectedVoiceID })
+  }
+
+  var selectedSampleText: String {
+    let safeIndex = min(max(0, selectedSampleIndex), Self.builtInSamples.count - 1)
+    return Self.builtInSamples[safeIndex]
+  }
+
+  var trimmedCustomText: String {
+    customText.trimmingCharacters(in: .whitespacesAndNewlines)
+  }
+
+  var hasConfiguredAPIBaseURL: Bool {
+    ttsService.isConfigured
+  }
+
+  func loadIfNeeded() async {
+    guard voices.isEmpty, !isLoadingVoices else {
+      return
+    }
+    await refreshVoices()
+  }
+
+  func refreshVoices(keeping preferredVoiceID: String? = nil) async {
+    guard !isLoadingVoices else {
+      return
+    }
+
+    isLoadingVoices = true
+    statusText = "Refreshing installed Piper voices..."
+    defer { isLoadingVoices = false }
+
+    do {
+      let inventory = try await ttsService.fetchAvailableVoices()
+      voices = inventory.voices
+      speakerAssignments = Dictionary(
+        uniqueKeysWithValues: inventory.speaker_assignments.compactMap { key, value in
+          guard let speakerType = PiperSpeakerType(rawValue: key), let value else {
+            return nil
+          }
+          return (speakerType, value)
+        }
+      )
+
+      if let preferredVoiceID,
+         voices.contains(where: { $0.voice_id == preferredVoiceID }) {
+        selectedVoiceID = preferredVoiceID
+      } else if let selectedVoiceID,
+                voices.contains(where: { $0.voice_id == selectedVoiceID }) {
+        self.selectedVoiceID = selectedVoiceID
+      } else {
+        selectedVoiceID = voices.first?.voice_id
+      }
+
+      if let selectedVoice {
+        statusText = "Ready to audition \(selectedVoice.displayName)."
+      } else if voices.isEmpty {
+        statusText = "No installed Piper voices found on the current backend."
+      } else {
+        statusText = "Select a Piper voice to preview."
+      }
+    } catch {
+      voices = []
+      speakerAssignments = [:]
+      selectedVoiceID = nil
+      statusText = "Piper voice inventory failed: \(error.localizedDescription)"
+    }
+  }
+
+  func selectVoice(_ voiceID: String, autoplay: Bool) {
+    guard selectedVoiceID != voiceID else {
+      return
+    }
+    selectedVoiceID = voiceID
+    if let selectedVoice {
+      statusText = "Selected \(selectedVoice.displayName)."
+    }
+    if autoplay && autoPreviewOnVoiceChange {
+      previewSelectedSample()
+    }
+  }
+
+  func selectNextVoice() {
+    guard !voices.isEmpty else {
+      return
+    }
+    let currentIndex = voices.firstIndex(where: { $0.voice_id == selectedVoiceID }) ?? 0
+    let nextIndex = min(currentIndex + 1, voices.count - 1)
+    selectVoice(voices[nextIndex].voice_id, autoplay: true)
+  }
+
+  func selectPreviousVoice() {
+    guard !voices.isEmpty else {
+      return
+    }
+    let currentIndex = voices.firstIndex(where: { $0.voice_id == selectedVoiceID }) ?? 0
+    let previousIndex = max(currentIndex - 1, 0)
+    selectVoice(voices[previousIndex].voice_id, autoplay: true)
+  }
+
+  func previewSelectedSample() {
+    preview(text: selectedSampleText, label: "sample")
+  }
+
+  func previewCustomText() {
+    preview(text: trimmedCustomText, label: "custom")
+  }
+
+  func assignSelectedVoice(to speakerType: PiperSpeakerType) async {
+    guard let selectedVoice else {
+      statusText = "Select a Piper voice before assigning it."
+      return
+    }
+    guard !isAssigning else {
+      return
+    }
+
+    isAssigning = true
+    statusText = "Assigning \(selectedVoice.displayName) to \(speakerType.displayName)..."
+    defer { isAssigning = false }
+
+    do {
+      let response = try await ttsService.assignVoice(selectedVoice.voice_id, to: speakerType)
+      if let assignedVoiceID = response.assigned_voice_id {
+        speakerAssignments[speakerType] = assignedVoiceID
+      } else {
+        speakerAssignments.removeValue(forKey: speakerType)
+      }
+      statusText = "\(speakerType.displayName) now uses \(selectedVoice.displayName)."
+      await refreshVoices(keeping: selectedVoice.voice_id)
+    } catch {
+      statusText = "Piper assignment failed: \(error.localizedDescription)"
+    }
+  }
+
+  func stop() {
+    previewTask?.cancel()
+    previewTask = nil
+    audioPlayer?.stop()
+    audioPlayer = nil
+    if isPreviewing {
+      AmbientMusicController.shared.setSpeechActive(false)
+    }
+    isPreviewing = false
+  }
+
+  func assignmentLabel(for speakerType: PiperSpeakerType) -> String {
+    guard let assignedVoiceID = speakerAssignments[speakerType] else {
+      return "Unassigned"
+    }
+    if let voice = voices.first(where: { $0.voice_id == assignedVoiceID }) {
+      return voice.displayName
+    }
+    return "Missing voice"
+  }
+
+  private func preview(text: String, label: String) {
+    guard let selectedVoice else {
+      statusText = "Select a Piper voice before previewing."
+      return
+    }
+
+    let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmedText.isEmpty else {
+      statusText = "Enter a short line to preview."
+      return
+    }
+
+    stop()
+    statusText = "Preparing \(label) preview for \(selectedVoice.displayName)..."
+
+    previewTask = Task { @MainActor [weak self] in
+      await self?.runPreview(voice: selectedVoice, text: trimmedText)
+    }
+  }
+
+  private func runPreview(
+    voice: PiperVoiceInventoryEntryPayload,
+    text: String
+  ) async {
+    do {
+      let preparedLine = try await ttsService.synthesizeAuditionLine(
+        voiceID: voice.voice_id,
+        text: text
+      )
+      guard !Task.isCancelled else {
+        return
+      }
+
+      try AudioSessionCoordinator.shared.activatePlaybackSession()
+      let player = try AVAudioPlayer(contentsOf: preparedLine.localFileURL)
+      player.delegate = self
+      player.prepareToPlay()
+      audioPlayer = player
+
+      guard player.play() else {
+        throw NSError(
+          domain: "ARChess.PiperTTS",
+          code: -2011,
+          userInfo: [NSLocalizedDescriptionKey: "Piper audition audio could not start playback."]
+        )
+      }
+
+      previewTask = nil
+      isPreviewing = true
+      AmbientMusicController.shared.setSpeechActive(true)
+      statusText = preparedLine.cacheHit
+        ? "Previewing \(voice.displayName) from cache."
+        : "Previewing \(voice.displayName) with fresh synthesis."
+    } catch is CancellationError {
+      previewTask = nil
+      statusText = "Preview cancelled."
+    } catch {
+      Self.logger.error("Piper audition playback failed: \(error.localizedDescription, privacy: .public)")
+      previewTask = nil
+      audioPlayer = nil
+      if isPreviewing {
+        AmbientMusicController.shared.setSpeechActive(false)
+      }
+      isPreviewing = false
+      statusText = "Piper audition failed: \(error.localizedDescription)"
+    }
+  }
+
+  func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
+    previewTask = nil
+    audioPlayer = nil
+    if isPreviewing {
+      AmbientMusicController.shared.setSpeechActive(false)
+    }
+    isPreviewing = false
+    if !flag {
+      statusText = "Preview ended unexpectedly."
+    }
+  }
+
+  func audioPlayerDecodeErrorDidOccur(_ player: AVAudioPlayer, error: Error?) {
+    previewTask = nil
+    audioPlayer = nil
+    if isPreviewing {
+      AmbientMusicController.shared.setSpeechActive(false)
+    }
+    isPreviewing = false
+    statusText = error?.localizedDescription ?? "Preview audio decode failed."
   }
 }
 
@@ -11721,6 +12204,7 @@ private struct ExperienceLoadingView: View {
 private struct ModeSelectionView: View {
   @Binding var selectedNarrator: NarratorType
   let onSelect: (PlayModeChoice) -> Void
+  @State private var isPiperAuditionPresented = false
 
   var body: some View {
     ZStack {
@@ -11757,6 +12241,11 @@ private struct ModeSelectionView: View {
         NarratorSelectionCard(selectedNarrator: $selectedNarrator)
           .frame(maxWidth: 340)
 
+        NativeActionButton(title: "Piper Voice Lab", style: .outline) {
+          isPiperAuditionPresented = true
+        }
+        .frame(maxWidth: 340)
+
         VStack(spacing: 14) {
           NativeActionButton(title: "Course", style: .solid) {
             onSelect(.course)
@@ -11787,6 +12276,441 @@ private struct ModeSelectionView: View {
       .padding(.horizontal, 24)
       .padding(.vertical, 30)
     }
+    .sheet(isPresented: $isPiperAuditionPresented) {
+      PiperVoiceAuditionView()
+        .presentationDetents([.large])
+        .presentationDragIndicator(.visible)
+    }
+  }
+}
+
+private struct PiperVoiceAuditionView: View {
+  @Environment(\.dismiss) private var dismiss
+  @StateObject private var store = PiperVoiceAuditionStore()
+
+  var body: some View {
+    ZStack {
+      ChessboardBackdrop()
+      LinearGradient(
+        colors: [
+          Color(red: 0.03, green: 0.05, blue: 0.08).opacity(0.16),
+          Color(red: 0.03, green: 0.05, blue: 0.08).opacity(0.82),
+          Color.black.opacity(0.96),
+        ],
+        startPoint: .top,
+        endPoint: .bottom
+      )
+      .ignoresSafeArea()
+
+      ScrollView(showsIndicators: false) {
+        VStack(alignment: .leading, spacing: 18) {
+          header
+
+          auditionCard {
+            VStack(alignment: .leading, spacing: 10) {
+              Text("Status")
+                .font(.system(size: 12, weight: .bold, design: .rounded))
+                .tracking(1.8)
+                .foregroundStyle(Color(red: 0.95, green: 0.88, blue: 0.73))
+
+              Text(store.statusText)
+                .font(.system(size: 14, weight: .semibold, design: .rounded))
+                .foregroundStyle(Color.white.opacity(0.88))
+                .lineSpacing(2)
+
+              HStack(spacing: 10) {
+                statusPill(
+                  title: store.hasConfiguredAPIBaseURL ? "Backend ready" : "Backend missing",
+                  accent: store.hasConfiguredAPIBaseURL
+                    ? Color(red: 0.64, green: 0.90, blue: 0.74)
+                    : Color(red: 0.96, green: 0.72, blue: 0.68)
+                )
+                statusPill(
+                  title: store.isPreviewing ? "Previewing" : "Idle",
+                  accent: store.isPreviewing
+                    ? Color(red: 0.82, green: 0.90, blue: 0.98)
+                    : Color.white.opacity(0.66)
+                )
+              }
+            }
+          }
+
+          auditionCard {
+            VStack(alignment: .leading, spacing: 12) {
+              Text("Voice Navigator")
+                .font(.system(size: 12, weight: .bold, design: .rounded))
+                .tracking(1.8)
+                .foregroundStyle(Color(red: 0.88, green: 0.82, blue: 0.70))
+
+              if let selectedVoice = store.selectedVoice {
+                Text(selectedVoice.displayName)
+                  .font(.system(size: 26, weight: .heavy, design: .rounded))
+                  .foregroundStyle(.white)
+
+                Text(selectedVoice.voice_id)
+                  .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                  .foregroundStyle(Color.white.opacity(0.66))
+                  .textSelection(.enabled)
+
+                if !selectedVoice.metadataLine.isEmpty {
+                  Text(selectedVoice.metadataLine)
+                    .font(.system(size: 13, weight: .semibold, design: .rounded))
+                    .foregroundStyle(Color(red: 0.82, green: 0.90, blue: 0.98))
+                }
+
+                if !selectedVoice.configured_speaker_types.isEmpty {
+                  Text("Assigned now: \(selectedVoice.configured_speaker_types.map(\.capitalized).joined(separator: ", "))")
+                    .font(.system(size: 12, weight: .medium, design: .rounded))
+                    .foregroundStyle(Color.white.opacity(0.72))
+                }
+
+                HStack(spacing: 10) {
+                  compactActionButton(title: "Previous", systemImage: "chevron.left") {
+                    store.selectPreviousVoice()
+                  }
+
+                  compactActionButton(
+                    title: store.isPreviewing ? "Playing" : "Preview sample",
+                    systemImage: "speaker.wave.2.fill",
+                    isDisabled: store.selectedVoice == nil || store.isLoadingVoices
+                  ) {
+                    store.previewSelectedSample()
+                  }
+
+                  compactActionButton(title: "Next", systemImage: "chevron.right") {
+                    store.selectNextVoice()
+                  }
+                }
+
+                Toggle("Auto preview on voice switch", isOn: $store.autoPreviewOnVoiceChange)
+                  .tint(Color(red: 0.95, green: 0.88, blue: 0.73))
+                  .foregroundStyle(Color.white.opacity(0.82))
+              } else {
+                Text("No installed Piper voices found yet.")
+                  .font(.system(size: 14, weight: .semibold, design: .rounded))
+                  .foregroundStyle(Color.white.opacity(0.76))
+              }
+            }
+          }
+
+          auditionCard {
+            VStack(alignment: .leading, spacing: 12) {
+              Text("Installed Voices")
+                .font(.system(size: 12, weight: .bold, design: .rounded))
+                .tracking(1.8)
+                .foregroundStyle(Color(red: 0.88, green: 0.82, blue: 0.70))
+
+              if store.voices.isEmpty {
+                Text("The current backend did not report any installed Piper models.")
+                  .font(.system(size: 14, weight: .medium, design: .rounded))
+                  .foregroundStyle(Color.white.opacity(0.72))
+              } else {
+                ScrollView(.horizontal, showsIndicators: false) {
+                  HStack(spacing: 12) {
+                    ForEach(store.voices) { voice in
+                      Button {
+                        store.selectVoice(voice.voice_id, autoplay: true)
+                      } label: {
+                        VStack(alignment: .leading, spacing: 8) {
+                          Text(voice.displayName)
+                            .font(.system(size: 15, weight: .bold, design: .rounded))
+                            .foregroundStyle(.white)
+                            .lineLimit(2)
+
+                          if !voice.metadataLine.isEmpty {
+                            Text(voice.metadataLine)
+                              .font(.system(size: 12, weight: .semibold, design: .rounded))
+                              .foregroundStyle(Color(red: 0.84, green: 0.90, blue: 0.98))
+                              .lineLimit(1)
+                          }
+
+                          Text(voice.voice_id)
+                            .font(.system(size: 10, weight: .medium, design: .monospaced))
+                            .foregroundStyle(Color.white.opacity(0.62))
+                            .lineLimit(2)
+
+                          if !voice.configured_speaker_types.isEmpty {
+                            Text("Assigned: \(voice.configured_speaker_types.map(\.capitalized).joined(separator: ", "))")
+                              .font(.system(size: 11, weight: .medium, design: .rounded))
+                              .foregroundStyle(Color.white.opacity(0.72))
+                              .lineLimit(2)
+                          }
+                        }
+                        .frame(width: 230, alignment: .leading)
+                        .padding(14)
+                        .background(
+                          RoundedRectangle(cornerRadius: 20, style: .continuous)
+                            .fill(
+                              store.selectedVoiceID == voice.voice_id
+                                ? Color(red: 0.20, green: 0.28, blue: 0.36).opacity(0.96)
+                                : Color.white.opacity(0.05)
+                            )
+                            .overlay(
+                              RoundedRectangle(cornerRadius: 20, style: .continuous)
+                                .stroke(
+                                  store.selectedVoiceID == voice.voice_id
+                                    ? Color(red: 0.95, green: 0.88, blue: 0.73)
+                                    : Color.white.opacity(0.10),
+                                  lineWidth: 1
+                                )
+                            )
+                        )
+                      }
+                      .buttonStyle(.plain)
+                    }
+                  }
+                  .padding(.vertical, 2)
+                }
+              }
+            }
+          }
+
+          auditionCard {
+            VStack(alignment: .leading, spacing: 12) {
+              Text("Sample Lines")
+                .font(.system(size: 12, weight: .bold, design: .rounded))
+                .tracking(1.8)
+                .foregroundStyle(Color(red: 0.88, green: 0.82, blue: 0.70))
+
+              Text("Keep one sample selected, then move across voices with Previous/Next for fast A/B testing.")
+                .font(.system(size: 13, weight: .medium, design: .rounded))
+                .foregroundStyle(Color.white.opacity(0.72))
+                .lineSpacing(2)
+
+              ForEach(Array(PiperVoiceAuditionStore.builtInSamples.enumerated()), id: \.offset) { index, line in
+                Button {
+                  store.selectedSampleIndex = index
+                  store.previewSelectedSample()
+                } label: {
+                  HStack(alignment: .top, spacing: 10) {
+                    Image(systemName: store.selectedSampleIndex == index ? "speaker.wave.3.fill" : "text.quote")
+                      .font(.system(size: 14, weight: .bold))
+                      .foregroundStyle(Color(red: 0.95, green: 0.88, blue: 0.73))
+                      .frame(width: 20, height: 20)
+
+                    Text(line)
+                      .font(.system(size: 14, weight: .semibold, design: .rounded))
+                      .foregroundStyle(Color.white.opacity(0.90))
+                      .frame(maxWidth: .infinity, alignment: .leading)
+                      .multilineTextAlignment(.leading)
+                      .lineSpacing(2)
+                  }
+                  .padding(14)
+                  .background(
+                    RoundedRectangle(cornerRadius: 18, style: .continuous)
+                      .fill(
+                        store.selectedSampleIndex == index
+                          ? Color(red: 0.18, green: 0.24, blue: 0.32).opacity(0.96)
+                          : Color.white.opacity(0.04)
+                      )
+                      .overlay(
+                        RoundedRectangle(cornerRadius: 18, style: .continuous)
+                          .stroke(Color.white.opacity(store.selectedSampleIndex == index ? 0.18 : 0.08), lineWidth: 1)
+                      )
+                  )
+                }
+                .buttonStyle(.plain)
+              }
+            }
+          }
+
+          auditionCard {
+            VStack(alignment: .leading, spacing: 12) {
+              Text("Custom Line")
+                .font(.system(size: 12, weight: .bold, design: .rounded))
+                .tracking(1.8)
+                .foregroundStyle(Color(red: 0.88, green: 0.82, blue: 0.70))
+
+              TextField("Type a short custom line", text: $store.customText)
+                .textInputAutocapitalization(.sentences)
+                .disableAutocorrection(false)
+                .font(.system(size: 15, weight: .medium, design: .rounded))
+                .foregroundStyle(.white)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 12)
+                .background(
+                  RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .fill(Color.white.opacity(0.06))
+                    .overlay(
+                      RoundedRectangle(cornerRadius: 18, style: .continuous)
+                        .stroke(Color.white.opacity(0.12), lineWidth: 1)
+                    )
+                )
+
+              HStack {
+                Text("\(store.trimmedCustomText.count)/200")
+                  .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                  .foregroundStyle(Color.white.opacity(0.62))
+
+                Spacer(minLength: 8)
+
+                compactActionButton(
+                  title: "Preview custom",
+                  systemImage: "waveform.and.mic",
+                  isDisabled: store.trimmedCustomText.isEmpty
+                ) {
+                  store.previewCustomText()
+                }
+              }
+            }
+          }
+
+          auditionCard {
+            VStack(alignment: .leading, spacing: 12) {
+              Text("Character Assignments")
+                .font(.system(size: 12, weight: .bold, design: .rounded))
+                .tracking(1.8)
+                .foregroundStyle(Color(red: 0.88, green: 0.82, blue: 0.70))
+
+              Text("These assignment actions update the current backend Piper config so live commentary uses the chosen voice next time it speaks.")
+                .font(.system(size: 13, weight: .medium, design: .rounded))
+                .foregroundStyle(Color.white.opacity(0.72))
+                .lineSpacing(2)
+
+              ForEach(PiperSpeakerType.allCases) { speakerType in
+                HStack(alignment: .center, spacing: 12) {
+                  VStack(alignment: .leading, spacing: 3) {
+                    Text(speakerType.displayName)
+                      .font(.system(size: 14, weight: .bold, design: .rounded))
+                      .foregroundStyle(.white)
+
+                    Text(store.assignmentLabel(for: speakerType))
+                      .font(.system(size: 12, weight: .medium, design: .rounded))
+                      .foregroundStyle(Color.white.opacity(0.70))
+                      .lineLimit(2)
+                  }
+
+                  Spacer(minLength: 8)
+
+                  compactActionButton(
+                    title: "Use selected",
+                    systemImage: "checkmark",
+                    isDisabled: store.selectedVoice == nil || store.isAssigning
+                  ) {
+                    Task {
+                      await store.assignSelectedVoice(to: speakerType)
+                    }
+                  }
+                  .frame(width: 140)
+                }
+                .padding(.vertical, 4)
+              }
+            }
+          }
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 24)
+      }
+    }
+    .task {
+      await store.loadIfNeeded()
+    }
+    .onDisappear {
+      store.stop()
+    }
+    .onChange(of: store.customText) { newValue in
+      if newValue.count > 200 {
+        store.customText = String(newValue.prefix(200))
+      }
+    }
+  }
+
+  private var header: some View {
+    HStack(alignment: .top, spacing: 12) {
+      VStack(alignment: .leading, spacing: 8) {
+        Text("Voice Lab")
+          .font(.system(size: 12, weight: .bold, design: .rounded))
+          .tracking(2.0)
+          .foregroundStyle(Color(red: 0.95, green: 0.88, blue: 0.73))
+
+        Text("Piper Voice Audition")
+          .font(.system(size: 32, weight: .heavy, design: .rounded))
+          .foregroundStyle(.white)
+
+        Text("Listen to installed voices on game-flavored lines, compare them quickly, and assign the best fit to each chess character.")
+          .font(.system(size: 15, weight: .medium, design: .rounded))
+          .foregroundStyle(Color.white.opacity(0.82))
+          .lineSpacing(3)
+      }
+
+      Spacer(minLength: 12)
+
+      VStack(spacing: 10) {
+        compactActionButton(title: "Refresh", systemImage: "arrow.clockwise") {
+          Task {
+            await store.refreshVoices(keeping: store.selectedVoiceID)
+          }
+        }
+
+        compactActionButton(title: "Done", systemImage: "xmark") {
+          dismiss()
+        }
+      }
+      .frame(width: 126)
+    }
+  }
+
+  private func auditionCard<Content: View>(
+    @ViewBuilder content: () -> Content
+  ) -> some View {
+    VStack(alignment: .leading, spacing: 0) {
+      content()
+    }
+    .padding(18)
+    .background(
+      RoundedRectangle(cornerRadius: 28, style: .continuous)
+        .fill(Color(red: 0.07, green: 0.10, blue: 0.14).opacity(0.90))
+        .overlay(
+          RoundedRectangle(cornerRadius: 28, style: .continuous)
+            .stroke(Color.white.opacity(0.12), lineWidth: 1)
+        )
+    )
+  }
+
+  private func statusPill(title: String, accent: Color) -> some View {
+    Text(title)
+      .font(.system(size: 11, weight: .bold, design: .rounded))
+      .padding(.horizontal, 10)
+      .padding(.vertical, 6)
+      .foregroundStyle(accent)
+      .background(
+        Capsule(style: .continuous)
+          .fill(accent.opacity(0.12))
+      )
+      .overlay(
+        Capsule(style: .continuous)
+          .stroke(accent.opacity(0.20), lineWidth: 1)
+      )
+  }
+
+  private func compactActionButton(
+    title: String,
+    systemImage: String,
+    isDisabled: Bool = false,
+    action: @escaping () -> Void
+  ) -> some View {
+    Button(action: action) {
+      HStack(spacing: 8) {
+        Image(systemName: systemImage)
+          .font(.system(size: 12, weight: .bold))
+        Text(title)
+          .font(.system(size: 13, weight: .bold, design: .rounded))
+      }
+      .frame(maxWidth: .infinity)
+      .padding(.horizontal, 12)
+      .padding(.vertical, 10)
+      .foregroundStyle(Color.white.opacity(isDisabled ? 0.58 : 0.92))
+      .background(
+        RoundedRectangle(cornerRadius: 16, style: .continuous)
+          .fill(Color.white.opacity(isDisabled ? 0.04 : 0.08))
+          .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+              .stroke(Color.white.opacity(isDisabled ? 0.06 : 0.12), lineWidth: 1)
+          )
+      )
+    }
+    .buttonStyle(.plain)
+    .disabled(isDisabled)
   }
 }
 
