@@ -18499,7 +18499,7 @@ private struct NativeARView: UIViewRepresentable {
       knightCameraSplatHideWorkItem = nil
       knightCameraSplatStartTime = nil
 
-      guard let knightCameraSplatAnchor else {
+      guard let splatAnchor = knightCameraSplatAnchor else {
         return
       }
 
@@ -18507,11 +18507,11 @@ private struct NativeARView: UIViewRepresentable {
         var transform = splatPiece.transform
         transform.scale *= 0.90
         splatPiece.move(to: transform, relativeTo: splatPiece.parent, duration: 0.12, timingFunction: .easeIn)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.14) { [weak anchor] in
-          anchor?.removeFromParent()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.14) {
+          splatAnchor.removeFromParent()
         }
       } else {
-        knightCameraSplatAnchor?.removeFromParent()
+        splatAnchor.removeFromParent()
       }
 
       knightCameraSplatAnchor = nil
