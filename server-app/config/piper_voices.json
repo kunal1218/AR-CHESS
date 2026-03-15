@@ -5,11 +5,13 @@
   "voices": {
     "pawn": {
       "model_path": "piper/voices/audition/en_GB-northern_english_male-medium.onnx",
-      "config_path": "piper/voices/audition/en_GB-northern_english_male-medium.onnx.json"
+      "config_path": "piper/voices/audition/en_GB-northern_english_male-medium.onnx.json",
+      "preload": true
     },
     "rook": {
       "model_path": "piper/voices/audition/en_US-joe-medium.onnx",
-      "config_path": "piper/voices/audition/en_US-joe-medium.onnx.json"
+      "config_path": "piper/voices/audition/en_US-joe-medium.onnx.json",
+      "preload": true
     },
     "knight": {
       "model_path": "piper/voices/knight/en_US-lessac-medium.onnx",
@@ -18,15 +20,18 @@
     },
     "bishop": {
       "model_path": "piper/voices/audition/en_US-ryan-medium.onnx",
-      "config_path": "piper/voices/audition/en_US-ryan-medium.onnx.json"
+      "config_path": "piper/voices/audition/en_US-ryan-medium.onnx.json",
+      "preload": true
     },
     "queen": {
       "model_path": "piper/voices/audition/en_US-hfc_female-medium.onnx",
-      "config_path": "piper/voices/audition/en_US-hfc_female-medium.onnx.json"
+      "config_path": "piper/voices/audition/en_US-hfc_female-medium.onnx.json",
+      "preload": true
     },
     "king": {
       "model_path": "piper/voices/audition/en_GB-alan-medium.onnx",
-      "config_path": "piper/voices/audition/en_GB-alan-medium.onnx.json"
+      "config_path": "piper/voices/audition/en_GB-alan-medium.onnx.json",
+      "preload": true
     }
   }
 }

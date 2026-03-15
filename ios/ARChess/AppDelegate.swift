@@ -489,16 +489,32 @@ private struct CourseCatalogEntry: Identifiable, Hashable {
 
 private struct AppRuntimeConfig {
   let apiBaseURL: URL?
+  let piperAPIBaseURL: URL?
 
   static let current = AppRuntimeConfig()
 
   init() {
+    apiBaseURL = Self.resolveURL(
+      environmentKey: "AR_CHESS_API_BASE_URL",
+      bundleKey: "ARChessAPIBaseURL"
+    )
+    piperAPIBaseURL = Self.resolveURL(
+      environmentKey: "AR_CHESS_PIPER_API_BASE_URL",
+      bundleKey: "ARChessPiperAPIBaseURL",
+      fallback: apiBaseURL
+    )
+  }
+
+  private static func resolveURL(
+    environmentKey: String,
+    bundleKey: String,
+    fallback: URL? = nil
+  ) -> URL? {
     let sources = [
-      ProcessInfo.processInfo.environment["AR_CHESS_API_BASE_URL"],
-      Bundle.main.object(forInfoDictionaryKey: "ARChessAPIBaseURL") as? String,
+      ProcessInfo.processInfo.environment[environmentKey],
+      Bundle.main.object(forInfoDictionaryKey: bundleKey) as? String,
     ]
 
-    var resolvedAPIBaseURL: URL?
     for candidate in sources {
       guard let candidate else {
         continue
@@ -509,11 +525,10 @@ private struct AppRuntimeConfig {
         continue
       }
 
-      resolvedAPIBaseURL = url.deletingTrailingSlash()
-      break
+      return url.deletingTrailingSlash()
     }
 
-    apiBaseURL = resolvedAPIBaseURL
+    return fallback
   }
 }
 
@@ -2564,7 +2579,7 @@ private final class PiperTTSService {
   private let decoder = JSONDecoder()
 
   init(
-    apiBaseURL: URL? = AppRuntimeConfig.current.apiBaseURL,
+    apiBaseURL: URL? = AppRuntimeConfig.current.piperAPIBaseURL,
     session: URLSession = .shared,
     fileManager: FileManager = .default
   ) {
@@ -2858,7 +2873,7 @@ private final class PiperTTSService {
       throw NSError(
         domain: "ARChess.PiperTTS",
         code: -2001,
-        userInfo: [NSLocalizedDescriptionKey: "Piper TTS is disabled until ARChessAPIBaseURL is configured."]
+        userInfo: [NSLocalizedDescriptionKey: "Piper TTS is disabled until ARChessPiperAPIBaseURL or ARChessAPIBaseURL is configured."]
       )
     }
     return baseURL

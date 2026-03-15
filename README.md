@@ -24,10 +24,11 @@ Monorepo for the AR Chess platform with the existing server and a native iOS app
 - Run the `ARChess` scheme on an iPhone for native AR.
 - The app now launches native SwiftUI screens for `Join`, `Create`, `Lobby / Loading`, and the native AR sandbox.
 - `mobile/` is no longer the active iOS runtime path.
-- For Gemini hints, configure `ARChessAPIBaseURL` for the iOS app and set `GEMINI_API_KEY` only on the backend (`server-app/.env`).
+- For Gemini hints and narration, configure `ARChessAPIBaseURL` for the iOS app and set `GEMINI_API_KEY` only on the backend (`server-app/.env`).
+- For local low-latency Piper piece voices, configure `ARChessPiperAPIBaseURL` to your Mac's LAN URL for `server-app` while keeping `ARChessAPIBaseURL` on Railway.
 - Gemini hints currently run through the backend Gemini Live session. Keep `GEMINI_LIVE_MODEL` on a Live-capable model such as `models/gemini-2.5-flash-native-audio-preview-12-2025`; Gemini 3 models are not currently supported on the Live API.
 
-The native iOS UI does not require the server for local board play, but Gemini hints now require the server. Use your Mac's LAN IP instead of `localhost` when running on iPhone.
+The native iOS UI does not require the server for local board play, but Gemini hints now require the server. Use your Mac's LAN IP instead of `localhost` when running on iPhone. The app can now split traffic so Gemini uses Railway and Piper piece voices use your local Mac backend.
 
 ## Stockfish integration
 

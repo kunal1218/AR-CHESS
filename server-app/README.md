@@ -130,9 +130,13 @@ Matchmaking uses Postgres transactions and `FOR UPDATE SKIP LOCKED` so two queue
 - Voice paths live in `server-app/config/piper_voices.json`.
 - Generated wav files are cached under `server-app/.cache/piper/` by default.
 - Download the distinct knight voice with `server-app/scripts/download_piper_knight_voice.sh`.
+- Download only the chosen default piece voices with `server-app/scripts/download_piper_selected_voices.sh`.
 - Download a broader in-app audition set with `server-app/scripts/download_piper_audition_voices.sh`.
 - The curated audition list lives in `server-app/config/piper_audition_voices.txt`, and the Voice Lab will automatically show any downloaded `.onnx` + `.onnx.json` pairs under `server-app/piper/voices/`.
-- The repo’s default iOS `ARChessAPIBaseURL` currently points at Railway, so local Piper testing requires pointing the app at your local backend instead of the hosted backend.
+- The iOS app can now split backends:
+  - `ARChessAPIBaseURL` for Railway Gemini and gameplay APIs
+  - `ARChessPiperAPIBaseURL` for local Piper TTS on your Mac's LAN IP
+- The selected default piece voices are marked `preload: true` in `server-app/config/piper_voices.json` so the local Piper runtime warms them on startup for lower first-line latency.
 
 ## Verify locally
 
