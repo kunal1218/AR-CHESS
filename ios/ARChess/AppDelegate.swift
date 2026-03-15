@@ -14227,27 +14227,7 @@ private struct NativeARExperienceView: View {
       }
 
       if gameReview.phase == .idle {
-        VStack {
-          Spacer()
-
-          HStack(alignment: .bottom, spacing: 16) {
-            VStack(alignment: .leading, spacing: 12) {
-              if fishing.showsFishingStatus {
-                fishingStatusChip
-                  .transition(.move(edge: .leading).combined(with: .opacity))
-              }
-
-              if fishing.showsFishingButton {
-                fishingButton
-                  .transition(.scale(scale: 0.88).combined(with: .opacity))
-              }
-            }
-
-            Spacer()
-          }
-          .padding(.horizontal, 22)
-          .padding(.bottom, 30)
-        }
+        fishingPromptOverlay
       }
 
       if gameReview.isAwaitingEntryDecision {
@@ -14263,7 +14243,10 @@ private struct NativeARExperienceView: View {
       }
 
       if fishing.showsRewardNote {
-        fishingRewardOverlay
+        FishingRewardOverlay(
+          rewardMoves: fishing.rewardMoves,
+          onDismiss: { fishing.dismissRewardNote() }
+        )
       }
     }
     .task {
@@ -14613,151 +14596,29 @@ private struct NativeARExperienceView: View {
     }
   }
 
-  private var fishingButton: some View {
-    Button {
-      fishing.requestCast()
-    } label: {
-      ZStack {
-        Circle()
-          .fill(
-            LinearGradient(
-              colors: [
-                Color(red: 0.95, green: 0.88, blue: 0.73),
-                Color(red: 0.78, green: 0.88, blue: 0.95),
-              ],
-              startPoint: .topLeading,
-              endPoint: .bottomTrailing
-            )
-          )
-          .shadow(color: Color.black.opacity(0.28), radius: 20, y: 12)
+  private var fishingPromptOverlay: some View {
+    VStack {
+      Spacer()
 
-        Circle()
-          .stroke(Color.white.opacity(0.58), lineWidth: 1.5)
-
-        VStack(spacing: 6) {
-          FishingRodGlyph()
-            .frame(width: 34, height: 34)
-
-          Text("Fish")
-            .font(.system(size: 13, weight: .black, design: .rounded))
-            .foregroundStyle(Color(red: 0.08, green: 0.12, blue: 0.16))
-        }
-      }
-      .frame(width: 92, height: 92)
-    }
-    .buttonStyle(.plain)
-    .accessibilityLabel("Cast fishing line")
-  }
-
-  private var fishingStatusChip: some View {
-    Text(fishing.statusText)
-      .font(.system(size: 13, weight: .bold, design: .rounded))
-      .foregroundStyle(.white)
-      .lineSpacing(2)
-      .padding(.horizontal, 14)
-      .padding(.vertical, 10)
-      .background(
-        Capsule(style: .continuous)
-          .fill(Color(red: 0.06, green: 0.09, blue: 0.12).opacity(0.84))
-          .overlay(
-            Capsule(style: .continuous)
-              .stroke(Color.white.opacity(0.14), lineWidth: 1)
-          )
-      )
-  }
-
-  private var fishingRewardOverlay: some View {
-    ZStack {
-      Color.black.opacity(0.56)
-        .ignoresSafeArea()
-        .onTapGesture {
-          fishing.dismissRewardNote()
-        }
-
-      VStack(alignment: .leading, spacing: 16) {
-        HStack(alignment: .top, spacing: 12) {
-          VStack(alignment: .leading, spacing: 6) {
-            Text("Pond Reward")
-              .font(.system(size: 12, weight: .bold, design: .rounded))
-              .tracking(2.0)
-              .foregroundStyle(Color(red: 0.84, green: 0.91, blue: 0.96))
-
-            Text("Stockfish's note")
-              .font(.system(size: 28, weight: .heavy, design: .rounded))
-              .foregroundStyle(.white)
-
-            Text("The fish dragged back a short move list from the engine.")
-              .font(.system(size: 15, weight: .semibold, design: .rounded))
-              .foregroundStyle(Color.white.opacity(0.78))
-              .lineSpacing(3)
+      HStack(alignment: .bottom, spacing: 16) {
+        VStack(alignment: .leading, spacing: 12) {
+          if fishing.showsFishingStatus {
+            FishingStatusChip(text: fishing.statusText)
+              .transition(.move(edge: .leading).combined(with: .opacity))
           }
 
-          Spacer(minLength: 12)
-
-          Button {
-            fishing.dismissRewardNote()
-          } label: {
-            Image(systemName: "xmark")
-              .font(.system(size: 14, weight: .bold))
-              .foregroundStyle(Color.white.opacity(0.88))
-              .frame(width: 38, height: 38)
-              .background(
-                Circle()
-                  .fill(Color.white.opacity(0.08))
-              )
-          }
-          .buttonStyle(.plain)
-        }
-
-        ScrollView(showsIndicators: true) {
-          VStack(alignment: .leading, spacing: 10) {
-            ForEach(Array(fishing.rewardMoves.enumerated()), id: \.offset) { _, line in
-              Text(line)
-                .font(.system(size: 13, weight: .semibold, design: .monospaced))
-                .foregroundStyle(Color(red: 0.12, green: 0.15, blue: 0.18))
-                .lineSpacing(3)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 14)
-                .padding(.vertical, 10)
-                .background(
-                  RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .fill(Color.white.opacity(0.82))
-                )
+          if fishing.showsFishingButton {
+            FishingActionButton {
+              fishing.requestCast()
             }
+            .transition(.scale(scale: 0.88).combined(with: .opacity))
           }
-          .padding(18)
         }
-        .frame(maxHeight: overlayPanelMaxHeight(ratio: 0.38))
-        .background(
-          RoundedRectangle(cornerRadius: 26, style: .continuous)
-            .fill(
-              LinearGradient(
-                colors: [
-                  Color(red: 0.96, green: 0.94, blue: 0.88),
-                  Color(red: 0.87, green: 0.84, blue: 0.76),
-                ],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-              )
-            )
-        )
 
-        HStack(spacing: 12) {
-          NativeActionButton(title: "Cast again", style: .solid) {
-            fishing.dismissRewardNote()
-          }
-        }
+        Spacer()
       }
-      .padding(24)
-      .background(
-        RoundedRectangle(cornerRadius: 30, style: .continuous)
-          .fill(Color(red: 0.06, green: 0.11, blue: 0.15).opacity(0.94))
-          .overlay(
-            RoundedRectangle(cornerRadius: 30, style: .continuous)
-              .stroke(Color.white.opacity(0.12), lineWidth: 1)
-          )
-      )
-      .padding(.horizontal, 24)
+      .padding(.horizontal, 22)
+      .padding(.bottom, 30)
     }
   }
 
@@ -15384,6 +15245,178 @@ private struct FishingRodGlyph: View {
       }
       .frame(width: geometry.size.width, height: geometry.size.height)
     }
+  }
+}
+
+private struct FishingActionButton: View {
+  let action: () -> Void
+
+  var body: some View {
+    Button(action: action) {
+      ZStack {
+        Circle()
+          .fill(
+            LinearGradient(
+              colors: [
+                Color(red: 0.95, green: 0.88, blue: 0.73),
+                Color(red: 0.78, green: 0.88, blue: 0.95),
+              ],
+              startPoint: .topLeading,
+              endPoint: .bottomTrailing
+            )
+          )
+          .shadow(color: Color.black.opacity(0.28), radius: 20, y: 12)
+
+        Circle()
+          .stroke(Color.white.opacity(0.58), lineWidth: 1.5)
+
+        VStack(spacing: 6) {
+          FishingRodGlyph()
+            .frame(width: 34, height: 34)
+
+          Text("Fish")
+            .font(.system(size: 13, weight: .black, design: .rounded))
+            .foregroundStyle(Color(red: 0.08, green: 0.12, blue: 0.16))
+        }
+      }
+      .frame(width: 92, height: 92)
+    }
+    .buttonStyle(.plain)
+    .accessibilityLabel("Cast fishing line")
+  }
+}
+
+private struct FishingStatusChip: View {
+  let text: String
+
+  var body: some View {
+    Text(text)
+      .font(.system(size: 13, weight: .bold, design: .rounded))
+      .foregroundStyle(.white)
+      .lineSpacing(2)
+      .padding(.horizontal, 14)
+      .padding(.vertical, 10)
+      .background(
+        Capsule(style: .continuous)
+          .fill(Color(red: 0.06, green: 0.09, blue: 0.12).opacity(0.84))
+          .overlay(
+            Capsule(style: .continuous)
+              .stroke(Color.white.opacity(0.14), lineWidth: 1)
+          )
+      )
+  }
+}
+
+private struct FishingRewardOverlay: View {
+  let rewardMoves: [String]
+  let onDismiss: () -> Void
+
+  var body: some View {
+    ZStack {
+      Color.black.opacity(0.56)
+        .ignoresSafeArea()
+        .onTapGesture(perform: onDismiss)
+
+      VStack(alignment: .leading, spacing: 16) {
+        header
+        moveList
+
+        HStack(spacing: 12) {
+          NativeActionButton(title: "Cast again", style: .solid, action: onDismiss)
+        }
+      }
+      .padding(24)
+      .background(cardBackground)
+      .padding(.horizontal, 24)
+    }
+  }
+
+  private var header: some View {
+    HStack(alignment: .top, spacing: 12) {
+      VStack(alignment: .leading, spacing: 6) {
+        Text("Pond Reward")
+          .font(.system(size: 12, weight: .bold, design: .rounded))
+          .tracking(2.0)
+          .foregroundStyle(Color(red: 0.84, green: 0.91, blue: 0.96))
+
+        Text("Stockfish's note")
+          .font(.system(size: 28, weight: .heavy, design: .rounded))
+          .foregroundStyle(.white)
+
+        Text("The fish dragged back a short move list from the engine.")
+          .font(.system(size: 15, weight: .semibold, design: .rounded))
+          .foregroundStyle(Color.white.opacity(0.78))
+          .lineSpacing(3)
+      }
+
+      Spacer(minLength: 12)
+
+      Button(action: onDismiss) {
+        Image(systemName: "xmark")
+          .font(.system(size: 14, weight: .bold))
+          .foregroundStyle(Color.white.opacity(0.88))
+          .frame(width: 38, height: 38)
+          .background(
+            Circle()
+              .fill(Color.white.opacity(0.08))
+          )
+      }
+      .buttonStyle(.plain)
+    }
+  }
+
+  private var moveList: some View {
+    ScrollView(showsIndicators: true) {
+      VStack(alignment: .leading, spacing: 10) {
+        ForEach(Array(rewardMoves.enumerated()), id: \.offset) { _, line in
+          FishingRewardLine(text: line)
+        }
+      }
+      .padding(18)
+    }
+    .frame(maxHeight: UIScreen.main.bounds.height * 0.38)
+    .background(noteBackground)
+  }
+
+  private var noteBackground: some View {
+    RoundedRectangle(cornerRadius: 26, style: .continuous)
+      .fill(
+        LinearGradient(
+          colors: [
+            Color(red: 0.96, green: 0.94, blue: 0.88),
+            Color(red: 0.87, green: 0.84, blue: 0.76),
+          ],
+          startPoint: .topLeading,
+          endPoint: .bottomTrailing
+        )
+      )
+  }
+
+  private var cardBackground: some View {
+    RoundedRectangle(cornerRadius: 30, style: .continuous)
+      .fill(Color(red: 0.06, green: 0.11, blue: 0.15).opacity(0.94))
+      .overlay(
+        RoundedRectangle(cornerRadius: 30, style: .continuous)
+          .stroke(Color.white.opacity(0.12), lineWidth: 1)
+      )
+  }
+}
+
+private struct FishingRewardLine: View {
+  let text: String
+
+  var body: some View {
+    Text(text)
+      .font(.system(size: 13, weight: .semibold, design: .monospaced))
+      .foregroundStyle(Color(red: 0.12, green: 0.15, blue: 0.18))
+      .lineSpacing(3)
+      .frame(maxWidth: .infinity, alignment: .leading)
+      .padding(.horizontal, 14)
+      .padding(.vertical, 10)
+      .background(
+        RoundedRectangle(cornerRadius: 14, style: .continuous)
+          .fill(Color.white.opacity(0.82))
+      )
   }
 }
 
@@ -20371,7 +20404,12 @@ private struct NativeARView: UIViewRepresentable {
       fishingBobberEntity = bobber
 
       let target = pondTarget + SIMD3<Float>(0, 0.012, 0)
-      anchor.move(to: worldTransform(translation: target), relativeTo: nil, duration: 0.78, timingFunction: .easeInOut)
+      anchor.move(
+        to: worldTransform(translation: target),
+        relativeTo: nil as Entity?,
+        duration: 0.78,
+        timingFunction: AnimationTimingFunction.easeInOut
+      )
     }
 
     private func makeFishingBobberEntity() -> ModelEntity {
@@ -20410,7 +20448,12 @@ private struct NativeARView: UIViewRepresentable {
         rotation: current.rotation,
         translation: current.translation + SIMD3<Float>(0, 0.18, 0.04)
       )
-      bobber.move(to: lifted, relativeTo: nil, duration: 0.24, timingFunction: .easeIn)
+      bobber.move(
+        to: lifted,
+        relativeTo: nil as Entity?,
+        duration: 0.24,
+        timingFunction: AnimationTimingFunction.easeIn
+      )
     }
 
     @MainActor
