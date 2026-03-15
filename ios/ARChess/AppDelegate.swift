@@ -5991,7 +5991,7 @@ private final class AmbientMusicController {
   private var player: AVAudioPlayer?
   private var ambientTrackMissing = false
   private let idleVolume: Float = 0.09
-  private let speechDuckedVolume: Float = 0.0
+  private let speechDuckedVolume: Float = 0.035
   private var isSpeechActive = false
   private var isPlayingRequested = false
   private var isMutedInternal = UserDefaults.standard.bool(forKey: muteDefaultsKey)
@@ -11712,6 +11712,22 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     activeAutomaticPlaybackCaptionToken = captionToken
     pieceVoiceStatusText = "Speaking narrator line via Gemini Live."
     appendGeminiDebug("Speech start: Narrator via Gemini Live -> \(text)")
+
+    if geminiConnectionState != .connected {
+      appendGeminiDebug(
+        "Gemini narrator audio skipped because Live is \(geminiConnectionState.rawValue). Using local fallback."
+      )
+      activePassiveAutomaticPlaybackRecord = nil
+      activePassiveAutomaticPlaybackDidStart = false
+      liveNarratorPlaybackOwnsCaption = false
+      clearCommentaryCaption(ifOwnedBy: .automaticPlayback(captionToken))
+      activeAutomaticPlaybackCaptionToken = nil
+      activeAutomaticPlaybackSource = .none
+      return startLocalAutomaticNarratorUtterance(
+        text: text,
+        playbackRecord: playbackRecord
+      )
+    }
 
     guard passiveNarratorLiveSpeaker.speak(line: text, role: .narrator) else {
       appendGeminiDebug("Gemini Live narrator audio unavailable right now; using local speech fallback.")
