@@ -1,15 +1,15 @@
 {
   "binary_path": "piper",
   "cache_dir": ".cache/piper",
-  "default_speaker_type": "narrator",
+  "default_speaker_type": "knight",
   "voices": {
     "pawn": {
-      "model_path": "piper/voices/pawn/pawn.onnx",
-      "config_path": "piper/voices/pawn/pawn.onnx.json"
+      "model_path": "piper/voices/audition/en_GB-northern_english_male-medium.onnx",
+      "config_path": "piper/voices/audition/en_GB-northern_english_male-medium.onnx.json"
     },
     "rook": {
-      "model_path": "piper/voices/rook/rook.onnx",
-      "config_path": "piper/voices/rook/rook.onnx.json"
+      "model_path": "piper/voices/audition/en_US-joe-medium.onnx",
+      "config_path": "piper/voices/audition/en_US-joe-medium.onnx.json"
     },
     "knight": {
       "model_path": "piper/voices/knight/en_US-lessac-medium.onnx",
@@ -17,20 +17,16 @@
       "preload": true
     },
     "bishop": {
-      "model_path": "piper/voices/bishop/bishop.onnx",
-      "config_path": "piper/voices/bishop/bishop.onnx.json"
+      "model_path": "piper/voices/audition/en_US-ryan-medium.onnx",
+      "config_path": "piper/voices/audition/en_US-ryan-medium.onnx.json"
     },
     "queen": {
-      "model_path": "piper/voices/queen/queen.onnx",
-      "config_path": "piper/voices/queen/queen.onnx.json"
+      "model_path": "piper/voices/audition/en_US-hfc_female-medium.onnx",
+      "config_path": "piper/voices/audition/en_US-hfc_female-medium.onnx.json"
     },
     "king": {
-      "model_path": "piper/voices/king/king.onnx",
-      "config_path": "piper/voices/king/king.onnx.json"
-    },
-    "narrator": {
-      "model_path": "piper/voices/narrator/narrator.onnx",
-      "config_path": "piper/voices/narrator/narrator.onnx.json"
+      "model_path": "piper/voices/audition/en_GB-alan-medium.onnx",
+      "config_path": "piper/voices/audition/en_GB-alan-medium.onnx.json"
     }
   }
 }

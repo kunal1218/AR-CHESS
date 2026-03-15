@@ -639,6 +639,10 @@ private enum PiperSpeakerType: String, CaseIterable, Identifiable {
     }
   }
 
+  var usesGeminiLiveNarrator: Bool {
+    self == .narrator
+  }
+
   var id: String { rawValue }
 }
 
@@ -3199,6 +3203,10 @@ private final class PiperVoiceAuditionStore: NSObject, ObservableObject, AVAudio
   }
 
   func assignSelectedVoice(to speakerType: PiperSpeakerType) async {
+    guard !speakerType.usesGeminiLiveNarrator else {
+      statusText = "Narrator stays on Gemini Live."
+      return
+    }
     guard let selectedVoice else {
       statusText = "Select a Piper voice before assigning it."
       return
@@ -3237,6 +3245,9 @@ private final class PiperVoiceAuditionStore: NSObject, ObservableObject, AVAudio
   }
 
   func assignmentLabel(for speakerType: PiperSpeakerType) -> String {
+    if speakerType.usesGeminiLiveNarrator {
+      return "Gemini Live narrator"
+    }
     guard let assignedVoiceID = speakerAssignments[speakerType] else {
       return "Unassigned"
     }
@@ -7680,6 +7691,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
         try AudioSessionCoordinator.shared.activatePlaybackSession()
         _ = AVSpeechSynthesisVoice(language: "en-US")
         self.prewarmSpeechSynthesizerIfNeeded()
+        self.passiveNarratorLiveSpeaker.prewarmIfNeeded()
         self.piperAutomaticSpeaker.prepareIfNeeded()
         self.hasPrewarmedSpeechPath = true
       } catch {
@@ -8369,6 +8381,10 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
 
   private func hasAutomaticCommentaryInFlightOrQueued() -> Bool {
     if automaticCommentaryRequestTask != nil {
+      return true
+    }
+
+    if passiveNarratorLiveSpeaker.isBusy {
       return true
     }
 
@@ -11524,14 +11540,15 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       priority: priority,
       rawDuration: pieceAudioBusyDurationProvider?() ?? 0
     )
+    let narratorLiveBusy = passiveNarratorLiveSpeaker.isBusy
     let piperBusy = piperAutomaticSpeaker.isBusy
-    if synthesizer.isSpeaking || pieceAudioBusyDuration > 0.05 || piperBusy {
+    if synthesizer.isSpeaking || pieceAudioBusyDuration > 0.05 || narratorLiveBusy || piperBusy {
       let retryDelay = max(pieceAudioBusyDuration, priority == .urgent ? 0.05 : 0.08)
       if case .pieceVoice(let speaker) = style {
         pieceVoiceStatusText = "Queued \(speaker.displayName) voice behind speech/SFX."
       }
       appendGeminiDebug(
-        "Queued \(generatedNarrationDebugLabel(style)) speech. synthesizer=\(synthesizer.isSpeaking) piper_busy=\(piperBusy) sfx_busy=\(String(format: "%.2f", pieceAudioBusyDuration)) retry=\(String(format: "%.2f", retryDelay))"
+        "Queued \(generatedNarrationDebugLabel(style)) speech. synthesizer=\(synthesizer.isSpeaking) narrator_busy=\(narratorLiveBusy) piper_busy=\(piperBusy) sfx_busy=\(String(format: "%.2f", pieceAudioBusyDuration)) retry=\(String(format: "%.2f", retryDelay))"
       )
       queuePendingGeneratedNarration(
         text: sanitizedText,
@@ -11562,7 +11579,12 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     }
 
     switch style {
-    case .automaticNarrator, .pieceVoice:
+    case .automaticNarrator:
+      return startAutomaticNarratorPlayback(
+        text: text,
+        playbackRecord: playbackRecord
+      )
+    case .pieceVoice:
       return startPiperAutomaticPlayback(
         text: text,
         style: style,
@@ -11609,6 +11631,37 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     appendGeminiDebug("Speech start: \(generatedNarrationDebugLabel(style)) -> \(text)")
     maybeHighlightNarrationFocus(text)
     synthesizer.speak(utterance)
+    return true
+  }
+
+  private func startAutomaticNarratorPlayback(
+    text: String,
+    playbackRecord: AutomaticDialoguePlaybackRecord?
+  ) -> Bool {
+    maybeHighlightNarrationFocus(text)
+    caption = Caption(
+      title: "Narrator",
+      line: text,
+      imageAssetName: "GeminiNarratorPortrait"
+    )
+    pieceVoiceStatusText = "Speaking narrator line via Gemini Live."
+    appendGeminiDebug("Speech start: Narrator via Gemini Live -> \(text)")
+
+    guard passiveNarratorLiveSpeaker.speak(line: text, role: .narrator) else {
+      appendGeminiDebug("Gemini Live narrator audio unavailable right now; using local speech fallback.")
+      activePassiveAutomaticPlaybackRecord = nil
+      activePassiveAutomaticPlaybackDidStart = false
+      liveNarratorPlaybackOwnsCaption = false
+      caption = nil
+      return startLocalAutomaticNarratorUtterance(
+        text: text,
+        playbackRecord: playbackRecord
+      )
+    }
+
+    activePassiveAutomaticPlaybackRecord = playbackRecord
+    activePassiveAutomaticPlaybackDidStart = false
+    liveNarratorPlaybackOwnsCaption = true
     return true
   }
 
@@ -11771,11 +11824,13 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       priority: .urgent,
       rawDuration: pieceAudioBusyDurationProvider?() ?? 0
     )
+    let narratorLiveBusy = passiveNarratorLiveSpeaker.isBusy
     guard !synthesizer.isSpeaking,
+          !narratorLiveBusy,
           !piperAutomaticSpeaker.isBusy,
           pieceAudioBusyDuration <= 0.05 else {
       appendGeminiDebug(
-        "Pending speech blocked for \(generatedNarrationDebugLabel(pendingGeneratedNarration.style)). synthesizer=\(synthesizer.isSpeaking) piper_busy=\(piperAutomaticSpeaker.isBusy) sfx_busy=\(String(format: "%.2f", pieceAudioBusyDuration))"
+        "Pending speech blocked for \(generatedNarrationDebugLabel(pendingGeneratedNarration.style)). synthesizer=\(synthesizer.isSpeaking) narrator_busy=\(narratorLiveBusy) piper_busy=\(piperAutomaticSpeaker.isBusy) sfx_busy=\(String(format: "%.2f", pieceAudioBusyDuration))"
       )
       schedulePendingGeneratedNarrationFlush(after: max(pieceAudioBusyDuration, 0.08))
       return
@@ -12574,7 +12629,7 @@ private struct PiperVoiceAuditionView: View {
                 .tracking(1.8)
                 .foregroundStyle(Color(red: 0.88, green: 0.82, blue: 0.70))
 
-              Text("These assignment actions update the current backend Piper config so live commentary uses the chosen voice next time it speaks.")
+              Text("These assignment actions update the current backend Piper config so live piece commentary uses the chosen voice next time it speaks. Narrator stays on Gemini Live.")
                 .font(.system(size: 13, weight: .medium, design: .rounded))
                 .foregroundStyle(Color.white.opacity(0.72))
                 .lineSpacing(2)
@@ -12595,9 +12650,9 @@ private struct PiperVoiceAuditionView: View {
                   Spacer(minLength: 8)
 
                   compactActionButton(
-                    title: "Use selected",
+                    title: speakerType.usesGeminiLiveNarrator ? "Gemini Live" : "Use selected",
                     systemImage: "checkmark",
-                    isDisabled: store.selectedVoice == nil || store.isAssigning
+                    isDisabled: speakerType.usesGeminiLiveNarrator || store.selectedVoice == nil || store.isAssigning
                   ) {
                     Task {
                       await store.assignSelectedVoice(to: speakerType)
