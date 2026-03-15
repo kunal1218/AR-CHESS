@@ -4707,6 +4707,14 @@ private struct SpokenLine {
   let volume: Float?
 }
 
+private struct AutomaticVoiceProfile {
+  let preferredVoiceIdentifiers: [String]
+  let preferredLanguages: [String]
+  let pitch: Float
+  let rate: Float
+  let volume: Float
+}
+
 private enum SpeechPriority: Int {
   case normal
   case urgent
@@ -6318,10 +6326,18 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     case reviewThirdBest
   }
 
+  private enum PassiveAutomaticVoiceBackend {
+    case localDeviceVoices
+    case geminiLive
+  }
+
   private static let preferredMovetimeMs = 80
   private static let preferredHardTimeoutMs = 600
   private static let substantialGainThreshold = 120
   private static let substantialDropThreshold = -140
+  // Passive automatic speech runs on-device so piece and narrator playback can use
+  // distinct local voices without depending on the backend speech route.
+  private static let passiveAutomaticVoiceBackend: PassiveAutomaticVoiceBackend = .localDeviceVoices
   // The passive narrator ramps by 10 percentage points after each normal move where the
   // narrator stays silent. We evaluate the next move at `(storedTurns + 1) * increment`
   // so the first eligible post-narrator move starts at 10%.
@@ -6673,8 +6689,18 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       do {
         try AudioSessionCoordinator.shared.activatePlaybackSession()
         _ = AVSpeechSynthesisVoice(language: "en-US")
+        _ = self.resolvedAutomaticVoice(for: self.narratorAutomaticVoiceProfile())
+        for speaker in [
+          PersonalitySpeaker.pawn,
+          .rook,
+          .knight,
+          .bishop,
+          .queen,
+          .king,
+        ] {
+          _ = self.resolvedAutomaticVoice(for: self.automaticVoiceProfile(for: speaker))
+        }
         self.prewarmSpeechSynthesizerIfNeeded()
-        self.passiveNarratorLiveSpeaker.prewarmIfNeeded()
         self.hasPrewarmedSpeechPath = true
       } catch {
         return
@@ -10431,7 +10457,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     text: String,
     playbackRecord: AutomaticDialoguePlaybackRecord?
   ) -> Bool {
-    appendGeminiDebug("Preparing passive narrator Gemini Live speech.")
+    appendGeminiDebug("Preparing passive narrator on-device speech.")
     return speakGeneratedNarration(
       text: text,
       style: .automaticNarrator,
@@ -10456,7 +10482,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     priority: SpeechPriority,
     playbackRecord: AutomaticDialoguePlaybackRecord?
   ) -> Bool {
-    appendGeminiDebug("Preparing piece voice speech for \(speaker.displayName.lowercased()).")
+    appendGeminiDebug("Preparing on-device piece voice speech for \(speaker.displayName.lowercased()).")
     return speakGeneratedNarration(
       text: text,
       style: .pieceVoice(speaker: speaker),
@@ -10537,11 +10563,30 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
 
     switch style {
     case .automaticNarrator, .pieceVoice:
-      return startPassiveAutomaticLivePlayback(
-        text: text,
-        style: style,
-        playbackRecord: playbackRecord
-      )
+      switch Self.passiveAutomaticVoiceBackend {
+      case .localDeviceVoices:
+        switch style {
+        case .automaticNarrator:
+          return startLocalAutomaticNarratorUtterance(
+            text: text,
+            playbackRecord: playbackRecord
+          )
+        case .pieceVoice(let speaker):
+          return startLocalPieceVoiceUtterance(
+            text: text,
+            speaker: speaker,
+            playbackRecord: playbackRecord
+          )
+        case .gemini:
+          break
+        }
+      case .geminiLive:
+        return startPassiveAutomaticLivePlayback(
+          text: text,
+          style: style,
+          playbackRecord: playbackRecord
+        )
+      }
     case .gemini:
       break
     }
@@ -10644,16 +10689,125 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     return true
   }
 
+  private func narratorAutomaticVoiceProfile() -> AutomaticVoiceProfile {
+    AutomaticVoiceProfile(
+      preferredVoiceIdentifiers: [
+        "com.apple.ttsbundle.Daniel-compact",
+        "com.apple.ttsbundle.Samantha-compact"
+      ],
+      preferredLanguages: ["en-GB", "en-US", "en-AU"],
+      pitch: 0.96,
+      rate: 0.43,
+      volume: 0.94
+    )
+  }
+
+  private func automaticVoiceProfile(for speaker: PersonalitySpeaker) -> AutomaticVoiceProfile {
+    switch speaker {
+    case .pawn:
+      return AutomaticVoiceProfile(
+        preferredVoiceIdentifiers: [
+          "com.apple.ttsbundle.Karen-compact",
+          "com.apple.ttsbundle.Samantha-compact"
+        ],
+        preferredLanguages: ["en-AU", "en-US", "en-GB"],
+        pitch: 0.92,
+        rate: 0.47,
+        volume: 0.84
+      )
+    case .rook:
+      return AutomaticVoiceProfile(
+        preferredVoiceIdentifiers: [
+          "com.apple.ttsbundle.Daniel-compact",
+          "com.apple.ttsbundle.Alex-compact"
+        ],
+        preferredLanguages: ["en-GB", "en-US", "en-AU"],
+        pitch: 0.74,
+        rate: 0.53,
+        volume: 1.0
+      )
+    case .knight:
+      return AutomaticVoiceProfile(
+        preferredVoiceIdentifiers: [
+          "com.apple.ttsbundle.Moira-compact",
+          "com.apple.ttsbundle.Fiona-compact"
+        ],
+        preferredLanguages: ["en-IE", "en-GB", "en-US"],
+        pitch: 1.32,
+        rate: 0.56,
+        volume: 0.96
+      )
+    case .bishop:
+      return AutomaticVoiceProfile(
+        preferredVoiceIdentifiers: [
+          "com.apple.ttsbundle.Tessa-compact",
+          "com.apple.ttsbundle.Samantha-compact"
+        ],
+        preferredLanguages: ["en-ZA", "en-US", "en-GB"],
+        pitch: 1.02,
+        rate: 0.37,
+        volume: 0.88
+      )
+    case .queen:
+      return AutomaticVoiceProfile(
+        preferredVoiceIdentifiers: [
+          "com.apple.ttsbundle.Karen-compact",
+          "com.apple.ttsbundle.Moira-compact"
+        ],
+        preferredLanguages: ["en-AU", "en-GB", "en-US"],
+        pitch: 1.18,
+        rate: 0.31,
+        volume: 0.92
+      )
+    case .king:
+      return AutomaticVoiceProfile(
+        preferredVoiceIdentifiers: [
+          "com.apple.ttsbundle.Rishi-compact",
+          "com.apple.ttsbundle.Daniel-compact"
+        ],
+        preferredLanguages: ["en-IN", "en-GB", "en-US"],
+        pitch: 0.84,
+        rate: 0.49,
+        volume: 0.98
+      )
+    }
+  }
+
+  private func resolvedAutomaticVoice(for profile: AutomaticVoiceProfile) -> AVSpeechSynthesisVoice? {
+    for identifier in profile.preferredVoiceIdentifiers {
+      if let voice = AVSpeechSynthesisVoice(identifier: identifier) {
+        return voice
+      }
+    }
+
+    let availableVoices = AVSpeechSynthesisVoice.speechVoices()
+    for language in profile.preferredLanguages {
+      if let voice = availableVoices.first(where: { $0.language.caseInsensitiveCompare(language) == .orderedSame }) {
+        return voice
+      }
+    }
+
+    for language in profile.preferredLanguages {
+      let loweredLanguage = language.lowercased()
+      if let voice = availableVoices.first(where: { $0.language.lowercased().hasPrefix(loweredLanguage) }) {
+        return voice
+      }
+    }
+
+    return AVSpeechSynthesisVoice(language: "en-US")
+  }
+
   private func startLocalAutomaticNarratorUtterance(
     text: String,
     playbackRecord: AutomaticDialoguePlaybackRecord? = nil
   ) -> Bool {
     liveNarratorPlaybackOwnsCaption = false
     let utterance = AVSpeechUtterance(string: text)
-    utterance.voice = AVSpeechSynthesisVoice(language: "en-US")
-    utterance.pitchMultiplier = 0.98
-    utterance.rate = 0.45
-    utterance.volume = 0.94
+    let voiceProfile = narratorAutomaticVoiceProfile()
+    utterance.voice = resolvedAutomaticVoice(for: voiceProfile)
+    utterance.pitchMultiplier = voiceProfile.pitch
+    utterance.rate = voiceProfile.rate
+    utterance.volume = voiceProfile.volume
     utterance.preUtteranceDelay = 0.02
     utteranceCaptions[ObjectIdentifier(utterance)] = Caption(
       title: "Narrator",
@@ -10677,10 +10831,11 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     playbackRecord: AutomaticDialoguePlaybackRecord? = nil
   ) -> Bool {
     let utterance = AVSpeechUtterance(string: text)
-    utterance.voice = AVSpeechSynthesisVoice(language: "en-US")
-    utterance.pitchMultiplier = min(max(speaker.defaultPitch, 0.5), 2.0)
-    utterance.rate = min(max(speaker.defaultRate, 0.1), 0.65)
-    utterance.volume = min(max(speaker.defaultVolume, 0.0), 1.0)
+    let voiceProfile = automaticVoiceProfile(for: speaker)
+    utterance.voice = resolvedAutomaticVoice(for: voiceProfile)
+    utterance.pitchMultiplier = min(max(voiceProfile.pitch, 0.5), 2.0)
+    utterance.rate = min(max(voiceProfile.rate, 0.1), 0.65)
+    utterance.volume = min(max(voiceProfile.volume, 0.0), 1.0)
     utterance.preUtteranceDelay = 0.02
     utteranceCaptions[ObjectIdentifier(utterance)] = Caption(speaker: speaker, line: text)
     utteranceStyles[ObjectIdentifier(utterance)] = .pieceVoice(speaker: speaker)
