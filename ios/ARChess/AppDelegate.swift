@@ -7503,7 +7503,9 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
           self.activePassiveAutomaticPlaybackRecord = nil
           self.activePassiveAutomaticPlaybackDidStart = false
           self.liveNarratorPlaybackOwnsCaption = false
-          self.caption = nil
+          if !self.synthesizer.isSpeaking {
+            self.caption = nil
+          }
           self.flushPendingGeneratedNarrationIfPossible()
           self.flushQueuedAutomaticCommentaryDecisionIfPossible()
         }
@@ -7530,6 +7532,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
             playbackRecord: playbackRecord
           )
         case .piece:
+          self.setSpeakingPieceHighlight(square: nil)
           guard let speakerName = request.speakerName,
                 let speaker = self.personalitySpeaker(named: speakerName) else {
             self.pieceVoiceStatusText = "Piece Gemini Live unavailable."
@@ -7573,7 +7576,9 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
           self.activePassiveAutomaticPlaybackRecord = nil
           self.activePassiveAutomaticPlaybackDidStart = false
           self.liveNarratorPlaybackOwnsCaption = false
-          self.caption = nil
+          if !self.synthesizer.isSpeaking {
+            self.caption = nil
+          }
           self.flushPendingGeneratedNarrationIfPossible()
           self.flushQueuedAutomaticCommentaryDecisionIfPossible()
         }
@@ -7617,6 +7622,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
             playbackRecord: playbackRecord
           )
         case .pawn, .rook, .knight, .bishop, .queen, .king:
+          self.setSpeakingPieceHighlight(square: nil)
           guard let speaker = self.personalitySpeaker(for: request.line.speakerType) else {
             self.pieceVoiceStatusText = "Piece Piper unavailable."
             self.flushQueuedAutomaticCommentaryDecisionIfPossible()
@@ -8530,8 +8536,11 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       endAutomaticDialoguePlayback(playbackRecord)
     }
     if !synthesizer.isSpeaking {
-      AmbientMusicController.shared.setSpeechActive(false)
-      caption = nil
+      let otherSpeechActive = passiveNarratorLiveSpeaker.isBusy || piperAutomaticSpeaker.isBusy
+      if !otherSpeechActive {
+        AmbientMusicController.shared.setSpeechActive(false)
+        caption = nil
+      }
       flushPendingGeneratedNarrationIfPossible()
       flushQueuedAutomaticCommentaryDecisionIfPossible()
     }
@@ -8553,8 +8562,11 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       endAutomaticDialoguePlayback(playbackRecord)
     }
     if !synthesizer.isSpeaking {
-      AmbientMusicController.shared.setSpeechActive(false)
-      caption = nil
+      let otherSpeechActive = passiveNarratorLiveSpeaker.isBusy || piperAutomaticSpeaker.isBusy
+      if !otherSpeechActive {
+        AmbientMusicController.shared.setSpeechActive(false)
+        caption = nil
+      }
       flushPendingGeneratedNarrationIfPossible()
       flushQueuedAutomaticCommentaryDecisionIfPossible()
     }
@@ -11692,6 +11704,7 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       )
       caption = Caption(speaker: speaker, line: text)
       pieceVoiceStatusText = "Speaking \(speaker.displayName) voice via Piper."
+      setSpeakingPieceHighlight(square: playbackRecord?.highlightedSquare)
     case .gemini:
       return false
     }
