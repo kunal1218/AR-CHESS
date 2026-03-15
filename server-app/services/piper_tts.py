@@ -4,11 +4,20 @@ import os
 import shutil
 import subprocess
 import threading
+import time
+import wave
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
 from services.piper_cache import PiperAudioCache, build_piper_cache_key, normalize_cacheable_tts_text
+
+try:
+    from piper.config import SynthesisConfig
+    from piper.voice import PiperVoice
+except ImportError:  # pragma: no cover - optional runtime fallback
+    PiperVoice = None
+    SynthesisConfig = None
 
 
 LOGGER = logging.getLogger("archess.piper.tts")
@@ -36,11 +45,12 @@ class PiperVoiceSpec:
     model_path: Path
     config_path: Path
     speaker_id: int | None = None
+    preload: bool = False
 
 
 @dataclass(frozen=True)
 class PiperRuntimeConfig:
-    binary_path: Path
+    binary_path: Path | None
     cache_dir: Path
     default_speaker_type: str
     voices: dict[str, PiperVoiceSpec]
@@ -65,15 +75,25 @@ class PiperSynthesisResult:
     audio_path: Path
 
 
+@dataclass
+class LoadedPiperVoice:
+    signature: str
+    voice: PiperVoice
+    lock: threading.Lock
+
+
 class PiperTTSService:
     def __init__(self) -> None:
         self._config_path = self._resolve_config_path(os.getenv("PIPER_VOICES_CONFIG_PATH"))
         self._timeout_seconds = float(os.getenv("PIPER_TTS_TIMEOUT_SECONDS", "20"))
+        self._force_subprocess = self._parse_bool_env("PIPER_TTS_FORCE_SUBPROCESS")
         self._config_lock = threading.Lock()
         self._config_mtime_ns: int | None = None
         self._runtime_config: PiperRuntimeConfig | None = None
         self._generation_lock = threading.Lock()
         self._generation_locks: dict[str, threading.Lock] = {}
+        self._loaded_voice_lock = threading.Lock()
+        self._loaded_voices: dict[str, LoadedPiperVoice] = {}
 
     def synthesize(self, speaker_type: str, text: str) -> PiperSynthesisResult:
         normalized_speaker_type = self._normalize_speaker_type(speaker_type)
@@ -114,7 +134,7 @@ class PiperTTSService:
                     audio_path=audio_path,
                 )
 
-            self._run_piper(runtime, resolved_voice.spec, normalized_text, audio_path)
+            self._synthesize_to_file(runtime, resolved_voice.spec, normalized_text, audio_path)
 
         return PiperSynthesisResult(
             requested_speaker_type=normalized_speaker_type,
@@ -133,6 +153,32 @@ class PiperTTSService:
             raise PiperAudioNotFoundError(f"Piper audio cache miss for {cache_key}.")
         return audio_path
 
+    def prewarm_configured_voices(self) -> None:
+        runtime = self._load_runtime_config()
+        if not self._can_use_python_runtime():
+            LOGGER.info("Skipping Piper voice prewarm because the in-process runtime is unavailable.")
+            return
+
+        speaker_types = {runtime.default_speaker_type}
+        for speaker_type, voice in runtime.voices.items():
+            if voice.preload:
+                speaker_types.add(speaker_type)
+
+        for speaker_type in sorted(speaker_types):
+            voice = runtime.voices.get(speaker_type)
+            if voice is None:
+                continue
+            if not self._voice_files_exist(voice):
+                LOGGER.info(
+                    "Skipping Piper prewarm for speaker_type=%s because model/config files are missing.",
+                    speaker_type,
+                )
+                continue
+            try:
+                self._get_loaded_voice(voice)
+            except Exception as exc:  # pragma: no cover - best effort warmup
+                LOGGER.warning("Piper prewarm failed for speaker_type=%s: %s", speaker_type, exc)
+
     def _load_runtime_config(self) -> PiperRuntimeConfig:
         with self._config_lock:
             if not self._config_path.is_file():
@@ -150,7 +196,7 @@ class PiperTTSService:
             if not isinstance(payload, dict):
                 raise PiperConfigurationError("Piper voice config must be a JSON object.")
 
-            binary_path = self._resolve_binary_path(os.getenv("PIPER_BINARY_PATH") or payload.get("binary_path"))
+            binary_setting = os.getenv("PIPER_BINARY_PATH") or payload.get("binary_path")
             cache_dir = self._resolve_optional_path(os.getenv("PIPER_CACHE_DIR") or payload.get("cache_dir"))
             default_speaker_type = self._normalize_speaker_type(payload.get("default_speaker_type") or "narrator")
             voices_payload = payload.get("voices")
@@ -169,6 +215,10 @@ class PiperTTSService:
                     f"Piper default_speaker_type {default_speaker_type!r} is missing from the voices map."
                 )
 
+            binary_path = self._resolve_binary_path(
+                binary_setting,
+                required=not self._can_use_python_runtime(),
+            )
             runtime = PiperRuntimeConfig(
                 binary_path=binary_path,
                 cache_dir=cache_dir or DEFAULT_CACHE_DIR,
@@ -200,11 +250,16 @@ class PiperTTSService:
             except (TypeError, ValueError) as exc:
                 raise PiperConfigurationError(f"Piper voice {speaker_type} has an invalid speaker_id.") from exc
 
+        preload = entry.get("preload", False)
+        if not isinstance(preload, bool):
+            raise PiperConfigurationError(f"Piper voice {speaker_type} has an invalid preload flag.")
+
         return PiperVoiceSpec(
             speaker_type=speaker_type,
             model_path=model_path,
             config_path=config_path,
             speaker_id=speaker_id,
+            preload=preload,
         )
 
     def _resolve_voice(self, requested_speaker_type: str, runtime: PiperRuntimeConfig) -> PiperResolvedVoice:
@@ -247,11 +302,108 @@ class PiperTTSService:
             voice_signature=self._voice_signature(default_voice),
         )
 
+    def _synthesize_to_file(
+        self,
+        runtime: PiperRuntimeConfig,
+        voice: PiperVoiceSpec,
+        text: str,
+        output_path: Path,
+    ) -> None:
+        if self._can_use_python_runtime():
+            try:
+                self._synthesize_with_loaded_voice(voice, text, output_path)
+                return
+            except Exception as exc:
+                if runtime.binary_path is None:
+                    if isinstance(exc, PiperSynthesisError):
+                        raise
+                    raise PiperSynthesisError(f"Piper runtime synthesis failed: {exc}") from exc
+                LOGGER.warning(
+                    "Piper in-process synthesis failed for speaker_type=%s. Falling back to subprocess. error=%s",
+                    voice.speaker_type,
+                    exc,
+                )
+
+        if runtime.binary_path is None:
+            raise PiperConfigurationError(
+                "Piper is unavailable because neither the Python runtime nor a Piper binary is configured."
+            )
+        self._run_piper(runtime, voice, text, output_path)
+
+    def _synthesize_with_loaded_voice(self, voice: PiperVoiceSpec, text: str, output_path: Path) -> None:
+        loaded_voice = self._get_loaded_voice(voice)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_output_path = output_path.with_name(f"{output_path.stem}-{uuid4().hex}.tmp.wav")
+        temp_output_path.unlink(missing_ok=True)
+        synthesis_config = self._build_synthesis_config(voice)
+        started_at = time.perf_counter()
+
+        try:
+            with loaded_voice.lock:
+                with wave.open(str(temp_output_path), "wb") as wav_file:
+                    loaded_voice.voice.synthesize_wav(
+                        text,
+                        wav_file,
+                        syn_config=synthesis_config,
+                        set_wav_format=True,
+                    )
+        except Exception as exc:
+            temp_output_path.unlink(missing_ok=True)
+            raise PiperSynthesisError(
+                f"Piper runtime synthesis failed for speaker_type={voice.speaker_type}: {exc}"
+            ) from exc
+
+        if not temp_output_path.is_file() or temp_output_path.stat().st_size == 0:
+            temp_output_path.unlink(missing_ok=True)
+            raise PiperSynthesisError("Piper runtime did not produce a non-empty wav file.")
+
+        temp_output_path.replace(output_path)
+        LOGGER.info(
+            "Piper synthesized speaker_type=%s via in-process runtime in %.1fms.",
+            voice.speaker_type,
+            (time.perf_counter() - started_at) * 1000,
+        )
+
+    def _get_loaded_voice(self, voice: PiperVoiceSpec) -> LoadedPiperVoice:
+        if not self._can_use_python_runtime() or PiperVoice is None:
+            raise PiperConfigurationError("Piper Python runtime is unavailable.")
+
+        signature = self._voice_signature(voice)
+        with self._loaded_voice_lock:
+            existing = self._loaded_voices.get(voice.speaker_type)
+            if existing is not None and existing.signature == signature:
+                return existing
+
+            started_at = time.perf_counter()
+            try:
+                loaded_voice = PiperVoice.load(voice.model_path, config_path=voice.config_path)
+            except Exception as exc:
+                raise PiperSynthesisError(
+                    f"Piper runtime could not load speaker_type={voice.speaker_type}: {exc}"
+                ) from exc
+
+            wrapped = LoadedPiperVoice(
+                signature=signature,
+                voice=loaded_voice,
+                lock=threading.Lock(),
+            )
+            self._loaded_voices[voice.speaker_type] = wrapped
+            LOGGER.info(
+                "Loaded Piper voice speaker_type=%s in %.1fms.",
+                voice.speaker_type,
+                (time.perf_counter() - started_at) * 1000,
+            )
+            return wrapped
+
+    def _build_synthesis_config(self, voice: PiperVoiceSpec) -> SynthesisConfig | None:
+        if voice.speaker_id is None or SynthesisConfig is None:
+            return None
+        return SynthesisConfig(speaker_id=voice.speaker_id)
+
     def _run_piper(self, runtime: PiperRuntimeConfig, voice: PiperVoiceSpec, text: str, output_path: Path) -> None:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         temp_output_path = output_path.with_name(f"{output_path.stem}-{uuid4().hex}.tmp.wav")
-        if temp_output_path.exists():
-            temp_output_path.unlink()
+        temp_output_path.unlink(missing_ok=True)
 
         command = [
             str(runtime.binary_path),
@@ -265,6 +417,7 @@ class PiperTTSService:
         if voice.speaker_id is not None:
             command.extend(["--speaker", str(voice.speaker_id)])
 
+        started_at = time.perf_counter()
         try:
             completed = subprocess.run(
                 command,
@@ -277,19 +430,16 @@ class PiperTTSService:
         except FileNotFoundError as exc:
             raise PiperConfigurationError(f"Piper binary not found at {runtime.binary_path}.") from exc
         except subprocess.TimeoutExpired as exc:
-            if temp_output_path.exists():
-                temp_output_path.unlink(missing_ok=True)
+            temp_output_path.unlink(missing_ok=True)
             raise PiperSynthesisError(f"Piper timed out after {self._timeout_seconds:.1f}s.") from exc
         except OSError as exc:
-            if temp_output_path.exists():
-                temp_output_path.unlink(missing_ok=True)
+            temp_output_path.unlink(missing_ok=True)
             raise PiperSynthesisError(f"Could not launch Piper: {exc}") from exc
 
         stderr = completed.stderr.strip()
         stdout = completed.stdout.strip()
         if completed.returncode != 0:
-            if temp_output_path.exists():
-                temp_output_path.unlink(missing_ok=True)
+            temp_output_path.unlink(missing_ok=True)
             details = stderr or stdout or f"exit code {completed.returncode}"
             raise PiperSynthesisError(f"Piper exited unsuccessfully: {details}")
 
@@ -298,6 +448,11 @@ class PiperTTSService:
             raise PiperSynthesisError("Piper did not produce a non-empty wav file.")
 
         temp_output_path.replace(output_path)
+        LOGGER.info(
+            "Piper synthesized speaker_type=%s via subprocess in %.1fms.",
+            voice.speaker_type,
+            (time.perf_counter() - started_at) * 1000,
+        )
 
     def _voice_files_exist(self, voice: PiperVoiceSpec) -> bool:
         return voice.model_path.is_file() and voice.config_path.is_file()
@@ -330,9 +485,11 @@ class PiperTTSService:
             return self._resolve_required_path(raw_path)
         return DEFAULT_CONFIG_PATH
 
-    def _resolve_binary_path(self, raw_value: object) -> Path:
+    def _resolve_binary_path(self, raw_value: object, *, required: bool) -> Path | None:
         if not isinstance(raw_value, str) or not raw_value.strip():
-            raise PiperConfigurationError("Piper binary_path must be configured.")
+            if required:
+                raise PiperConfigurationError("Piper binary_path must be configured.")
+            return None
 
         trimmed = raw_value.strip()
         if "/" not in trimmed and "\\" not in trimmed and not trimmed.startswith("."):
@@ -341,9 +498,16 @@ class PiperTTSService:
                 return Path(resolved).resolve()
 
         candidate = self._resolve_required_path(trimmed)
-        if not candidate.exists():
+        if candidate.is_file():
+            return candidate
+        if required:
             raise PiperConfigurationError(f"Piper binary not found at {candidate}.")
-        return candidate
+
+        LOGGER.warning(
+            "Configured Piper binary_path=%s was not found. Using the in-process Piper runtime instead.",
+            trimmed,
+        )
+        return None
 
     def _resolve_optional_path(self, raw_value: object) -> Path | None:
         if raw_value is None:
@@ -367,3 +531,10 @@ class PiperTTSService:
                 "Piper speaker_type must be one of pawn, rook, knight, bishop, queen, king, narrator."
             )
         return normalized
+
+    def _can_use_python_runtime(self) -> bool:
+        return PiperVoice is not None and not self._force_subprocess
+
+    def _parse_bool_env(self, env_name: str) -> bool:
+        raw_value = os.getenv(env_name, "").strip().lower()
+        return raw_value in {"1", "true", "yes", "on"}

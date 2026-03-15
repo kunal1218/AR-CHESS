@@ -9,7 +9,7 @@ from collections import Counter, deque
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from threading import Lock
+from threading import Lock, Thread
 from typing import Any
 from urllib.parse import urlparse
 
@@ -2822,6 +2822,11 @@ def get_queue_match_moves(
 async def startup_gemini_live() -> None:
     GEMINI_LIVE_CLIENT.ensure_connection_background()
     GEMINI_PASSIVE_COMMENTARY_CLIENT.ensure_connection_background()
+    Thread(
+        target=PIPER_TTS_SERVICE.prewarm_configured_voices,
+        name="PiperTTSPrewarm",
+        daemon=True,
+    ).start()
 
 
 @app.on_event("shutdown")

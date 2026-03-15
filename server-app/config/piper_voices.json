@@ -12,8 +12,9 @@
       "config_path": "piper/voices/rook/rook.onnx.json"
     },
     "knight": {
-      "model_path": "piper/voices/knight/en_US-lessac-high.onnx",
-      "config_path": "piper/voices/knight/en_US-lessac-high.onnx.json"
+      "model_path": "piper/voices/knight/en_US-lessac-medium.onnx",
+      "config_path": "piper/voices/knight/en_US-lessac-medium.onnx.json",
+      "preload": true
     },
     "bishop": {
       "model_path": "piper/voices/bishop/bishop.onnx",
