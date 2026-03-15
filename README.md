@@ -26,6 +26,7 @@ Monorepo for the AR Chess platform with the existing server and a native iOS app
 - `mobile/` is no longer the active iOS runtime path.
 - For Gemini hints, configure `ARChessAPIBaseURL` for the iOS app and set `GEMINI_API_KEY` only on the backend (`server-app/.env`).
 - Gemini hints currently run through the backend Gemini Live session. Keep `GEMINI_LIVE_MODEL` on a Live-capable model such as `models/gemini-2.5-flash-native-audio-preview-12-2025`; Gemini 3 models are not currently supported on the Live API.
+- Passive automatic voices can optionally run through a local Piper backend instead of Gemini Live. Set `PASSIVE_LIVE_TTS_BACKEND=piper`, `PIPER_BINARY_PATH`, and either per-piece `PIPER_VOICE_<ROLE>_MODEL` / `PIPER_VOICE_<ROLE>_SPEAKER` vars (`NARRATOR`, `PAWN`, `KNIGHT`, `BISHOP`, `ROOK`, `QUEEN`, `KING`) or a shared `PIPER_VOICE_PIECE_DEFAULT_MODEL` with per-piece speaker IDs.
 
 The native iOS UI does not require the server for local board play, but Gemini hints now require the server. Use your Mac's LAN IP instead of `localhost` when running on iPhone.
 

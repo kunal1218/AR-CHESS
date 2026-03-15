@@ -1,7 +1,10 @@
 import sys
 import uuid
+import wave
+from array import array
 from datetime import datetime, timezone
 from pathlib import Path
+import logging
 
 import httpx
 import pytest
@@ -32,6 +35,7 @@ from main import (  # noqa: E402
     sanitize_passive_narrator_line_text,
     sanitize_piece_voice_line_text,
 )
+from services.passive_narrator_live import PassiveLocalPiperConfig, _load_wav_as_pcm  # noqa: E402
 
 
 def test_fastapi_app_bootstraps() -> None:
@@ -402,6 +406,50 @@ def test_gemini_live_socket_passes_narrator_query_param(monkeypatch) -> None:
     assert payload == {"type": "status", "state": "ready"}
     assert observed["narrator"] == "fletcher"
     assert observed["closed"] is True
+
+
+def test_passive_local_piper_config_maps_piece_types(monkeypatch) -> None:
+    monkeypatch.setenv("PASSIVE_LIVE_TTS_BACKEND", "piper")
+    monkeypatch.setenv("PIPER_BINARY_PATH", "/usr/local/bin/piper")
+    monkeypatch.setenv("PIPER_VOICE_NARRATOR_MODEL", "/voices/narrator.onnx")
+    monkeypatch.setenv("PIPER_VOICE_PIECE_DEFAULT_MODEL", "/voices/pieces.onnx")
+    monkeypatch.setenv("PIPER_VOICE_PAWN_SPEAKER", "1")
+    monkeypatch.setenv("PIPER_VOICE_KNIGHT_SPEAKER", "2")
+    monkeypatch.setenv("PIPER_VOICE_BISHOP_SPEAKER", "3")
+    monkeypatch.setenv("PIPER_VOICE_ROOK_MODEL", "/voices/rook.onnx")
+    monkeypatch.setenv("PIPER_VOICE_QUEEN_SPEAKER", "5")
+    monkeypatch.setenv("PIPER_VOICE_KING_SPEAKER", "6")
+
+    config = PassiveLocalPiperConfig.from_env(logging.getLogger("test.passive_piper"))
+
+    assert config is not None
+    assert config.binary_path == "/usr/local/bin/piper"
+    assert config.narrator_voice.model == "/voices/narrator.onnx"
+    assert config.resolve_voice("piece", "Pawn").model == "/voices/pieces.onnx"
+    assert config.resolve_voice("piece", "Pawn").speaker_id == 1
+    assert config.resolve_voice("piece", "Knight").speaker_id == 2
+    assert config.resolve_voice("piece", "Bishop").speaker_id == 3
+    assert config.resolve_voice("piece", "Rook").model == "/voices/rook.onnx"
+    assert config.resolve_voice("piece", "Queen").speaker_id == 5
+    assert config.resolve_voice("piece", "King").speaker_id == 6
+    assert config.resolve_voice("piece", "Unknown").model == "/voices/pieces.onnx"
+
+
+def test_load_wav_as_pcm_downmixes_stereo(tmp_path: Path) -> None:
+    wav_path = tmp_path / "stereo.wav"
+    stereo_samples = array("h", [1000, -1000, 3000, -3000])
+    with wave.open(str(wav_path), "wb") as wav_file:
+        wav_file.setnchannels(2)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(22_050)
+        wav_file.writeframes(stereo_samples.tobytes())
+
+    sample_rate, pcm_bytes = _load_wav_as_pcm(wav_path)
+    mono_samples = array("h")
+    mono_samples.frombytes(pcm_bytes)
+
+    assert sample_rate == 22_050
+    assert list(mono_samples) == [0, 0]
 
 
 def test_create_gemini_hint_returns_sanitized_hint(monkeypatch) -> None:
