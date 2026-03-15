@@ -16227,8 +16227,10 @@ private struct NativeARView: UIViewRepresentable {
     private var brilliantMarkerPieceName: String?
     private var brilliantMarkerDisplayLink: CADisplayLink?
     private var brilliantMarkerHideWorkItem: DispatchWorkItem?
-    private weak var knightCameraSplatView: UIView?
+    private var knightCameraSplatAnchor: AnchorEntity?
+    private weak var knightCameraSplatEntity: Entity?
     private var knightCameraSplatHideWorkItem: DispatchWorkItem?
+    private var knightCameraSplatStartTime: CFTimeInterval?
     private var liveEngineTask: Task<Void, Never>?
     private var reviewEngineTask: Task<Void, Never>?
     private var hasTriggeredPostGameFlow = false
@@ -16281,7 +16283,7 @@ private struct NativeARView: UIViewRepresentable {
       brilliantMarkerDisplayLink?.invalidate()
       brilliantMarkerHideWorkItem?.cancel()
       knightCameraSplatHideWorkItem?.cancel()
-      knightCameraSplatView?.removeFromSuperview()
+      knightCameraSplatAnchor?.removeFromParent()
       threatOverlayDisplayLink?.invalidate()
       threatOverlayHideWorkItem?.cancel()
       AmbientMusicController.shared.stop()
@@ -16491,6 +16493,7 @@ private struct NativeARView: UIViewRepresentable {
     nonisolated func session(_ session: ARSession, didUpdate frame: ARFrame) {
       Task { @MainActor [weak self] in
         self?.updateTrackingReadiness(frame)
+        self?.updateKnightCameraSplatIfNeeded(frame)
       }
     }
 
@@ -18471,135 +18474,20 @@ private struct NativeARView: UIViewRepresentable {
       }
 
       clearKnightCameraSplatOverlay(animated: false)
-
-      let overlay = UIView(frame: arView.bounds)
-      overlay.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-      overlay.backgroundColor = .clear
-      overlay.isUserInteractionEnabled = false
-      overlay.alpha = 0
-
-      let overlaySize = min(arView.bounds.width, arView.bounds.height) * 0.74
-      let splat = UIView(frame: CGRect(origin: .zero, size: CGSize(width: overlaySize, height: overlaySize)))
-      splat.center = CGPoint(x: overlay.bounds.midX, y: overlay.bounds.midY + 18)
-      overlay.addSubview(splat)
-
-      let splatColor = UIColor(red: 0.15, green: 0.07, blue: 0.05, alpha: 0.86)
-      let rimColor = piece.color == .white
-        ? UIColor(red: 0.98, green: 0.95, blue: 0.88, alpha: 0.88)
-        : UIColor(red: 0.18, green: 0.20, blue: 0.24, alpha: 0.92)
-
-      let centralBlot = UIView(frame: splat.bounds.insetBy(dx: overlaySize * 0.18, dy: overlaySize * 0.18))
-      centralBlot.backgroundColor = splatColor
-      centralBlot.layer.cornerRadius = centralBlot.bounds.width * 0.32
-      centralBlot.transform = CGAffineTransform(rotationAngle: viewerColor == .black ? -0.26 : 0.26)
-      splat.addSubview(centralBlot)
-
-      let rim = UIView(frame: centralBlot.frame.insetBy(dx: -10, dy: -10))
-      rim.backgroundColor = .clear
-      rim.layer.borderWidth = 5
-      rim.layer.borderColor = rimColor.cgColor
-      rim.layer.cornerRadius = centralBlot.layer.cornerRadius + 10
-      rim.alpha = 0.88
-      rim.transform = CGAffineTransform(rotationAngle: viewerColor == .black ? 0.18 : -0.18)
-      splat.addSubview(rim)
-
-      let dropletFrames: [CGRect] = [
-        CGRect(x: overlaySize * 0.14, y: overlaySize * 0.14, width: overlaySize * 0.16, height: overlaySize * 0.12),
-        CGRect(x: overlaySize * 0.72, y: overlaySize * 0.20, width: overlaySize * 0.14, height: overlaySize * 0.10),
-        CGRect(x: overlaySize * 0.22, y: overlaySize * 0.74, width: overlaySize * 0.12, height: overlaySize * 0.09),
-        CGRect(x: overlaySize * 0.70, y: overlaySize * 0.72, width: overlaySize * 0.18, height: overlaySize * 0.13),
-      ]
-      let dropletAngles: [CGFloat] = [-0.44, 0.36, 0.22, -0.28]
-      for (frame, angle) in zip(dropletFrames, dropletAngles) {
-        let droplet = UIView(frame: frame)
-        droplet.backgroundColor = splatColor.withAlphaComponent(0.94)
-        droplet.layer.cornerRadius = min(frame.width, frame.height) * 0.46
-        droplet.transform = CGAffineTransform(rotationAngle: angle)
-        splat.addSubview(droplet)
-      }
-
-      let glare = UIView(frame: CGRect(
-        x: overlaySize * 0.28,
-        y: overlaySize * 0.24,
-        width: overlaySize * 0.28,
-        height: overlaySize * 0.12
-      ))
-      glare.backgroundColor = UIColor.white.withAlphaComponent(0.14)
-      glare.layer.cornerRadius = glare.bounds.height * 0.48
-      glare.transform = CGAffineTransform(rotationAngle: -0.54)
-      splat.addSubview(glare)
-
-      let shadowSymbol = UILabel(frame: splat.bounds)
-      shadowSymbol.text = chessGlyph(for: piece)
-      shadowSymbol.textAlignment = .center
-      shadowSymbol.textColor = UIColor.black.withAlphaComponent(0.24)
-      shadowSymbol.font = UIFont.systemFont(ofSize: overlaySize * 0.55)
-      shadowSymbol.center = CGPoint(x: splat.bounds.midX + 9, y: splat.bounds.midY + 14)
-      splat.addSubview(shadowSymbol)
-
-      let symbol = UILabel(frame: splat.bounds)
-      symbol.text = chessGlyph(for: piece)
-      symbol.textAlignment = .center
-      symbol.textColor = piece.color == .white
-        ? UIColor(red: 0.98, green: 0.97, blue: 0.95, alpha: 1)
-        : UIColor(red: 0.18, green: 0.20, blue: 0.24, alpha: 1)
-      symbol.font = UIFont.systemFont(ofSize: overlaySize * 0.55)
-      symbol.layer.shadowColor = UIColor.black.cgColor
-      symbol.layer.shadowOpacity = 0.22
-      symbol.layer.shadowRadius = 12
-      symbol.layer.shadowOffset = CGSize(width: 0, height: 8)
-      splat.addSubview(symbol)
-
-      let caption = UILabel(frame: CGRect(
-        x: 0,
-        y: overlaySize * 0.80,
-        width: overlaySize,
-        height: overlaySize * 0.16
-      ))
-      caption.text = "\(piece.color.displayName) \(piece.kind.displayName)"
-      caption.textAlignment = .center
-      caption.textColor = UIColor.white.withAlphaComponent(0.94)
-      caption.font = UIFont.systemFont(ofSize: overlaySize * 0.09, weight: .black)
-      caption.layer.shadowColor = UIColor.black.cgColor
-      caption.layer.shadowOpacity = 0.28
-      caption.layer.shadowRadius = 10
-      caption.layer.shadowOffset = CGSize(width: 0, height: 5)
-      splat.addSubview(caption)
-
-      let incomingAngle: CGFloat = viewerColor == .black ? -0.78 : 0.78
-      splat.transform = CGAffineTransform(translationX: 0, y: -120)
-        .rotated(by: incomingAngle)
-        .scaledBy(x: 0.16, y: 0.16)
-
-      arView.addSubview(overlay)
-      arView.bringSubviewToFront(overlay)
-      knightCameraSplatView = overlay
-
+      let cameraMatrix = arView.session.currentFrame?.camera.transform ?? arView.cameraTransform.matrix
+      let anchor = AnchorEntity(world: cameraMatrix)
+      let splatPiece = piecePrototype(for: piece.kind, color: piece.color).clone(recursive: true)
+      splatPiece.name = "knight_camera_splat_piece"
+      anchor.addChild(splatPiece)
+      arView.scene.addAnchor(anchor)
+      knightCameraSplatAnchor = anchor
+      knightCameraSplatEntity = splatPiece
+      knightCameraSplatStartTime = CACurrentMediaTime()
       UIImpactFeedbackGenerator(style: .heavy).impactOccurred()
+      updateKnightCameraSplatTransform(viewerColor: viewerColor, elapsed: 0)
 
-      UIView.animate(
-        withDuration: 0.26,
-        delay: 0,
-        usingSpringWithDamping: 0.64,
-        initialSpringVelocity: 0.18
-      ) {
-        overlay.alpha = 1
-        splat.transform = CGAffineTransform(rotationAngle: viewerColor == .black ? -0.06 : 0.06)
-          .scaledBy(x: 1.08, y: 0.94)
-      }
-
-      UIView.animate(withDuration: 0.12, delay: 0.26, options: [.curveEaseOut]) {
-        splat.transform = .identity
-      }
-
-      let hideWorkItem = DispatchWorkItem { [weak self, weak overlay] in
-        self?.knightCameraSplatHideWorkItem = nil
-        UIView.animate(withDuration: 0.22, delay: 0, options: [.curveEaseIn]) {
-          overlay?.alpha = 0
-          splat.transform = CGAffineTransform(scaleX: 0.92, y: 0.92)
-        } completion: { _ in
-          overlay?.removeFromSuperview()
-        }
+      let hideWorkItem = DispatchWorkItem { [weak self] in
+        self?.clearKnightCameraSplatOverlay(animated: false)
       }
       knightCameraSplatHideWorkItem = hideWorkItem
       DispatchQueue.main.asyncAfter(deadline: .now() + 2.6, execute: hideWorkItem)
@@ -18609,49 +18497,82 @@ private struct NativeARView: UIViewRepresentable {
     private func clearKnightCameraSplatOverlay(animated: Bool) {
       knightCameraSplatHideWorkItem?.cancel()
       knightCameraSplatHideWorkItem = nil
+      knightCameraSplatStartTime = nil
 
-      guard let knightCameraSplatView else {
+      guard let knightCameraSplatAnchor else {
         return
       }
 
-      if animated {
-        UIView.animate(withDuration: 0.14, animations: {
-          knightCameraSplatView.alpha = 0
-        }, completion: { _ in
-          knightCameraSplatView.removeFromSuperview()
-        })
+      if animated, let splatPiece = knightCameraSplatEntity {
+        var transform = splatPiece.transform
+        transform.scale *= 0.90
+        splatPiece.move(to: transform, relativeTo: splatPiece.parent, duration: 0.12, timingFunction: .easeIn)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.14) { [weak anchor] in
+          anchor?.removeFromParent()
+        }
       } else {
-        knightCameraSplatView.removeFromSuperview()
+        knightCameraSplatAnchor?.removeFromParent()
       }
+
+      knightCameraSplatAnchor = nil
+      knightCameraSplatEntity = nil
     }
 
-    private func chessGlyph(for piece: ChessPieceState) -> String {
-      switch (piece.color, piece.kind) {
-      case (.white, .pawn):
-        return "♙"
-      case (.white, .rook):
-        return "♖"
-      case (.white, .knight):
-        return "♘"
-      case (.white, .bishop):
-        return "♗"
-      case (.white, .queen):
-        return "♕"
-      case (.white, .king):
-        return "♔"
-      case (.black, .pawn):
-        return "♟"
-      case (.black, .rook):
-        return "♜"
-      case (.black, .knight):
-        return "♞"
-      case (.black, .bishop):
-        return "♝"
-      case (.black, .queen):
-        return "♛"
-      case (.black, .king):
-        return "♚"
+    @MainActor
+    private func updateKnightCameraSplatIfNeeded(_ frame: ARFrame) {
+      guard let anchor = knightCameraSplatAnchor,
+            let startedAt = knightCameraSplatStartTime else {
+        return
       }
+
+      anchor.setTransformMatrix(frame.camera.transform, relativeTo: nil)
+
+      let elapsed = CACurrentMediaTime() - startedAt
+      let viewerColor = boardViewerColor
+      updateKnightCameraSplatTransform(viewerColor: viewerColor, elapsed: elapsed)
+    }
+
+    @MainActor
+    private func updateKnightCameraSplatTransform(viewerColor: ChessColor, elapsed: CFTimeInterval) {
+      guard let splatPiece = knightCameraSplatEntity else {
+        return
+      }
+
+      let settleDuration: Float = 0.24
+      let progress = min(max(Float(elapsed) / settleDuration, 0), 1)
+      let eased = 1 - pow(1 - progress, 3)
+      let wobbleTime = max(0, Float(elapsed) - settleDuration)
+      let wobble = sin(wobbleTime * 11) * 0.028 * exp(-wobbleTime * 4.6)
+
+      let startPosition = SIMD3<Float>(0, 0.07, -0.48)
+      let endPosition = SIMD3<Float>(0, 0.008, -0.145)
+      let position = interpolatedVector(startPosition, endPosition, progress: eased) + SIMD3<Float>(0, wobble * 0.12, 0)
+
+      let finalRotation = simd_normalize(
+        simd_quatf(angle: .pi, axis: SIMD3<Float>(0, 1, 0)) *
+          simd_quatf(angle: viewerColor == .black ? -0.08 : 0.08, axis: SIMD3<Float>(0, 0, 1))
+      )
+      let startRotation = simd_normalize(
+        simd_quatf(angle: viewerColor == .black ? -0.82 : 0.82, axis: SIMD3<Float>(0, 1, 0)) *
+          simd_quatf(angle: -.pi / 8, axis: SIMD3<Float>(1, 0, 0)) *
+          finalRotation
+      )
+      let rotation = simd_slerp(startRotation, finalRotation, eased)
+
+      let startScale = SIMD3<Float>(repeating: 0.86)
+      let endScale = SIMD3<Float>(2.95, 2.95, 0.36)
+      var scale = interpolatedVector(startScale, endScale, progress: eased)
+      scale.z = max(0.28, scale.z + abs(wobble) * 0.22)
+
+      splatPiece.transform = Transform(scale: scale, rotation: rotation, translation: position)
+    }
+
+    private func interpolatedVector(
+      _ from: SIMD3<Float>,
+      _ to: SIMD3<Float>,
+      progress: Float
+    ) -> SIMD3<Float> {
+      from + ((to - from) * progress)
     }
 
     private func attackDirection(for move: ChessMove) -> SIMD3<Float> {
