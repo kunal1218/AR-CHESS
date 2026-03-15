@@ -12278,8 +12278,20 @@ private struct ModeSelectionView: View {
     }
     .sheet(isPresented: $isPiperAuditionPresented) {
       PiperVoiceAuditionView()
+        .piperVoiceLabSheetPresentation()
+    }
+  }
+}
+
+private extension View {
+  @ViewBuilder
+  func piperVoiceLabSheetPresentation() -> some View {
+    if #available(iOS 16.0, *) {
+      self
         .presentationDetents([.large])
         .presentationDragIndicator(.visible)
+    } else {
+      self
     }
   }
 }
