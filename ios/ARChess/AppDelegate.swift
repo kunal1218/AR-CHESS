@@ -20394,7 +20394,10 @@ private struct NativeARView: UIViewRepresentable {
       let forward = normalized3(-simd_make_float3(cameraMatrix.columns.2), fallback: SIMD3<Float>(0, 0, -1))
       let right = normalized3(simd_make_float3(cameraMatrix.columns.0), fallback: SIMD3<Float>(1, 0, 0))
       let up = normalized3(simd_make_float3(cameraMatrix.columns.1), fallback: SIMD3<Float>(0, 1, 0))
-      let startPosition = cameraPosition + (forward * 0.34) + (right * 0.12) - (up * 0.10)
+      let forwardOffset: SIMD3<Float> = forward * 0.34
+      let lateralOffset: SIMD3<Float> = right * 0.12
+      let verticalOffset: SIMD3<Float> = up * -0.10
+      let startPosition: SIMD3<Float> = cameraPosition + forwardOffset + lateralOffset + verticalOffset
 
       let anchor = AnchorEntity(world: worldMatrix(translation: startPosition))
       let bobber = makeFishingBobberEntity()
