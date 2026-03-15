@@ -13633,7 +13633,7 @@ private final class FishingInteractionStore: ObservableObject {
 
   @Published private(set) var state: State = .idle
   @Published private(set) var isPondInFocus = false
-  @Published private(set) var statusText = "Look left toward the pond."
+  @Published private(set) var statusText = "Look toward the pond beside the board."
   @Published private(set) var rewardMoves: [String] = []
 
   private var castHandler: (() -> Void)?
@@ -13686,7 +13686,7 @@ private final class FishingInteractionStore: ObservableObject {
       }
     case .eligible:
       if !isFocused {
-        transition(to: .idle, status: "Look left toward the pond.")
+        transition(to: .idle, status: "Look toward the pond beside the board.")
       }
     case .casting, .waiting, .bite, .catchWindow, .caught, .revealNote, .reset:
       break
@@ -13731,7 +13731,7 @@ private final class FishingInteractionStore: ObservableObject {
     rewardMoves = []
     transition(
       to: isPondInFocus ? .eligible : .idle,
-      status: isPondInFocus ? "Cast toward the pond." : "Look left toward the pond."
+      status: isPondInFocus ? "Cast toward the pond." : "Look toward the pond beside the board."
     )
   }
 
@@ -16655,7 +16655,7 @@ private struct NativeARView: UIViewRepresentable {
 
     private static let boardTemplateSize: Float = 0.40
     private static let boardSquareSize: Float = boardTemplateSize / 8.0
-    private static let fishingPondOffset = SIMD3<Float>(-1.52, -0.068, 0.70)
+    private static let fishingPondVerticalOffset: Float = -0.068
     private static let fishingLookAlignmentThreshold: Float = 0.945
     private static let fishingPondFocusDistance: Float = 4.0
     private static let fishingBiteDelayRangeSeconds: ClosedRange<Double> = 5.0...10.0
@@ -17309,6 +17309,7 @@ private struct NativeARView: UIViewRepresentable {
 
     private func applyBoardScale() {
       boardRoot.scale = SIMD3<Float>(repeating: boardScale)
+      updateFishingPondPlacement()
     }
 
     private func desiredBoardViewerColor() -> ChessColor {
@@ -19847,7 +19848,7 @@ private struct NativeARView: UIViewRepresentable {
       backdrop.addChild(meadowAccent)
 
       let pond = makeFishingPondEntity()
-      pond.position = Self.fishingPondOffset
+      pond.position = fishingPondOffset()
       backdrop.addChild(pond)
 
       for index in 0..<12 {
@@ -20058,6 +20059,17 @@ private struct NativeARView: UIViewRepresentable {
     private func ringPosition(radius: Float, degrees: Float, height: Float) -> SIMD3<Float> {
       let radians = degrees * Float.pi / 180.0
       return SIMD3<Float>(sin(radians) * radius, height, cos(radians) * radius)
+    }
+
+    private func fishingPondOffset() -> SIMD3<Float> {
+      let halfBoardWidth = (boardSize * boardScale) * 0.5
+      let lateralDistance = max(halfBoardWidth + 0.46, 0.72)
+      return SIMD3<Float>(-lateralDistance, Self.fishingPondVerticalOffset, 0.02)
+    }
+
+    @MainActor
+    private func updateFishingPondPlacement() {
+      fishingPondEntity?.position = fishingPondOffset()
     }
 
     private static func scenicMaterial(_ color: UIColor, roughness: Float) -> SimpleMaterial {
@@ -20304,7 +20316,19 @@ private struct NativeARView: UIViewRepresentable {
 
     @MainActor
     private func updateFishingRodCameraFollow(_ frame: ARFrame) {
+      if fishing.state == .eligible && fishing.isPondInFocus {
+        ensureFishingHeldRodPreview(cameraMatrix: frame.camera.transform)
+      } else if fishing.state == .idle {
+        clearFishingHeldRodPreview()
+      }
+
       fishingRodAnchor?.setTransformMatrix(frame.camera.transform, relativeTo: nil)
+
+      if fishing.state == .eligible,
+         fishing.isPondInFocus,
+         let rod = fishingRodEntity {
+        rod.transform = fishingHeldTransform()
+      }
     }
 
     @MainActor
@@ -20335,9 +20359,37 @@ private struct NativeARView: UIViewRepresentable {
       fishingRodEntity = rod
     }
 
+    @MainActor
+    private func ensureFishingHeldRodPreview(cameraMatrix: simd_float4x4) {
+      guard fishingRodAnchor == nil || fishingRodEntity == nil else {
+        return
+      }
+
+      createFishingRodAnchor(cameraMatrix: cameraMatrix)
+    }
+
+    @MainActor
+    private func clearFishingHeldRodPreview() {
+      guard fishing.state == .idle || fishing.state == .eligible else {
+        return
+      }
+
+      fishingRodAnchor?.removeFromParent()
+      fishingRodAnchor = nil
+      fishingRodEntity = nil
+    }
+
     private func makeFishingRodEntity() -> Entity {
       let rod = Entity()
       rod.name = "fishing_rod"
+
+      let line = ModelEntity(
+        mesh: .generateBox(size: SIMD3<Float>(0.003, 0.52, 0.003)),
+        materials: [SimpleMaterial(color: UIColor(red: 0.92, green: 0.96, blue: 1.0, alpha: 0.92), roughness: 0.04, isMetallic: false)]
+      )
+      line.position = SIMD3<Float>(-0.018, 0.23, 0.006)
+      line.orientation = simd_quatf(angle: -.pi / 22, axis: SIMD3<Float>(0, 0, 1))
+      rod.addChild(line)
 
       let handle = ModelEntity(
         mesh: .generateBox(size: SIMD3<Float>(0.020, 0.24, 0.020)),
@@ -20370,7 +20422,52 @@ private struct NativeARView: UIViewRepresentable {
       tip.position = SIMD3<Float>(-0.02, 0.50, 0)
       rod.addChild(tip)
 
+      let rearHand = makeFishingHandEntity(
+        sleeveColor: UIColor(red: 0.13, green: 0.16, blue: 0.20, alpha: 1),
+        skinColor: UIColor(red: 0.88, green: 0.74, blue: 0.62, alpha: 1)
+      )
+      rearHand.position = SIMD3<Float>(0.07, -0.12, 0.04)
+      rearHand.orientation = simd_quatf(angle: -.pi / 16, axis: SIMD3<Float>(0, 1, 0))
+      rod.addChild(rearHand)
+
+      let frontHand = makeFishingHandEntity(
+        sleeveColor: UIColor(red: 0.18, green: 0.22, blue: 0.28, alpha: 1),
+        skinColor: UIColor(red: 0.88, green: 0.74, blue: 0.62, alpha: 1)
+      )
+      frontHand.position = SIMD3<Float>(-0.03, 0.01, -0.02)
+      frontHand.orientation = simd_quatf(angle: .pi / 8, axis: SIMD3<Float>(0, 1, 0))
+      frontHand.scale = SIMD3<Float>(0.92, 0.92, 0.92)
+      rod.addChild(frontHand)
+
       return rod
+    }
+
+    private func makeFishingHandEntity(sleeveColor: UIColor, skinColor: UIColor) -> Entity {
+      let hand = Entity()
+
+      let forearm = ModelEntity(
+        mesh: .generateBox(size: SIMD3<Float>(0.10, 0.08, 0.12)),
+        materials: [Self.scenicMaterial(sleeveColor, roughness: 0.96)]
+      )
+      forearm.position = SIMD3<Float>(0.05, -0.02, 0.08)
+      hand.addChild(forearm)
+
+      let palm = ModelEntity(
+        mesh: .generateBox(size: SIMD3<Float>(0.062, 0.042, 0.068)),
+        materials: [Self.scenicMaterial(skinColor, roughness: 0.92)]
+      )
+      palm.position = SIMD3<Float>(0.0, 0.0, 0.0)
+      hand.addChild(palm)
+
+      let thumb = ModelEntity(
+        mesh: .generateBox(size: SIMD3<Float>(0.024, 0.026, 0.034)),
+        materials: [Self.scenicMaterial(skinColor, roughness: 0.92)]
+      )
+      thumb.position = SIMD3<Float>(0.025, -0.010, 0.034)
+      thumb.orientation = simd_quatf(angle: -.pi / 6, axis: SIMD3<Float>(0, 1, 0))
+      hand.addChild(thumb)
+
+      return hand
     }
 
     @MainActor
