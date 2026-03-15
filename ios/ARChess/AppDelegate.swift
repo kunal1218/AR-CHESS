@@ -16132,6 +16132,7 @@ private struct NativeARView: UIViewRepresentable {
     private static let boardSquareMesh = MeshResource.generateBox(
       size: SIMD3<Float>(boardSquareSize, 0.004, boardSquareSize)
     )
+    private static let voidBackgroundColor = UIColor.black
     private static let darkSquareMaterial = SimpleMaterial(
       color: UIColor(red: 0.22, green: 0.18, blue: 0.15, alpha: 1),
       roughness: 0.35,
@@ -16279,7 +16280,7 @@ private struct NativeARView: UIViewRepresentable {
         self?.applyDirectVoiceCommand(transcript)
       }
       arView.automaticallyConfigureSession = false
-      arView.environment.background = .cameraFeed()
+      applySceneBackground(for: arView)
       arView.renderOptions.insert(.disableMotionBlur)
       arView.renderOptions.insert(.disableAREnvironmentLighting)
       arView.renderOptions.insert(.disableGroundingShadows)
@@ -18853,6 +18854,7 @@ private struct NativeARView: UIViewRepresentable {
         arView.scene.addAnchor(boardAnchor)
         self.boardAnchor = boardAnchor
         boardWorldTransform = transform
+        applySceneBackground(for: arView)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
           AmbientMusicController.shared.playLoopIfNeeded()
         }
@@ -18920,6 +18922,14 @@ private struct NativeARView: UIViewRepresentable {
       initialAnalysisTask = nil
       commentary.prepareEngineIfNeeded()
       noteWarmupStatus("Board ready. Local Stockfish is standing by.")
+    }
+
+    private func applySceneBackground(for arView: ARView) {
+      if boardAnchor == nil {
+        arView.environment.background = .cameraFeed()
+      } else {
+        arView.environment.background = .color(Self.voidBackgroundColor)
+      }
     }
 
     private func noteWarmupStatus(_ message: String) {
