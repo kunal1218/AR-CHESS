@@ -1,15 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
 import logging
 import os
-import tempfile
-import wave
-from array import array
-from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 import websockets
@@ -25,185 +19,6 @@ Do not add, remove, paraphrase, explain, preface, summarize, or continue past th
 Adjust delivery to the supplied speaker role metadata when present.
 Return audio and matching transcription only.
 """.strip()
-
-PIPER_PIECE_VOICE_KEYS = ("pawn", "knight", "bishop", "rook", "queen", "king")
-
-
-@dataclass(frozen=True)
-class PiperVoiceSpec:
-    model: str
-    speaker_id: int | None = None
-
-
-@dataclass(frozen=True)
-class PassiveLocalPiperConfig:
-    binary_path: str
-    narrator_voice: PiperVoiceSpec
-    piece_default_voice: PiperVoiceSpec
-    piece_voices: dict[str, PiperVoiceSpec]
-
-    @classmethod
-    def from_env(cls, logger: logging.Logger) -> PassiveLocalPiperConfig | None:
-        backend = (os.getenv("PASSIVE_LIVE_TTS_BACKEND") or "gemini").strip().lower()
-        if backend != "piper":
-            return None
-
-        binary_path = (os.getenv("PIPER_BINARY_PATH") or "piper").strip() or "piper"
-        piece_default_voice = _piper_voice_spec_from_env("PIECE_DEFAULT")
-        narrator_voice = _piper_voice_spec_from_env(
-            "NARRATOR",
-            fallback_model=piece_default_voice.model if piece_default_voice else None,
-            fallback_speaker_id=piece_default_voice.speaker_id if piece_default_voice else None,
-        )
-
-        if narrator_voice is None and piece_default_voice is None:
-            logger.warning(
-                "PASSIVE_LIVE_TTS_BACKEND=piper, but no Piper narrator or piece default voice is configured. "
-                "Falling back to Gemini passive live."
-            )
-            return None
-
-        narrator_voice = narrator_voice or piece_default_voice
-        assert narrator_voice is not None
-        piece_default_voice = piece_default_voice or narrator_voice
-
-        piece_voices: dict[str, PiperVoiceSpec] = {}
-        for key in PIPER_PIECE_VOICE_KEYS:
-            piece_voices[key] = _piper_voice_spec_from_env(
-                key.upper(),
-                fallback_model=piece_default_voice.model,
-                fallback_speaker_id=piece_default_voice.speaker_id,
-            ) or piece_default_voice
-
-        return cls(
-            binary_path=binary_path,
-            narrator_voice=narrator_voice,
-            piece_default_voice=piece_default_voice,
-            piece_voices=piece_voices,
-        )
-
-    def resolve_voice(self, speaker_role: str, speaker_name: str | None) -> PiperVoiceSpec:
-        if speaker_role == "narrator":
-            return self.narrator_voice
-        voice_key = _normalize_piece_voice_key(speaker_name)
-        return self.piece_voices.get(voice_key or "", self.piece_default_voice)
-
-
-class PassiveLocalPiperSynthesizer:
-    _chunk_size_bytes = 8192
-
-    def __init__(self, config: PassiveLocalPiperConfig, logger: logging.Logger | None = None) -> None:
-        self._config = config
-        self._logger = logger or logging.getLogger("archess.passive_piper")
-
-    async def synthesize(self, text: str, *, speaker_role: str, speaker_name: str | None) -> tuple[int, bytes]:
-        voice = self._config.resolve_voice(speaker_role, speaker_name)
-        with tempfile.TemporaryDirectory(prefix="archess_piper_") as temp_dir:
-            output_path = Path(temp_dir) / "line.wav"
-            args = [
-                self._config.binary_path,
-                "--model",
-                voice.model,
-                "--output_file",
-                str(output_path),
-            ]
-            if voice.speaker_id is not None:
-                args.extend(["--speaker", str(voice.speaker_id)])
-
-            process = await asyncio.create_subprocess_exec(
-                *args,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            _, stderr = await process.communicate((text.strip() + "\n").encode("utf-8"))
-            if process.returncode != 0:
-                error_text = stderr.decode("utf-8", errors="ignore").strip() or "Piper synthesis failed."
-                raise RuntimeError(error_text)
-
-            return _load_wav_as_pcm(output_path)
-
-    async def stream_to_frontend(
-        self,
-        *,
-        frontend_send: Any,
-        text: str,
-        speaker_role: str,
-        speaker_name: str | None,
-    ) -> None:
-        sample_rate, pcm_bytes = await self.synthesize(
-            text,
-            speaker_role=speaker_role,
-            speaker_name=speaker_name,
-        )
-        await frontend_send({"type": "output_transcription", "text": text})
-        mime_type = f"audio/pcm;rate={sample_rate}"
-        for chunk in _iter_pcm_chunks(pcm_bytes, chunk_size_bytes=self._chunk_size_bytes):
-            await frontend_send(
-                {
-                    "type": "audio_chunk",
-                    "data": base64.b64encode(chunk).decode("ascii"),
-                    "mime_type": mime_type,
-                }
-            )
-
-
-def _piper_voice_spec_from_env(
-    slot: str,
-    *,
-    fallback_model: str | None = None,
-    fallback_speaker_id: int | None = None,
-) -> PiperVoiceSpec | None:
-    model = (os.getenv(f"PIPER_VOICE_{slot}_MODEL") or fallback_model or "").strip()
-    if not model:
-        return None
-
-    speaker_raw = (os.getenv(f"PIPER_VOICE_{slot}_SPEAKER") or "").strip()
-    if not speaker_raw:
-        return PiperVoiceSpec(model=model, speaker_id=fallback_speaker_id)
-
-    try:
-        speaker_id = int(speaker_raw)
-    except ValueError:
-        speaker_id = fallback_speaker_id
-    return PiperVoiceSpec(model=model, speaker_id=speaker_id)
-
-
-def _normalize_piece_voice_key(speaker_name: str | None) -> str | None:
-    normalized = " ".join((speaker_name or "").split()).strip().lower()
-    if normalized in PIPER_PIECE_VOICE_KEYS:
-        return normalized
-    return None
-
-
-def _load_wav_as_pcm(path: Path) -> tuple[int, bytes]:
-    with wave.open(str(path), "rb") as wav_file:
-        sample_rate = wav_file.getframerate()
-        sample_width = wav_file.getsampwidth()
-        channels = wav_file.getnchannels()
-        pcm_bytes = wav_file.readframes(wav_file.getnframes())
-
-    if sample_width != 2:
-        raise RuntimeError(f"Unsupported Piper sample width {sample_width * 8}-bit; expected 16-bit PCM.")
-
-    if channels <= 1:
-        return sample_rate, pcm_bytes
-
-    samples = array("h")
-    samples.frombytes(pcm_bytes)
-    mono_samples = array("h")
-    for index in range(0, len(samples), channels):
-        frame = samples[index : index + channels]
-        mono_samples.append(int(sum(frame) / len(frame)))
-    return sample_rate, mono_samples.tobytes()
-
-
-def _iter_pcm_chunks(pcm_bytes: bytes, *, chunk_size_bytes: int) -> list[bytes]:
-    return [
-        pcm_bytes[offset : offset + chunk_size_bytes]
-        for offset in range(0, len(pcm_bytes), max(chunk_size_bytes, 1))
-        if pcm_bytes[offset : offset + chunk_size_bytes]
-    ]
 
 
 class PassiveNarratorLiveSession:
@@ -231,26 +46,11 @@ class PassiveNarratorLiveSession:
         self._gemini_reader_task: asyncio.Task[None] | None = None
         self._reconnect_task: asyncio.Task[None] | None = None
         self._gemini_ready = asyncio.Event()
-        self._local_piper = PassiveLocalPiperConfig.from_env(self._logger)
-        self._local_piper_synthesizer = (
-            PassiveLocalPiperSynthesizer(self._local_piper, logger=self._logger)
-            if self._local_piper is not None
-            else None
-        )
 
     async def run(self) -> None:
         await self._frontend_socket.accept()
-        if self._local_piper_synthesizer is not None:
-            await self._send_frontend(
-                {
-                    "type": "status",
-                    "state": "ready",
-                    "message": "Local Piper passive voices ready.",
-                }
-            )
-        else:
-            await self._send_frontend({"type": "status", "state": "connecting"})
-            await self._connect_gemini()
+        await self._send_frontend({"type": "status", "state": "connecting"})
+        await self._connect_gemini()
 
         try:
             while True:
@@ -298,18 +98,7 @@ class PassiveNarratorLiveSession:
             self._response_in_flight = True
             await self._send_frontend({"type": "streaming", "active": True})
             try:
-                if self._local_piper_synthesizer is not None:
-                    await self._local_piper_synthesizer.stream_to_frontend(
-                        frontend_send=self._send_frontend,
-                        text=line,
-                        speaker_role=speaker_role,
-                        speaker_name=speaker_name,
-                    )
-                    self._response_in_flight = False
-                    await self._send_frontend({"type": "turn_complete", "turn_complete": True})
-                    await self._send_frontend({"type": "streaming", "active": False})
-                else:
-                    await self._send_user_turn(line, speaker_role=speaker_role, speaker_name=speaker_name)
+                await self._send_user_turn(line, speaker_role=speaker_role, speaker_name=speaker_name)
             except Exception as exc:
                 self._response_in_flight = False
                 await self._send_frontend({"type": "streaming", "active": False})
@@ -317,11 +106,7 @@ class PassiveNarratorLiveSession:
                     {
                         "type": "status",
                         "state": "error",
-                        "message": (
-                            f"Local passive voice synthesis failed: {exc}"
-                            if self._local_piper_synthesizer is not None
-                            else f"Gemini passive automatic voice send failed: {exc}"
-                        ),
+                        "message": f"Gemini passive automatic voice send failed: {exc}",
                     }
                 )
             return
