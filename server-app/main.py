@@ -9,6 +9,7 @@ from collections import Counter, deque
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from threading import Lock, Thread
 from typing import Any
 from urllib.parse import urlparse
@@ -43,10 +44,27 @@ from services.socratic_coach import SocraticCoachSession
 from services.stockfish_engine import StockfishEngine
 
 
-load_dotenv()
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("archess.server")
+
+SERVER_APP_ROOT = Path(__file__).resolve().parent
+REPO_ROOT = SERVER_APP_ROOT.parent
+
+
+def load_archess_env() -> Path | None:
+    for candidate in (SERVER_APP_ROOT / ".env", REPO_ROOT / ".env"):
+        if candidate.is_file():
+            load_dotenv(candidate, override=False)
+            return candidate
+    load_dotenv()
+    return None
+
+
+LOADED_ENV_PATH = load_archess_env()
+if LOADED_ENV_PATH is not None:
+    logger.info("Loaded backend environment from %s", LOADED_ENV_PATH)
+else:
+    logger.info("No .env file found via explicit backend search; using process environment only.")
 
 DEFAULT_POSTGRES_PORT = 5432
 TICKET_TTL_SECONDS = int(os.getenv("MATCH_TICKET_TTL_SECONDS", "30"))

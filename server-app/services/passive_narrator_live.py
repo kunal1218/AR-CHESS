@@ -7,7 +7,7 @@ import os
 from typing import Any
 
 import websockets
-from fastapi import WebSocket
+from fastapi import WebSocket, WebSocketDisconnect
 
 from services.gemini_live import GeminiLiveClient
 
@@ -41,6 +41,7 @@ class PassiveNarratorLiveSession:
         self._gemini_send_lock = asyncio.Lock()
         self._closing = False
         self._response_in_flight = False
+        self._last_error_message: str | None = None
 
         self._gemini_ws: Any | None = None
         self._gemini_reader_task: asyncio.Task[None] | None = None
@@ -151,11 +152,12 @@ class PassiveNarratorLiveSession:
 
     async def _connect_gemini(self) -> None:
         if not self._api_key:
+            self._last_error_message = "GEMINI_API_KEY is not configured on the backend."
             await self._send_frontend(
                 {
                     "type": "status",
                     "state": "error",
-                    "message": "GEMINI_API_KEY is not configured on the backend.",
+                    "message": self._last_error_message,
                 }
             )
             return
@@ -176,14 +178,16 @@ class PassiveNarratorLiveSession:
                 ping_timeout=20,
                 max_size=8 * 1024 * 1024,
             )
+            self._last_error_message = None
             await self._send_gemini_json(self._build_setup_payload())
             self._gemini_reader_task = asyncio.create_task(self._gemini_read_loop())
         except Exception as exc:
+            self._last_error_message = f"Gemini passive narrator connect failed: {exc}"
             await self._send_frontend(
                 {
                     "type": "status",
                     "state": "error",
-                    "message": f"Gemini passive narrator connect failed: {exc}",
+                    "message": self._last_error_message,
                 }
             )
             self._schedule_reconnect()
@@ -220,13 +224,16 @@ class PassiveNarratorLiveSession:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            self._last_error_message = f"Gemini passive narrator connection failed: {exc}"
+            self._response_in_flight = False
             await self._send_frontend(
                 {
                     "type": "status",
-                    "state": "connecting",
-                    "message": f"Gemini passive narrator reconnecting: {exc}",
+                    "state": "error",
+                    "message": self._last_error_message,
                 }
             )
+            await self._send_frontend({"type": "streaming", "active": False})
         finally:
             self._gemini_ready.clear()
             if not self._closing:
@@ -235,11 +242,13 @@ class PassiveNarratorLiveSession:
     async def _handle_gemini_message(self, payload: dict[str, Any]) -> None:
         if "error" in payload:
             details = payload.get("error") or {}
+            self._last_error_message = details.get("message") if isinstance(details, dict) else str(details)
+            self._gemini_ready.clear()
             await self._send_frontend(
                 {
                     "type": "status",
                     "state": "error",
-                    "message": details.get("message") if isinstance(details, dict) else str(details),
+                    "message": self._last_error_message,
                 }
             )
             self._response_in_flight = False
@@ -247,6 +256,7 @@ class PassiveNarratorLiveSession:
             return
 
         if "setupComplete" in payload or "setup_complete" in payload:
+            self._last_error_message = None
             self._gemini_ready.set()
             await self._send_frontend({"type": "status", "state": "ready"})
             return
@@ -305,9 +315,22 @@ class PassiveNarratorLiveSession:
             await self._send_frontend({"type": "streaming", "active": False})
 
     async def _wait_until_gemini_ready(self) -> None:
+        if self._gemini_ready.is_set():
+            return
+        if self._last_error_message:
+            raise RuntimeError(self._last_error_message)
         if self._gemini_ws is None:
             await self._connect_gemini()
-        await asyncio.wait_for(self._gemini_ready.wait(), timeout=8.0)
+        if self._gemini_ready.is_set():
+            return
+        if self._last_error_message:
+            raise RuntimeError(self._last_error_message)
+        try:
+            await asyncio.wait_for(self._gemini_ready.wait(), timeout=8.0)
+        except TimeoutError as exc:
+            if self._last_error_message:
+                raise RuntimeError(self._last_error_message) from exc
+            raise RuntimeError("Gemini passive narrator was not ready in time.") from exc
 
     def _schedule_reconnect(self) -> None:
         if self._closing:
@@ -342,8 +365,13 @@ class PassiveNarratorLiveSession:
         )
 
     async def _send_frontend(self, payload: dict[str, Any]) -> None:
+        if self._closing:
+            return
         async with self._frontend_send_lock:
-            await self._frontend_socket.send_text(json.dumps(payload))
+            try:
+                await self._frontend_socket.send_text(json.dumps(payload))
+            except (RuntimeError, WebSocketDisconnect):
+                self._closing = True
 
     async def _send_gemini_json(self, payload: dict[str, Any]) -> None:
         if self._gemini_ws is None:
