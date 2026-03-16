@@ -1,5 +1,6 @@
 import AVFoundation
 import ARKit
+import Combine
 import CoreText
 import CoreMotion
 import CryptoKit
@@ -14630,6 +14631,7 @@ private final class CosmeticsCreatorRoomStore: ObservableObject {
   @Published var previewYaw: Float
   @Published var previewPitch: Float
   @Published var previewCameraDistance: Float
+  @Published private(set) var previewSpinRevision: Int
   @Published private var previewOnlyRoleCosmeticIDsByPieceKind: [ChessPieceKind: String] = [:]
   @Published private(set) var statusText: String?
 
@@ -14637,10 +14639,7 @@ private final class CosmeticsCreatorRoomStore: ObservableObject {
   private let defaultYaw: Float = -.pi / 6
   private let defaultPitch: Float = -.pi / 18
   private let defaultCameraDistance: Float = 0.25
-  private var dragStartYaw: Float = 0
-  private var dragStartPitch: Float = 0
   private var zoomStartDistance: Float = 0.25
-  private var isDragging = false
   private var isZooming = false
   private var statusTask: Task<Void, Never>?
 
@@ -14655,6 +14654,7 @@ private final class CosmeticsCreatorRoomStore: ObservableObject {
     previewYaw = defaultYaw
     previewPitch = defaultPitch
     previewCameraDistance = defaultCameraDistance
+    previewSpinRevision = 0
   }
 
   deinit {
@@ -14756,30 +14756,6 @@ private final class CosmeticsCreatorRoomStore: ObservableObject {
     objectWillChange.send()
   }
 
-  func beginRotationGestureIfNeeded() {
-    guard !isDragging else {
-      return
-    }
-
-    isDragging = true
-    dragStartYaw = previewYaw
-    dragStartPitch = previewPitch
-  }
-
-  func updateRotation(translation: CGSize) {
-    beginRotationGestureIfNeeded()
-    previewYaw = dragStartYaw + Float(translation.width) * 0.0105
-    previewPitch = clamp(
-      dragStartPitch - (Float(translation.height) * 0.0065),
-      min: -.pi / 5.2,
-      max: .pi / 8.8
-    )
-  }
-
-  func endRotationGesture() {
-    isDragging = false
-  }
-
   func beginZoomGestureIfNeeded() {
     guard !isZooming else {
       return
@@ -14806,6 +14782,7 @@ private final class CosmeticsCreatorRoomStore: ObservableObject {
     previewYaw = defaultYaw
     previewPitch = defaultPitch
     previewCameraDistance = defaultCameraDistance
+    previewSpinRevision += 1
   }
 
   private func ensureSelectedCategoryIsValid() {
@@ -15697,6 +15674,7 @@ private struct CosmeticsPiecePreviewView: UIViewRepresentable {
   let yaw: Float
   let pitch: Float
   let cameraDistance: Float
+  let spinRevision: Int
 
   func makeCoordinator() -> Coordinator {
     Coordinator()
@@ -15717,7 +15695,8 @@ private struct CosmeticsPiecePreviewView: UIViewRepresentable {
       loadout: loadout,
       yaw: yaw,
       pitch: pitch,
-      cameraDistance: cameraDistance
+      cameraDistance: cameraDistance,
+      spinRevision: spinRevision
     )
   }
 
@@ -15726,8 +15705,18 @@ private struct CosmeticsPiecePreviewView: UIViewRepresentable {
     private let pedestalRoot = Entity()
     private let rotationRoot = Entity()
     private let camera = PerspectiveCamera()
+    private var sceneUpdateSubscription: (any Cancellable)?
     private var currentSignature = ""
     private weak var previewPiece: Entity?
+    private var baseYaw: Float = 0
+    private var basePitch: Float = 0
+    private var idleYawOffset: Float = 0
+    private var lastSpinRevision = 0
+    private let idleSpinSpeed: Float = .pi / 10
+
+    deinit {
+      sceneUpdateSubscription?.cancel()
+    }
 
     func configure(_ arView: ARView) {
       arView.scene.anchors.append(anchor)
@@ -15761,6 +15750,10 @@ private struct CosmeticsPiecePreviewView: UIViewRepresentable {
         relativeTo: nil
       )
       anchor.addChild(camera)
+
+      sceneUpdateSubscription = arView.scene.subscribe(to: SceneEvents.Update.self) { [weak self] event in
+        self?.advanceIdleRotation(deltaTime: Float(event.deltaTime))
+      }
     }
 
     func update(
@@ -15769,7 +15762,8 @@ private struct CosmeticsPiecePreviewView: UIViewRepresentable {
       loadout: PieceCosmeticLoadout,
       yaw: Float,
       pitch: Float,
-      cameraDistance: Float
+      cameraDistance: Float,
+      spinRevision: Int
     ) {
       let signature = "\(pieceKind.storageKey)|\(color.storageKey)|\(loadout.signature)"
       if signature != currentSignature {
@@ -15785,9 +15779,13 @@ private struct CosmeticsPiecePreviewView: UIViewRepresentable {
         currentSignature = signature
       }
 
-      let yawRotation = simd_quatf(angle: yaw, axis: SIMD3<Float>(0, 1, 0))
-      let pitchRotation = simd_quatf(angle: pitch, axis: SIMD3<Float>(1, 0, 0))
-      rotationRoot.orientation = simd_normalize(yawRotation * pitchRotation)
+      if spinRevision != lastSpinRevision {
+        idleYawOffset = 0
+        lastSpinRevision = spinRevision
+      }
+      baseYaw = yaw
+      basePitch = pitch
+      applyIdleRotation()
 
       let cameraPosition = SIMD3<Float>(0, 0.085, cameraDistance)
       camera.look(
@@ -15796,6 +15794,22 @@ private struct CosmeticsPiecePreviewView: UIViewRepresentable {
         upVector: SIMD3<Float>(0, 1, 0),
         relativeTo: nil
       )
+    }
+
+    private func advanceIdleRotation(deltaTime: Float) {
+      guard deltaTime.isFinite, deltaTime > 0 else {
+        return
+      }
+
+      idleYawOffset.formTruncatingRemainder(dividingBy: .pi * 2)
+      idleYawOffset += deltaTime * idleSpinSpeed
+      applyIdleRotation()
+    }
+
+    private func applyIdleRotation() {
+      let yawRotation = simd_quatf(angle: baseYaw + idleYawOffset, axis: SIMD3<Float>(0, 1, 0))
+      let pitchRotation = simd_quatf(angle: basePitch, axis: SIMD3<Float>(1, 0, 0))
+      rotationRoot.orientation = simd_normalize(yawRotation * pitchRotation)
     }
 
     private func makePedestalEntity() -> Entity {
@@ -15998,19 +16012,11 @@ private struct CosmeticsCreatorView: View {
             loadout: roomStore.currentPreviewLoadout,
             yaw: roomStore.previewYaw,
             pitch: roomStore.previewPitch,
-            cameraDistance: roomStore.previewCameraDistance
+            cameraDistance: roomStore.previewCameraDistance,
+            spinRevision: roomStore.previewSpinRevision
           )
           .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
           .contentShape(Rectangle())
-          .gesture(
-            DragGesture(minimumDistance: 0)
-              .onChanged { value in
-                roomStore.updateRotation(translation: value.translation)
-              }
-              .onEnded { _ in
-                roomStore.endRotationGesture()
-              }
-          )
           .simultaneousGesture(
             MagnificationGesture()
               .onChanged { value in
@@ -16025,7 +16031,7 @@ private struct CosmeticsCreatorView: View {
             Spacer()
 
             HStack(alignment: .bottom) {
-              Text("Drag to rotate 360")
+              Text("Auto-rotating preview")
                 .font(.system(size: 12, weight: .bold, design: .rounded))
                 .foregroundStyle(Color.white.opacity(0.72))
                 .padding(.horizontal, 14)
@@ -26452,8 +26458,10 @@ private struct NativeARView: UIViewRepresentable {
     }
 
     private func fishingPondCastTargetWorldPosition() -> SIMD3<Float>? {
-      let pondTargetEntity = fishingPondWaterEntity ?? fishingPondEntity
-      return pondTargetEntity?.position(relativeTo: nil)
+      guard let pondCenter = fishingPondWorldCenter() else {
+        return nil
+      }
+      return clampedFishingPondSurfacePoint(pondCenter) ?? pondCenter
     }
 
     private func worldTransform(
@@ -26769,31 +26777,60 @@ private struct NativeARView: UIViewRepresentable {
       pondTarget: SIMD3<Float>
     ) -> SIMD3<Float> {
       guard let tip = fishingRodTipEntity else {
-        return pondTarget + SIMD3<Float>(0, 0.012, 0)
+        return clampedFishingPondSurfacePoint(pondTarget) ?? pondTarget
       }
 
       let tipForward = normalized3(
         -simd_make_float3(tip.transformMatrix(relativeTo: nil).columns.2),
         fallback: normalized3(pondTarget - rodTipWorldPosition, fallback: SIMD3<Float>(0, -1, 0))
       )
-      let waterY = pondTarget.y + 0.012
+      let waterY = pondTarget.y
       let denominator = tipForward.y
       guard abs(denominator) > 0.0001 else {
-        return pondTarget + SIMD3<Float>(0, 0.012, 0)
+        return clampedFishingPondSurfacePoint(pondTarget) ?? pondTarget
       }
 
       let travel = (waterY - rodTipWorldPosition.y) / denominator
       guard travel > 0 else {
-        return pondTarget + SIMD3<Float>(0, 0.012, 0)
+        return clampedFishingPondSurfacePoint(pondTarget) ?? pondTarget
       }
 
       let intersection = rodTipWorldPosition + (tipForward * travel)
-      let pondOffset = SIMD2<Float>(intersection.x - pondTarget.x, intersection.z - pondTarget.z)
-      guard simd_length(pondOffset) <= 0.72 else {
-        return pondTarget + SIMD3<Float>(0, 0.012, 0)
+      let worldIntersection = SIMD3<Float>(intersection.x, waterY, intersection.z)
+      return clampedFishingPondSurfacePoint(worldIntersection) ?? pondTarget
+    }
+
+    private func fishingPondWorldCenter() -> SIMD3<Float>? {
+      let pondTargetEntity = fishingPondWaterEntity ?? fishingPondEntity
+      guard let pondTargetEntity else {
+        return nil
       }
 
-      return SIMD3<Float>(intersection.x, waterY, intersection.z)
+      let worldPosition = pondTargetEntity.position(relativeTo: nil)
+      if pondTargetEntity === fishingPondWaterEntity {
+        return worldPosition + SIMD3<Float>(0, 0.012, 0)
+      }
+      return worldPosition
+    }
+
+    private func clampedFishingPondSurfacePoint(_ worldPoint: SIMD3<Float>) -> SIMD3<Float>? {
+      guard let water = fishingPondWaterEntity else {
+        return nil
+      }
+
+      let bounds = water.visualBounds(relativeTo: nil)
+      let center = SIMD3<Float>(bounds.center.x, bounds.center.y + 0.012, bounds.center.z)
+      let safeHalfWidth = max(bounds.extents.x * 0.36, 0.22)
+      let safeHalfDepth = max(bounds.extents.z * 0.36, 0.22)
+      let offset = SIMD2<Float>(worldPoint.x - center.x, worldPoint.z - center.z)
+      let normalizedOffset = SIMD2<Float>(offset.x / safeHalfWidth, offset.y / safeHalfDepth)
+      let normalizedLength = max(simd_length(normalizedOffset), 1.0)
+      let clampedNormalizedOffset = normalizedOffset / normalizedLength
+      return SIMD3<Float>(
+        center.x + (clampedNormalizedOffset.x * safeHalfWidth),
+        center.y,
+        center.z + (clampedNormalizedOffset.y * safeHalfDepth)
+      )
     }
 
     private func debugPrintFishingRigState(context: String) {
