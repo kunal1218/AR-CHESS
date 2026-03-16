@@ -7394,6 +7394,8 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     fen: ChessGameState.initial().fenString,
     pieceType: .pawn,
     pieceColor: .white,
+    behaviorRole: .worker,
+    behaviorRoleReason: "pulling weight in the battle",
     recentLines: [],
     dialogueMode: .independent,
     pieceDialogueHistory: [],
@@ -18100,62 +18102,100 @@ private struct NativeARExperienceView: View {
 
   private var reviewCheckpointOverlay: some View {
     VStack {
+      HStack(spacing: 10) {
+        Spacer()
+        audioSettingsButton
+        reviewCheckpointControlButton(
+          title: "Try again",
+          systemImage: "arrow.clockwise",
+          foregroundColor: .white,
+          backgroundColor: Color.white.opacity(0.08)
+        ) {
+          gameReview.restartCurrentCheckpoint()
+        }
+        reviewCheckpointControlButton(
+          title: "I give up",
+          systemImage: "flag.fill",
+          foregroundColor: .white,
+          backgroundColor: Color(red: 0.20, green: 0.12, blue: 0.08).opacity(0.92)
+        ) {
+          if gameReview.advanceToNextCheckpoint() {
+            returnHome()
+          }
+        }
+      }
+      .padding(.horizontal, 18)
+      .padding(.top, 24)
+
+      Spacer()
+
       if let checkpoint = gameReview.currentCheckpoint {
-        HStack(alignment: .top, spacing: 16) {
-          VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 10) {
+          HStack(alignment: .firstTextBaseline, spacing: 12) {
             Text("Game Review")
               .font(.system(size: 12, weight: .bold, design: .rounded))
               .tracking(2.0)
               .foregroundStyle(Color(red: 0.88, green: 0.82, blue: 0.70))
 
             Text("Checkpoint \(gameReview.currentReviewIndex + 1) of \(gameReview.reviewCheckpoints.count)")
-              .font(.system(size: 24, weight: .heavy, design: .rounded))
+              .font(.system(size: 21, weight: .heavy, design: .rounded))
               .foregroundStyle(.white)
+              .lineLimit(1)
+              .minimumScaleFactor(0.82)
 
-            Text("Replay \(commentaryHumanMove(checkpoint.blunderMove)) from ply \(checkpoint.moveIndex).")
-              .font(.system(size: 14, weight: .semibold, design: .rounded))
-              .foregroundStyle(Color.white.opacity(0.88))
-              .lineSpacing(2)
+            Spacer(minLength: 8)
 
             Text("Eval drop: \(formattedReviewDelta(checkpoint.deltaW))")
               .font(.system(size: 12, weight: .bold, design: .rounded))
               .foregroundStyle(Color(red: 0.95, green: 0.88, blue: 0.73))
+              .lineLimit(1)
           }
-          .padding(18)
-          .background(
-            RoundedRectangle(cornerRadius: 24, style: .continuous)
-              .fill(Color(red: 0.07, green: 0.10, blue: 0.14).opacity(0.88))
-              .overlay(
-                RoundedRectangle(cornerRadius: 24, style: .continuous)
-                  .stroke(Color.white.opacity(0.12), lineWidth: 1)
-              )
-          )
 
-          Spacer(minLength: 0)
-
-          VStack(spacing: 10) {
-            audioSettingsButton
-              .frame(width: 170)
-
-            NativeActionButton(title: "Try again", style: .outline) {
-              gameReview.restartCurrentCheckpoint()
-            }
-            .frame(width: 170)
-
-            NativeActionButton(title: "I give up", style: .solid) {
-              if gameReview.advanceToNextCheckpoint() {
-                returnHome()
-              }
-            }
-            .frame(width: 170)
-          }
+          Text("Replay \(commentaryHumanMove(checkpoint.blunderMove)) from ply \(checkpoint.moveIndex).")
+            .font(.system(size: 15, weight: .semibold, design: .rounded))
+            .foregroundStyle(Color.white.opacity(0.90))
+            .lineLimit(2)
+            .minimumScaleFactor(0.92)
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 18)
-        .padding(.top, 24)
+        .padding(.vertical, 14)
+        .background(
+          RoundedRectangle(cornerRadius: 24, style: .continuous)
+            .fill(Color(red: 0.07, green: 0.10, blue: 0.14).opacity(0.88))
+            .overlay(
+              RoundedRectangle(cornerRadius: 24, style: .continuous)
+                .stroke(Color.white.opacity(0.12), lineWidth: 1)
+            )
+        )
+        .padding(.horizontal, 18)
+        .padding(.bottom, 18)
       }
-
-      Spacer()
     }
+  }
+
+  private func reviewCheckpointControlButton(
+    title: String,
+    systemImage: String,
+    foregroundColor: Color = .white,
+    backgroundColor: Color = Color.black.opacity(0.54),
+    action: @escaping () -> Void
+  ) -> some View {
+    Button(action: action) {
+      Image(systemName: systemImage)
+        .font(.system(size: 16, weight: .black))
+        .foregroundStyle(foregroundColor)
+        .frame(width: 42, height: 42)
+        .background(
+          Circle()
+            .fill(backgroundColor)
+            .overlay(
+              Circle()
+                .stroke(Color.white.opacity(0.16), lineWidth: 1)
+            )
+        )
+    }
+    .accessibilityLabel(title)
   }
 
   private var lessonOverlay: some View {
