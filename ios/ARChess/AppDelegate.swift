@@ -13638,9 +13638,19 @@ private final class FishingInteractionStore: ObservableObject {
 
   private var castHandler: (() -> Void)?
   private var dismissNoteHandler: (() -> Void)?
+  private var armedRewardMoves: [String] = []
 
   var showsFishingButton: Bool {
     isPondInFocus && state == .eligible
+  }
+
+  var showsFirstPersonRig: Bool {
+    switch state {
+    case .idle, .revealNote, .reset:
+      return false
+    case .eligible, .casting, .waiting, .bite, .catchWindow, .caught:
+      return isPondInFocus || state != .eligible
+    }
   }
 
   var showsFishingStatus: Bool {
@@ -13654,6 +13664,10 @@ private final class FishingInteractionStore: ObservableObject {
 
   var showsRewardNote: Bool {
     state == .revealNote
+  }
+
+  var canRevealRewardFromFish: Bool {
+    state == .caught && !armedRewardMoves.isEmpty
   }
 
   var canAcceptCatchFlick: Bool {
@@ -13718,8 +13732,22 @@ private final class FishingInteractionStore: ObservableObject {
     transition(to: .caught, status: "Reeling in the catch...")
   }
 
+  func armRewardFromCaughtFish(lines: [String]) {
+    armedRewardMoves = lines
+    transition(to: .caught, status: "Tap the fish to read the note.")
+  }
+
   func revealRewardNote(lines: [String]) {
     rewardMoves = lines
+    transition(to: .revealNote, status: "Stockfish sent a note back with the fish.")
+  }
+
+  func revealArmedRewardNote() {
+    guard !armedRewardMoves.isEmpty else {
+      return
+    }
+
+    rewardMoves = armedRewardMoves
     transition(to: .revealNote, status: "Stockfish sent a note back with the fish.")
   }
 
@@ -13729,6 +13757,7 @@ private final class FishingInteractionStore: ObservableObject {
 
   func finishReset() {
     rewardMoves = []
+    armedRewardMoves = []
     transition(
       to: isPondInFocus ? .eligible : .idle,
       status: isPondInFocus ? "Cast toward the pond." : "Look toward the pond beside the board."
@@ -13746,6 +13775,54 @@ private final class FishingInteractionStore: ObservableObject {
 
     state = nextState
     statusText = status
+  }
+}
+
+@MainActor
+private final class PieceRoleStore: ObservableObject {
+  @Published private(set) var snapshot = PieceRoleSnapshot.empty(currentPlayer: .white)
+
+  private var highlightEmployeeHandler: (() -> Void)?
+
+  var employeeOfTheMonth: PieceRoleAssignment? {
+    snapshot.employeeOfTheMonth
+  }
+
+  var employeePosterTitle: String? {
+    guard let employee = employeeOfTheMonth else {
+      return nil
+    }
+
+    return "Wanted: \(employee.piece.kind.displayName) \(employee.square.algebraic.uppercased())"
+  }
+
+  var employeePosterSubtitle: String? {
+    guard let employee = employeeOfTheMonth else {
+      return nil
+    }
+
+    return "Threatens \(employee.influenceCount) home-half squares"
+  }
+
+  func update(snapshot: PieceRoleSnapshot) {
+    self.snapshot = snapshot
+  }
+
+  func reset() {
+    snapshot = PieceRoleSnapshot.empty(currentPlayer: .white)
+    highlightEmployeeHandler = nil
+  }
+
+  func bindEmployeeHighlightHandler(_ handler: @escaping () -> Void) {
+    highlightEmployeeHandler = handler
+  }
+
+  func unbindEmployeeHighlightHandler() {
+    highlightEmployeeHandler = nil
+  }
+
+  func requestEmployeeHighlight() {
+    highlightEmployeeHandler?()
   }
 }
 
@@ -13828,6 +13905,7 @@ private struct NativeARExperienceView: View {
   @StateObject private var lessonStore = OpeningLessonStore()
   @StateObject private var socraticCoach: SocraticCoachStore
   @StateObject private var fishing = FishingInteractionStore()
+  @StateObject private var pieceRoles = PieceRoleStore()
   @State private var isModePanelVisible = false
   @State private var isMatchLogVisible = false
   @State private var isGeminiDebugVisible = false
@@ -13865,6 +13943,7 @@ private struct NativeARExperienceView: View {
         lessonStore: lessonStore,
         socraticCoach: socraticCoach,
         fishing: fishing,
+        pieceRoles: pieceRoles,
         onReviewFinished: returnHome
       )
         .ignoresSafeArea()
@@ -14222,6 +14301,20 @@ private struct NativeARExperienceView: View {
           .padding(.horizontal, 18)
           .padding(.top, 24)
 
+          if let employeePosterTitle = pieceRoles.employeePosterTitle,
+             let employeePosterSubtitle = pieceRoles.employeePosterSubtitle {
+            HStack {
+              wantedPosterButton(
+                title: employeePosterTitle,
+                subtitle: employeePosterSubtitle
+              )
+
+              Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 18)
+            .padding(.top, 12)
+          }
+
           Spacer()
         }
       }
@@ -14323,6 +14416,7 @@ private struct NativeARExperienceView: View {
       socraticCoach.unbindThreatZoneHandler()
       socraticCoach.unbindMoveHandler()
       socraticCoach.unbindDirectVoiceCommandHandler()
+      pieceRoles.reset()
       socraticCoach.disconnect()
       switch mode {
       case .lesson:
@@ -14359,6 +14453,48 @@ private struct NativeARExperienceView: View {
         )
     }
     .accessibilityLabel(title)
+  }
+
+  private func wantedPosterButton(title: String, subtitle: String) -> some View {
+    Button {
+      pieceRoles.requestEmployeeHighlight()
+    } label: {
+      VStack(alignment: .leading, spacing: 6) {
+        HStack(spacing: 8) {
+          Image(systemName: "star.circle.fill")
+            .font(.system(size: 16, weight: .black))
+            .foregroundStyle(Color(red: 0.33, green: 0.12, blue: 0.07))
+
+          Text("WANTED")
+            .font(.system(size: 11, weight: .black, design: .rounded))
+            .tracking(2.1)
+            .foregroundStyle(Color(red: 0.33, green: 0.12, blue: 0.07))
+        }
+
+        Text(title)
+          .font(.system(size: 15, weight: .heavy, design: .rounded))
+          .foregroundStyle(Color(red: 0.20, green: 0.08, blue: 0.04))
+          .multilineTextAlignment(.leading)
+          .lineLimit(2)
+
+        Text(subtitle)
+          .font(.system(size: 12, weight: .bold, design: .rounded))
+          .foregroundStyle(Color(red: 0.29, green: 0.16, blue: 0.10).opacity(0.86))
+          .lineLimit(2)
+      }
+      .frame(maxWidth: 220, alignment: .leading)
+      .padding(.horizontal, 14)
+      .padding(.vertical, 12)
+      .background(
+        RoundedRectangle(cornerRadius: 22, style: .continuous)
+          .fill(Color(red: 0.92, green: 0.79, blue: 0.58).opacity(0.96))
+          .overlay(
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+              .stroke(Color(red: 0.44, green: 0.23, blue: 0.12).opacity(0.38), lineWidth: 1)
+          )
+      )
+    }
+    .accessibilityLabel("Wanted poster for \(title)")
   }
 
   private var musicToggleButton: some View {
@@ -15307,6 +15443,234 @@ private struct FishingStatusChip: View {
   }
 }
 
+private struct FishingFirstPersonOverlay: View {
+  let state: FishingInteractionStore.State
+
+  var body: some View {
+    if showsRig {
+      TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: false)) { context in
+        GeometryReader { geometry in
+          let metrics = overlayMetrics(
+            size: geometry.size,
+            timestamp: context.date.timeIntervalSinceReferenceDate
+          )
+
+          ZStack {
+            fishingLine(metrics: metrics)
+            fishingRod(metrics: metrics)
+            frontHand(metrics: metrics)
+            rearHand(metrics: metrics)
+          }
+          .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+        }
+      }
+      .ignoresSafeArea()
+      .transition(.opacity)
+    }
+  }
+
+  private var showsRig: Bool {
+    switch state {
+    case .eligible, .casting, .waiting, .bite, .catchWindow, .caught:
+      return true
+    case .idle, .revealNote, .reset:
+      return false
+    }
+  }
+
+  private func overlayMetrics(size: CGSize, timestamp: TimeInterval) -> FishingRigMetrics {
+    let idleBob = CGFloat(sin(timestamp * 2.1) * 6.0)
+    let biteJerk = CGFloat(sin(timestamp * 34.0) * 10.0)
+
+    let baseX = size.width * 0.72
+    let baseY = size.height * 0.93
+    let rigWidth = min(size.width * 0.54, 360)
+    let rigHeight = min(size.height * 0.30, 250)
+
+    switch state {
+    case .eligible:
+      return FishingRigMetrics(
+        center: CGPoint(x: baseX, y: baseY + idleBob),
+        rigSize: CGSize(width: rigWidth, height: rigHeight),
+        rodAngle: -23,
+        handAngle: -2,
+        lineLength: size.height * 0.12,
+        rodScale: 0.96
+      )
+    case .casting:
+      return FishingRigMetrics(
+        center: CGPoint(x: baseX + 10, y: baseY - 22),
+        rigSize: CGSize(width: rigWidth * 1.02, height: rigHeight * 1.02),
+        rodAngle: -30,
+        handAngle: -8,
+        lineLength: size.height * 0.16,
+        rodScale: 1.02
+      )
+    case .waiting:
+      return FishingRigMetrics(
+        center: CGPoint(x: baseX + 6, y: baseY - 10 + idleBob),
+        rigSize: CGSize(width: rigWidth, height: rigHeight),
+        rodAngle: -26,
+        handAngle: -4,
+        lineLength: size.height * 0.18,
+        rodScale: 1.0
+      )
+    case .bite, .catchWindow:
+      return FishingRigMetrics(
+        center: CGPoint(x: baseX + 2 + biteJerk, y: baseY - 22 - abs(biteJerk)),
+        rigSize: CGSize(width: rigWidth * 1.03, height: rigHeight * 1.03),
+        rodAngle: -18,
+        handAngle: -2,
+        lineLength: size.height * 0.20,
+        rodScale: 1.03
+      )
+    case .caught:
+      return FishingRigMetrics(
+        center: CGPoint(x: baseX - 6, y: baseY - 56),
+        rigSize: CGSize(width: rigWidth * 1.02, height: rigHeight * 1.02),
+        rodAngle: -8,
+        handAngle: 6,
+        lineLength: size.height * 0.10,
+        rodScale: 1.04
+      )
+    case .idle, .revealNote, .reset:
+      return FishingRigMetrics(
+        center: CGPoint(x: baseX, y: baseY),
+        rigSize: CGSize(width: rigWidth, height: rigHeight),
+        rodAngle: -30,
+        handAngle: 0,
+        lineLength: size.height * 0.12,
+        rodScale: 1.0
+      )
+    }
+  }
+
+  private func fishingLine(metrics: FishingRigMetrics) -> some View {
+    Capsule(style: .continuous)
+      .fill(Color.white.opacity(0.76))
+      .frame(width: 2.5, height: metrics.lineLength)
+      .position(
+        x: metrics.center.x + (metrics.rigSize.width * 0.08),
+        y: metrics.center.y - (metrics.rigSize.height * 0.47)
+      )
+      .rotationEffect(.degrees(metrics.rodAngle * 0.20))
+      .blur(radius: 0.15)
+  }
+
+  private func fishingRod(metrics: FishingRigMetrics) -> some View {
+    ZStack {
+      RoundedRectangle(cornerRadius: 14, style: .continuous)
+        .fill(
+          LinearGradient(
+            colors: [
+              Color(red: 0.63, green: 0.47, blue: 0.23),
+              Color(red: 0.36, green: 0.24, blue: 0.12),
+            ],
+            startPoint: .top,
+            endPoint: .bottom
+          )
+        )
+        .frame(width: 18, height: metrics.rigSize.height * 0.78)
+        .overlay(
+          RoundedRectangle(cornerRadius: 14, style: .continuous)
+            .stroke(Color.white.opacity(0.12), lineWidth: 1)
+        )
+        .shadow(color: Color.black.opacity(0.26), radius: 18, y: 10)
+
+      Circle()
+        .fill(
+          RadialGradient(
+            colors: [
+              Color(red: 0.98, green: 0.84, blue: 0.37),
+              Color(red: 0.55, green: 0.40, blue: 0.05),
+            ],
+            center: .center,
+            startRadius: 2,
+            endRadius: 24
+          )
+        )
+        .frame(width: 48, height: 48)
+        .offset(x: 26, y: 56)
+
+      RoundedRectangle(cornerRadius: 8, style: .continuous)
+        .fill(Color(red: 0.89, green: 0.79, blue: 0.57))
+        .frame(width: 11, height: metrics.rigSize.height * 0.16)
+        .offset(x: 0, y: -(metrics.rigSize.height * 0.35))
+    }
+    .scaleEffect(metrics.rodScale)
+    .rotationEffect(.degrees(metrics.rodAngle))
+    .position(x: metrics.center.x, y: metrics.center.y)
+  }
+
+  private func frontHand(metrics: FishingRigMetrics) -> some View {
+    FishingOverlayHand(
+      sleeveColor: Color(red: 0.10, green: 0.13, blue: 0.18),
+      skinColor: Color(red: 0.88, green: 0.73, blue: 0.61)
+    )
+    .frame(width: metrics.rigSize.width * 0.42, height: metrics.rigSize.height * 0.34)
+    .rotationEffect(.degrees(metrics.handAngle))
+    .position(
+      x: metrics.center.x - (metrics.rigSize.width * 0.16),
+      y: metrics.center.y + (metrics.rigSize.height * 0.18)
+    )
+  }
+
+  private func rearHand(metrics: FishingRigMetrics) -> some View {
+    FishingOverlayHand(
+      sleeveColor: Color(red: 0.15, green: 0.19, blue: 0.24),
+      skinColor: Color(red: 0.90, green: 0.76, blue: 0.64)
+    )
+    .frame(width: metrics.rigSize.width * 0.50, height: metrics.rigSize.height * 0.40)
+    .rotationEffect(.degrees(metrics.handAngle + 8))
+    .position(
+      x: metrics.center.x + (metrics.rigSize.width * 0.08),
+      y: metrics.center.y + (metrics.rigSize.height * 0.24)
+    )
+  }
+}
+
+private struct FishingRigMetrics {
+  let center: CGPoint
+  let rigSize: CGSize
+  let rodAngle: Double
+  let handAngle: Double
+  let lineLength: CGFloat
+  let rodScale: CGFloat
+}
+
+private struct FishingOverlayHand: View {
+  let sleeveColor: Color
+  let skinColor: Color
+
+  var body: some View {
+    ZStack(alignment: .trailing) {
+      RoundedRectangle(cornerRadius: 26, style: .continuous)
+        .fill(sleeveColor)
+        .frame(width: 150, height: 82)
+        .overlay(
+          RoundedRectangle(cornerRadius: 26, style: .continuous)
+            .stroke(Color.white.opacity(0.06), lineWidth: 1)
+        )
+
+      RoundedRectangle(cornerRadius: 20, style: .continuous)
+        .fill(skinColor)
+        .frame(width: 84, height: 68)
+        .offset(x: 22, y: -2)
+
+      RoundedRectangle(cornerRadius: 12, style: .continuous)
+        .fill(skinColor)
+        .frame(width: 24, height: 44)
+        .offset(x: 48, y: -10)
+
+      RoundedRectangle(cornerRadius: 12, style: .continuous)
+        .fill(skinColor)
+        .frame(width: 24, height: 40)
+        .offset(x: 54, y: 10)
+    }
+    .shadow(color: Color.black.opacity(0.22), radius: 12, y: 8)
+  }
+}
+
 private struct FishingRewardOverlay: View {
   let rewardMoves: [String]
   let onDismiss: () -> Void
@@ -15537,6 +15901,21 @@ private enum ChessPieceKind {
   case bishop
   case queen
   case king
+
+  var strategicRoleTradeValue: Int {
+    switch self {
+    case .pawn:
+      return 1
+    case .knight, .bishop:
+      return 3
+    case .rook:
+      return 5
+    case .queen:
+      return 9
+    case .king:
+      return .max
+    }
+  }
 
   var displayName: String {
     switch self {
@@ -16587,6 +16966,362 @@ private struct ChessGameState {
   }
 }
 
+private enum PieceRoleType: String {
+  case employee
+  case lazy
+  case traitor
+  case worker
+
+  var displayName: String {
+    switch self {
+    case .employee:
+      return "Employee of the Month"
+    case .lazy:
+      return "Lazy"
+    case .traitor:
+      return "Traitor"
+    case .worker:
+      return "Worker"
+    }
+  }
+}
+
+private struct PieceRoleAssignment {
+  let pieceId: String
+  let square: BoardSquare
+  let piece: ChessPieceState
+  let roleType: PieceRoleType
+  let influenceCount: Int
+}
+
+private struct PieceRoleSnapshot {
+  let currentPlayer: ChessColor
+  let assignmentsBySquare: [BoardSquare: PieceRoleAssignment]
+  let employeeOfTheMonthSquare: BoardSquare?
+
+  static func empty(currentPlayer: ChessColor) -> PieceRoleSnapshot {
+    PieceRoleSnapshot(
+      currentPlayer: currentPlayer,
+      assignmentsBySquare: [:],
+      employeeOfTheMonthSquare: nil
+    )
+  }
+
+  var employeeOfTheMonth: PieceRoleAssignment? {
+    guard let employeeOfTheMonthSquare else {
+      return nil
+    }
+
+    return assignmentsBySquare[employeeOfTheMonthSquare]
+  }
+}
+
+private struct PieceRoleEvaluationCache {
+  var influenceSquaresBySquare: [BoardSquare: [BoardSquare]] = [:]
+  var legalMovesBySquare: [BoardSquare: [ChessMove]] = [:]
+  var removedFriendlyPressureBySquare: [BoardSquare: Set<BoardSquare>] = [:]
+}
+
+extension ChessGameState {
+  func evaluatePieceRolesRelativeToCurrentPlayer() -> PieceRoleSnapshot {
+    let currentPlayer = turn
+    let enemyColor = currentPlayer.opponent
+    var assignmentsBySquare: [BoardSquare: PieceRoleAssignment] = [:]
+    var cache = PieceRoleEvaluationCache()
+
+    let baselineFriendlyPressure = pressuredSquaresOnEnemyHalf(
+      for: currentPlayer,
+      excluding: nil,
+      cache: &cache
+    )
+
+    let enemyPieces = orderedPieces(for: enemyColor)
+    let employeeCandidate = enemyPieces
+      .map { square, piece -> (square: BoardSquare, piece: ChessPieceState, count: Int) in
+        let count = roleInfluenceSquares(from: square, cache: &cache)
+          .filter { isOnHomeHalf($0, for: currentPlayer) }
+          .count
+        return (square, piece, count)
+      }
+      .max { lhs, rhs in
+        if lhs.count != rhs.count {
+          return lhs.count < rhs.count
+        }
+
+        let lhsValue = lhs.piece.kind.strategicRoleTradeValue
+        let rhsValue = rhs.piece.kind.strategicRoleTradeValue
+        if lhsValue != rhsValue {
+          return lhsValue < rhsValue
+        }
+
+        if lhs.square.rank != rhs.square.rank {
+          return lhs.square.rank < rhs.square.rank
+        }
+
+        return lhs.square.file < rhs.square.file
+      }
+
+    let employeeSquare = employeeCandidate?.square
+    for (square, piece) in enemyPieces {
+      let influenceCount = roleInfluenceSquares(from: square, cache: &cache)
+        .filter { isOnHomeHalf($0, for: currentPlayer) }
+        .count
+      let roleType: PieceRoleType = square == employeeSquare ? .employee : .worker
+      assignmentsBySquare[square] = PieceRoleAssignment(
+        pieceId: rolePieceIdentifier(for: piece, at: square),
+        square: square,
+        piece: piece,
+        roleType: roleType,
+        influenceCount: influenceCount
+      )
+    }
+
+    for (square, piece) in orderedPieces(for: currentPlayer) {
+      let influenceCount = roleInfluenceSquares(from: square, cache: &cache)
+        .filter { isOnEnemyHalf($0, for: currentPlayer) }
+        .count
+      let roleType: PieceRoleType
+      if isTraitorPiece(
+        at: square,
+        friendlyColor: currentPlayer,
+        baselineFriendlyPressure: baselineFriendlyPressure,
+        cache: &cache
+      ) {
+        roleType = .traitor
+      } else if isLazyPiece(at: square, piece: piece, cache: &cache) {
+        roleType = .lazy
+      } else {
+        roleType = .worker
+      }
+
+      assignmentsBySquare[square] = PieceRoleAssignment(
+        pieceId: rolePieceIdentifier(for: piece, at: square),
+        square: square,
+        piece: piece,
+        roleType: roleType,
+        influenceCount: influenceCount
+      )
+    }
+
+    return PieceRoleSnapshot(
+      currentPlayer: currentPlayer,
+      assignmentsBySquare: assignmentsBySquare,
+      employeeOfTheMonthSquare: employeeSquare
+    )
+  }
+
+  func influenceSquares(from origin: BoardSquare) -> [BoardSquare] {
+    guard let piece = board[origin] else {
+      return []
+    }
+
+    switch piece.kind {
+    case .pawn:
+      let direction = piece.color == .white ? 1 : -1
+      return [-1, 1].compactMap { origin.offset(file: $0, rank: direction) }
+    case .knight:
+      let offsets = [
+        (1, 2), (2, 1), (2, -1), (1, -2),
+        (-1, -2), (-2, -1), (-2, 1), (-1, 2),
+      ]
+      return offsets.compactMap { origin.offset(file: $0.0, rank: $0.1) }
+    case .bishop:
+      return influenceSquaresAlongDirections(
+        from: origin,
+        directions: [(1, 1), (1, -1), (-1, -1), (-1, 1)]
+      )
+    case .rook:
+      return influenceSquaresAlongDirections(
+        from: origin,
+        directions: [(1, 0), (-1, 0), (0, 1), (0, -1)]
+      )
+    case .queen:
+      return influenceSquaresAlongDirections(
+        from: origin,
+        directions: [
+          (1, 1), (1, -1), (-1, -1), (-1, 1),
+          (1, 0), (-1, 0), (0, 1), (0, -1),
+        ]
+      )
+    case .king:
+      var squares: [BoardSquare] = []
+      for deltaFile in -1...1 {
+        for deltaRank in -1...1 {
+          guard deltaFile != 0 || deltaRank != 0,
+                let target = origin.offset(file: deltaFile, rank: deltaRank) else {
+            continue
+          }
+          squares.append(target)
+        }
+      }
+      return squares
+    }
+  }
+
+  private func orderedPieces(for color: ChessColor) -> [(BoardSquare, ChessPieceState)] {
+    board
+      .filter { $0.value.color == color }
+      .sorted { lhs, rhs in
+        if lhs.key.rank != rhs.key.rank {
+          return lhs.key.rank < rhs.key.rank
+        }
+        return lhs.key.file < rhs.key.file
+      }
+      .map { ($0.key, $0.value) }
+  }
+
+  private func rolePieceIdentifier(for piece: ChessPieceState, at square: BoardSquare) -> String {
+    "\(piece.color.fenSymbol)_\(piece.kind.fenSymbol)_\(square.algebraic)"
+  }
+
+  private func roleInfluenceSquares(
+    from origin: BoardSquare,
+    cache: inout PieceRoleEvaluationCache
+  ) -> [BoardSquare] {
+    if let cached = cache.influenceSquaresBySquare[origin] {
+      return cached
+    }
+
+    let resolved = influenceSquares(from: origin)
+    cache.influenceSquaresBySquare[origin] = resolved
+    return resolved
+  }
+
+  private func roleLegalMoves(
+    from origin: BoardSquare,
+    cache: inout PieceRoleEvaluationCache
+  ) -> [ChessMove] {
+    if let cached = cache.legalMovesBySquare[origin] {
+      return cached
+    }
+
+    let resolved = legalMoves(from: origin)
+    cache.legalMovesBySquare[origin] = resolved
+    return resolved
+  }
+
+  private func pressuredSquaresOnEnemyHalf(
+    for color: ChessColor,
+    excluding excludedSquare: BoardSquare?,
+    cache: inout PieceRoleEvaluationCache
+  ) -> Set<BoardSquare> {
+    if let excludedSquare,
+       let cached = cache.removedFriendlyPressureBySquare[excludedSquare] {
+      return cached
+    }
+
+    let state = excludedSquare.map { removingPiece(at: $0) } ?? self
+    var pressuredSquares = Set<BoardSquare>()
+
+    for (square, piece) in state.orderedPieces(for: color) {
+      let influenceSquares: [BoardSquare]
+      if excludedSquare == nil {
+        influenceSquares = roleInfluenceSquares(from: square, cache: &cache)
+      } else {
+        influenceSquares = state.influenceSquares(from: square)
+      }
+
+      for target in influenceSquares where state.isOnEnemyHalf(target, for: piece.color) {
+        pressuredSquares.insert(target)
+      }
+    }
+
+    if let excludedSquare {
+      cache.removedFriendlyPressureBySquare[excludedSquare] = pressuredSquares
+    }
+
+    return pressuredSquares
+  }
+
+  private func isLazyPiece(
+    at square: BoardSquare,
+    piece: ChessPieceState,
+    cache: inout PieceRoleEvaluationCache
+  ) -> Bool {
+    let enemySideMoves = roleLegalMoves(from: square, cache: &cache)
+      .filter { isOnEnemyHalf($0.to, for: piece.color) }
+    guard !enemySideMoves.isEmpty else {
+      return true
+    }
+
+    let movingValue = piece.kind.strategicRoleTradeValue
+    for move in enemySideMoves {
+      let defendedByEqualOrLowerValueEnemy = attackOrigins(on: move.to, by: piece.color.opponent)
+        .contains { defenderSquare in
+          guard let defender = board[defenderSquare] else {
+            return false
+          }
+
+          return defender.kind.strategicRoleTradeValue <= movingValue
+        }
+
+      if !defendedByEqualOrLowerValueEnemy {
+        return false
+      }
+    }
+
+    return true
+  }
+
+  private func isTraitorPiece(
+    at square: BoardSquare,
+    friendlyColor: ChessColor,
+    baselineFriendlyPressure: Set<BoardSquare>,
+    cache: inout PieceRoleEvaluationCache
+  ) -> Bool {
+    let pressureWithoutPiece = pressuredSquaresOnEnemyHalf(
+      for: friendlyColor,
+      excluding: square,
+      cache: &cache
+    )
+    return pressureWithoutPiece.count > baselineFriendlyPressure.count
+  }
+
+  private func isOnEnemyHalf(_ square: BoardSquare, for color: ChessColor) -> Bool {
+    switch color {
+    case .white:
+      return square.rank >= 4
+    case .black:
+      return square.rank <= 3
+    }
+  }
+
+  private func isOnHomeHalf(_ square: BoardSquare, for color: ChessColor) -> Bool {
+    !isOnEnemyHalf(square, for: color)
+  }
+
+  private func removingPiece(at square: BoardSquare) -> ChessGameState {
+    var next = self
+    next.board[square] = nil
+    return next
+  }
+
+  private func influenceSquaresAlongDirections(
+    from origin: BoardSquare,
+    directions: [(Int, Int)]
+  ) -> [BoardSquare] {
+    directions.flatMap { influenceSquaresAlongRay(from: origin, direction: $0) }
+  }
+
+  private func influenceSquaresAlongRay(
+    from origin: BoardSquare,
+    direction: (Int, Int)
+  ) -> [BoardSquare] {
+    var squares: [BoardSquare] = []
+    var current = origin
+
+    while let next = current.offset(file: direction.0, rank: direction.1) {
+      squares.append(next)
+      if board[next] != nil {
+        break
+      }
+      current = next
+    }
+
+    return squares
+  }
+}
+
 private struct NativeARView: UIViewRepresentable {
   @ObservedObject var matchLog: MatchLogStore
   @ObservedObject var queueMatch: QueueMatchStore
@@ -16596,6 +17331,7 @@ private struct NativeARView: UIViewRepresentable {
   @ObservedObject var lessonStore: OpeningLessonStore
   @ObservedObject var socraticCoach: SocraticCoachStore
   @ObservedObject var fishing: FishingInteractionStore
+  @ObservedObject var pieceRoles: PieceRoleStore
   let onReviewFinished: () -> Void
 
   func makeCoordinator() -> Coordinator {
@@ -16608,6 +17344,7 @@ private struct NativeARView: UIViewRepresentable {
       lessonStore: lessonStore,
       socraticCoach: socraticCoach,
       fishing: fishing,
+      pieceRoles: pieceRoles,
       onReviewFinished: onReviewFinished
     )
   }
@@ -16653,6 +17390,11 @@ private struct NativeARView: UIViewRepresentable {
       var previewSquare: BoardSquare?
     }
 
+    private enum FishingHandSide {
+      case left
+      case right
+    }
+
     private static let boardTemplateSize: Float = 0.40
     private static let boardSquareSize: Float = boardTemplateSize / 8.0
     private static let fishingPondVerticalOffset: Float = -0.068
@@ -16660,6 +17402,15 @@ private struct NativeARView: UIViewRepresentable {
     private static let fishingPondFocusDistance: Float = 4.0
     private static let fishingBiteDelayRangeSeconds: ClosedRange<Double> = 5.0...10.0
     private static let fishingCatchWindowSeconds: TimeInterval = 1.85
+    private static let fishingRigBasePosition = SIMD3<Float>(0.0, -0.25, -0.60)
+    private static let fishingRigBasePitch: Float = 0
+    private static let fishingRigBaseYaw: Float = 0
+    private static let fishingRigBaseRoll: Float = 0
+    private static let fishingRigRelativePitchDeltaMin: Float = 0
+    private static let fishingRigRelativePitchDeltaMax: Float = 0.18
+    private static let fishingTerrainPlaneLocalY: Float = -0.041
+    private static let fishingRigGroundClearance: Float = 0.012
+    private static let fishingRigMinimumCameraUpComponent: Float = 0.22
     private static let boardBaseMesh = MeshResource.generateBox(
       size: SIMD3<Float>(boardTemplateSize + 0.03, 0.012, boardTemplateSize + 0.03)
     )
@@ -16712,6 +17463,7 @@ private struct NativeARView: UIViewRepresentable {
     private let lessonStore: OpeningLessonStore
     private let socraticCoach: SocraticCoachStore
     private let fishing: FishingInteractionStore
+    private let pieceRoles: PieceRoleStore
     private let onReviewFinished: () -> Void
     private weak var arView: ARView?
     private var boardAnchor: AnchorEntity?
@@ -16728,11 +17480,17 @@ private struct NativeARView: UIViewRepresentable {
     private var activeThreatSquares: [BoardSquare] = []
     private var persistentThreatSquares: [BoardSquare] = []
     private var speakingPieceHighlightSquare: BoardSquare?
+    private var wantedPosterHighlightSquare: BoardSquare?
     private var activeThreatEntities: [ModelEntity] = []
     private var threatOverlayDisplayLink: CADisplayLink?
     private var threatOverlayHideWorkItem: DispatchWorkItem?
     private var trackedPlaneID: UUID?
-    private var gameState = ChessGameState.initial()
+    private var gameState = ChessGameState.initial() {
+      didSet {
+        recalculatePieceRoles()
+      }
+    }
+    private var pieceRoleSnapshot = PieceRoleSnapshot.empty(currentPlayer: .white)
     private var selectedSquare: BoardSquare?
     private var selectedMoves: [ChessMove] = []
     private var activePieceDrag: ActivePieceDrag?
@@ -16758,18 +17516,32 @@ private struct NativeARView: UIViewRepresentable {
     private var knightCameraSplatStartTime: CFTimeInterval?
     private weak var fishingPondEntity: Entity?
     private weak var fishingPondWaterEntity: Entity?
+    private weak var fishingPondFinEntity: Entity?
     private var fishingRodAnchor: AnchorEntity?
+    private weak var fishingRigEntity: Entity?
     private weak var fishingRodEntity: Entity?
+    private weak var fishingLeftHandEntity: Entity?
+    private weak var fishingRightHandEntity: Entity?
+    private weak var fishingRodTipEntity: Entity?
+    private var baselineFishingOrientation: simd_float4x4?
+    private var baselineFishingDownwardPitch: Float?
+    private var fishingCastLineAnchor: AnchorEntity?
+    private weak var fishingCastLineEntity: ModelEntity?
     private var fishingBobberAnchor: AnchorEntity?
     private weak var fishingBobberEntity: ModelEntity?
     private var fishingFishAnchor: AnchorEntity?
     private weak var fishingFishEntity: Entity?
+    private var fishingFishFloatStartedAt: CFTimeInterval?
     private var fishingBiteTask: Task<Void, Never>?
     private var fishingCatchWindowTask: Task<Void, Never>?
     private var fishingRevealTask: Task<Void, Never>?
     private var fishingResetTask: Task<Void, Never>?
     private var fishingBobberCastCompletedAt: CFTimeInterval?
     private var fishingSequenceID = 0
+    private var fishingPondFinTravelStartedAt: CFTimeInterval = 0
+    private var fishingPondFinTravelDuration: Float = 0
+    private var fishingPondFinStartLocalPosition = SIMD3<Float>(0, 0.031, 0)
+    private var fishingPondFinTargetLocalPosition = SIMD3<Float>(0, 0.031, 0)
     private let upwardFlickDetector = UpwardFlickDetector()
     private var liveEngineTask: Task<Void, Never>?
     private var reviewEngineTask: Task<Void, Never>?
@@ -16789,6 +17561,7 @@ private struct NativeARView: UIViewRepresentable {
       lessonStore: OpeningLessonStore,
       socraticCoach: SocraticCoachStore,
       fishing: FishingInteractionStore,
+      pieceRoles: PieceRoleStore,
       onReviewFinished: @escaping () -> Void
     ) {
       self.matchLog = matchLog
@@ -16799,6 +17572,7 @@ private struct NativeARView: UIViewRepresentable {
       self.lessonStore = lessonStore
       self.socraticCoach = socraticCoach
       self.fishing = fishing
+      self.pieceRoles = pieceRoles
       self.onReviewFinished = onReviewFinished
 
       switch mode {
@@ -16818,6 +17592,7 @@ private struct NativeARView: UIViewRepresentable {
     }
 
     deinit {
+      pieceRoles.unbindEmployeeHighlightHandler()
       initialAnalysisTask?.cancel()
       moveAnimationTask?.cancel()
       liveEngineTask?.cancel()
@@ -16831,6 +17606,7 @@ private struct NativeARView: UIViewRepresentable {
       fishingRevealTask?.cancel()
       fishingResetTask?.cancel()
       fishingRodAnchor?.removeFromParent()
+      fishingCastLineAnchor?.removeFromParent()
       fishingBobberAnchor?.removeFromParent()
       fishingFishAnchor?.removeFromParent()
       upwardFlickDetector.stop()
@@ -16844,6 +17620,11 @@ private struct NativeARView: UIViewRepresentable {
       fishing.bindCastHandler { [weak self] in
         Task { @MainActor [weak self] in
           self?.beginFishingInteraction()
+        }
+      }
+      pieceRoles.bindEmployeeHighlightHandler { [weak self] in
+        Task { @MainActor [weak self] in
+          self?.highlightEmployeeOfTheMonth()
         }
       }
       fishing.bindDismissNoteHandler { [weak self] in
@@ -17010,6 +17791,7 @@ private struct NativeARView: UIViewRepresentable {
       ])
 
       syncSocraticCoachContext(force: true)
+      recalculatePieceRoles()
     }
 
     private static func preferredVideoFormat() -> ARConfiguration.VideoFormat? {
@@ -17081,6 +17863,10 @@ private struct NativeARView: UIViewRepresentable {
       let location = recognizer.location(in: arView)
 
       if let entity = arView.entity(at: location) {
+        if handleFishingEntityTap(entity) {
+          return
+        }
+
         if let square = square(for: entity, prefix: "piece") {
           handleTapOnPiece(at: square)
           return
@@ -17102,6 +17888,17 @@ private struct NativeARView: UIViewRepresentable {
       } else {
         handleTapOnSquare(square)
       }
+    }
+
+    private func handleFishingEntityTap(_ entity: Entity) -> Bool {
+      guard fishing.canRevealRewardFromFish,
+            fishingFishRoot(for: entity) != nil else {
+        return false
+      }
+
+      UIImpactFeedbackGenerator(style: .light).impactOccurred()
+      fishing.revealArmedRewardNote()
+      return true
     }
 
     @objc
@@ -17386,6 +18183,21 @@ private struct NativeARView: UIViewRepresentable {
       if force {
         clearAllThreatOverlays()
       }
+    }
+
+    private func recalculatePieceRoles() {
+      pieceRoleSnapshot = gameState.evaluatePieceRolesRelativeToCurrentPlayer()
+      wantedPosterHighlightSquare = nil
+      pieceRoles.update(snapshot: pieceRoleSnapshot)
+    }
+
+    private func highlightEmployeeOfTheMonth() {
+      guard let employeeSquare = pieceRoleSnapshot.employeeOfTheMonthSquare else {
+        return
+      }
+
+      wantedPosterHighlightSquare = employeeSquare
+      syncHighlights()
     }
 
     private func fullNarrativeMoveHistory() -> [String] {
@@ -19058,7 +19870,7 @@ private struct NativeARView: UIViewRepresentable {
         self?.clearKnightCameraSplatOverlay(animated: false)
       }
       knightCameraSplatHideWorkItem = hideWorkItem
-      DispatchQueue.main.asyncAfter(deadline: .now() + 2.6, execute: hideWorkItem)
+      DispatchQueue.main.asyncAfter(deadline: .now() + 3.15, execute: hideWorkItem)
     }
 
     @MainActor
@@ -19073,9 +19885,10 @@ private struct NativeARView: UIViewRepresentable {
 
       if animated, let splatPiece = knightCameraSplatEntity {
         var transform = splatPiece.transform
-        transform.scale *= 0.90
-        splatPiece.move(to: transform, relativeTo: splatPiece.parent, duration: 0.12, timingFunction: .easeIn)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.14) {
+        transform.translation += SIMD3<Float>(0, 0.34, 0)
+        transform.scale *= SIMD3<Float>(0.96, 0.96, 0.90)
+        splatPiece.move(to: transform, relativeTo: splatPiece.parent, duration: 0.28, timingFunction: .easeIn)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.30) {
           splatAnchor.removeFromParent()
         }
       } else {
@@ -19106,15 +19919,23 @@ private struct NativeARView: UIViewRepresentable {
         return
       }
 
+      let elapsed = Float(elapsed)
       let settleDuration: Float = 0.24
-      let progress = min(max(Float(elapsed) / settleDuration, 0), 1)
-      let eased = 1 - pow(1 - progress, 3)
-      let wobbleTime = max(0, Float(elapsed) - settleDuration)
-      let wobble = sin(wobbleTime * 11) * 0.028 * exp(-wobbleTime * 4.6)
+      let holdDuration: Float = 0.62
+      let slideDuration: Float = 2.2
+      let settleProgress = min(max(elapsed / settleDuration, 0), 1)
+      let settleEased = 1 - pow(1 - settleProgress, 3)
+      let slideStart = settleDuration + holdDuration
+      let slideProgress = min(max((elapsed - slideStart) / slideDuration, 0), 1)
+      let slideEased = slideProgress * slideProgress * (3 - (2 * slideProgress))
+      let wobbleTime = max(0, elapsed - settleDuration)
+      let wobble = sin(wobbleTime * 11) * 0.028 * exp(-wobbleTime * 5.4) * (1 - min(slideProgress, 1) * 0.8)
 
       let startPosition = SIMD3<Float>(0, 0.07, -0.48)
       let endPosition = SIMD3<Float>(0, 0.008, -0.145)
-      let position = interpolatedVector(startPosition, endPosition, progress: eased) + SIMD3<Float>(0, wobble * 0.12, 0)
+      let settledPosition = interpolatedVector(startPosition, endPosition, progress: settleEased) + SIMD3<Float>(0, wobble * 0.12, 0)
+      let downwardTravel = SIMD3<Float>(0, 0.56, 0)
+      let position = settledPosition + (downwardTravel * slideEased)
 
       let finalRotation = simd_normalize(
         simd_quatf(angle: .pi, axis: SIMD3<Float>(0, 1, 0)) *
@@ -19125,12 +19946,18 @@ private struct NativeARView: UIViewRepresentable {
           simd_quatf(angle: -.pi / 8, axis: SIMD3<Float>(1, 0, 0)) *
           finalRotation
       )
-      let rotation = simd_slerp(startRotation, finalRotation, eased)
+      let settledRotation = simd_slerp(startRotation, finalRotation, settleEased)
+      let slideTilt = simd_normalize(
+        simd_quatf(angle: -0.14 * slideEased, axis: SIMD3<Float>(1, 0, 0)) *
+          simd_quatf(angle: (viewerColor == .black ? 0.11 : -0.11) * slideEased, axis: SIMD3<Float>(0, 0, 1))
+      )
+      let rotation = simd_normalize(slideTilt * settledRotation)
 
       let startScale = SIMD3<Float>(repeating: 0.86)
       let endScale = SIMD3<Float>(2.95, 2.95, 0.36)
-      var scale = interpolatedVector(startScale, endScale, progress: eased)
-      scale.z = max(0.28, scale.z + abs(wobble) * 0.22)
+      var scale = interpolatedVector(startScale, endScale, progress: settleEased)
+      scale -= SIMD3<Float>(repeating: 0.18 * slideEased)
+      scale.z = max(0.24, scale.z - (0.06 * slideEased) + abs(wobble) * 0.22)
 
       splatPiece.transform = Transform(scale: scale, rotation: rotation, translation: position)
     }
@@ -19394,6 +20221,160 @@ private struct NativeARView: UIViewRepresentable {
         shackle.scale = SIMD3<Float>(repeating: 0.88)
         shackle.orientation = settledRotation
         victim.addChild(shackle)
+      }
+    }
+
+    private func attachPieceRoleAccessory(
+      to pieceEntity: Entity,
+      piece: ChessPieceState,
+      roleType: PieceRoleType
+    ) {
+      pieceEntity.findEntity(named: "piece_role_accessory")?.removeFromParent()
+
+      let accessory: Entity?
+      switch roleType {
+      case .employee:
+        accessory = nil
+      case .traitor:
+        accessory = makeTraitorHornsEntity(for: piece.kind)
+      case .lazy:
+        accessory = makeLazyChipsEntity(for: piece.kind)
+      case .worker:
+        accessory = makeWorkerBriefcaseEntity(for: piece.kind)
+      }
+
+      guard let accessory else {
+        return
+      }
+
+      accessory.name = "piece_role_accessory"
+      pieceEntity.addChild(accessory)
+    }
+
+    private func makeTraitorHornsEntity(for kind: ChessPieceKind) -> Entity {
+      let horns = Entity()
+      horns.position = SIMD3<Float>(0, pieceRoleHeadHeight(for: kind), -0.003)
+      let hornMaterial = accessoryMaterial(color: UIColor(red: 0.74, green: 0.12, blue: 0.12, alpha: 1), metallic: true)
+
+      for side in [Float(-1), Float(1)] {
+        let horn = Entity()
+        horn.position = SIMD3<Float>(0.007 * side, 0, 0)
+        horn.orientation = simd_normalize(
+          simd_quatf(angle: side * (.pi / 9), axis: SIMD3<Float>(0, 0, 1)) *
+            simd_quatf(angle: -.pi / 8, axis: SIMD3<Float>(1, 0, 0))
+        )
+
+        let base = ModelEntity(mesh: .generateSphere(radius: 0.003), materials: [hornMaterial])
+        horn.addChild(base)
+
+        let tip = ModelEntity(
+          mesh: .generateBox(size: SIMD3<Float>(0.0032, 0.011, 0.0032)),
+          materials: [hornMaterial]
+        )
+        tip.position = SIMD3<Float>(0, 0.006, 0)
+        horn.addChild(tip)
+
+        horns.addChild(horn)
+      }
+
+      return horns
+    }
+
+    private func makeLazyChipsEntity(for kind: ChessPieceKind) -> Entity {
+      let chips = Entity()
+      chips.position = SIMD3<Float>(0.020, pieceRoleCarryHeight(for: kind), 0.012)
+      chips.orientation = simd_normalize(
+        simd_quatf(angle: -.pi / 7, axis: SIMD3<Float>(0, 1, 0)) *
+          simd_quatf(angle: .pi / 16, axis: SIMD3<Float>(0, 0, 1))
+      )
+
+      let bagMaterial = accessoryMaterial(color: UIColor(red: 0.93, green: 0.74, blue: 0.22, alpha: 1), metallic: false)
+      let stripeMaterial = accessoryMaterial(color: UIColor(red: 0.81, green: 0.16, blue: 0.13, alpha: 1), metallic: false)
+      let chipMaterial = accessoryMaterial(color: UIColor(red: 0.98, green: 0.90, blue: 0.64, alpha: 1), metallic: false)
+
+      let bag = ModelEntity(
+        mesh: .generateBox(size: SIMD3<Float>(0.012, 0.016, 0.005)),
+        materials: [bagMaterial]
+      )
+      chips.addChild(bag)
+
+      let stripe = ModelEntity(
+        mesh: .generateBox(size: SIMD3<Float>(0.004, 0.0165, 0.0056)),
+        materials: [stripeMaterial]
+      )
+      stripe.position = SIMD3<Float>(0.002, 0, 0.0006)
+      chips.addChild(stripe)
+
+      let chip = ModelEntity(mesh: .generateSphere(radius: 0.0024), materials: [chipMaterial])
+      chip.scale = SIMD3<Float>(1.4, 0.4, 1.0)
+      chip.position = SIMD3<Float>(-0.002, 0.010, 0.001)
+      chips.addChild(chip)
+
+      return chips
+    }
+
+    private func makeWorkerBriefcaseEntity(for kind: ChessPieceKind) -> Entity {
+      let briefcase = Entity()
+      briefcase.position = SIMD3<Float>(-0.020, pieceRoleCarryHeight(for: kind), 0.010)
+      briefcase.orientation = simd_quatf(angle: .pi / 8, axis: SIMD3<Float>(0, 1, 0))
+
+      let caseMaterial = accessoryMaterial(color: UIColor(red: 0.34, green: 0.20, blue: 0.10, alpha: 1), metallic: false)
+      let latchMaterial = accessoryMaterial(color: UIColor(red: 0.84, green: 0.67, blue: 0.24, alpha: 1), metallic: true)
+
+      let caseBody = ModelEntity(
+        mesh: .generateBox(size: SIMD3<Float>(0.014, 0.010, 0.006)),
+        materials: [caseMaterial]
+      )
+      briefcase.addChild(caseBody)
+
+      let handle = ModelEntity(
+        mesh: .generateBox(size: SIMD3<Float>(0.007, 0.002, 0.002)),
+        materials: [caseMaterial]
+      )
+      handle.position = SIMD3<Float>(0, 0.007, 0)
+      briefcase.addChild(handle)
+
+      let latch = ModelEntity(
+        mesh: .generateBox(size: SIMD3<Float>(0.003, 0.003, 0.0014)),
+        materials: [latchMaterial]
+      )
+      latch.position = SIMD3<Float>(0, 0, 0.0034)
+      briefcase.addChild(latch)
+
+      return briefcase
+    }
+
+    private func pieceRoleHeadHeight(for kind: ChessPieceKind) -> Float {
+      switch kind {
+      case .pawn:
+        return 0.040
+      case .rook:
+        return 0.041
+      case .knight:
+        return 0.041
+      case .bishop:
+        return 0.055
+      case .queen:
+        return 0.049
+      case .king:
+        return 0.052
+      }
+    }
+
+    private func pieceRoleCarryHeight(for kind: ChessPieceKind) -> Float {
+      switch kind {
+      case .pawn:
+        return 0.021
+      case .rook:
+        return 0.025
+      case .knight:
+        return 0.024
+      case .bishop:
+        return 0.027
+      case .queen:
+        return 0.029
+      case .king:
+        return 0.030
       }
     }
 
@@ -20063,8 +21044,8 @@ private struct NativeARView: UIViewRepresentable {
 
     private func fishingPondOffset() -> SIMD3<Float> {
       let halfBoardWidth = (boardSize * boardScale) * 0.5
-      let lateralDistance = max(halfBoardWidth + 0.46, 0.72)
-      return SIMD3<Float>(-lateralDistance, Self.fishingPondVerticalOffset, 0.02)
+      let lateralDistance = max(halfBoardWidth + 0.70, 0.92)
+      return SIMD3<Float>(-lateralDistance, Self.fishingPondVerticalOffset, 0.04)
     }
 
     @MainActor
@@ -20080,23 +21061,66 @@ private struct NativeARView: UIViewRepresentable {
       let pond = Entity()
       pond.name = "fishing_pond"
 
-      let bank = ModelEntity(
+      let shoreline = ModelEntity(
         mesh: .generateSphere(radius: 0.5),
-        materials: [Self.scenicMaterial(UIColor(red: 0.45, green: 0.54, blue: 0.30, alpha: 1), roughness: 1.0)]
+        materials: [Self.scenicMaterial(UIColor(red: 0.20, green: 0.28, blue: 0.30, alpha: 1), roughness: 0.98)]
       )
-      bank.scale = SIMD3<Float>(0.86, 0.16, 0.64)
-      bank.position = SIMD3<Float>(0, 0, 0)
-      pond.addChild(bank)
+      shoreline.position = SIMD3<Float>(0, 0.010, 0)
+      shoreline.scale = SIMD3<Float>(1.02, 0.018, 1.02)
+      pond.addChild(shoreline)
 
       let water = ModelEntity(
         mesh: .generateSphere(radius: 0.5),
-        materials: [Self.scenicMaterial(UIColor(red: 0.23, green: 0.52, blue: 0.67, alpha: 0.96), roughness: 0.18)]
+        materials: [Self.scenicMaterial(UIColor(red: 0.18, green: 0.66, blue: 0.98, alpha: 0.98), roughness: 0.04)]
       )
-      water.scale = SIMD3<Float>(0.60, 0.030, 0.42)
-      water.position = SIMD3<Float>(0, 0.030, 0)
+      water.position = SIMD3<Float>(0, 0.022, 0)
+      water.scale = SIMD3<Float>(0.94, 0.018, 0.94)
       pond.addChild(water)
       fishingPondEntity = pond
       fishingPondWaterEntity = water
+
+      let deepWater = ModelEntity(
+        mesh: .generateSphere(radius: 0.5),
+        materials: [Self.scenicMaterial(UIColor(red: 0.08, green: 0.36, blue: 0.72, alpha: 1.0), roughness: 0.03)]
+      )
+      deepWater.position = SIMD3<Float>(0, 0.026, 0)
+      deepWater.scale = SIMD3<Float>(0.72, 0.010, 0.72)
+      pond.addChild(deepWater)
+
+      let shimmer = ModelEntity(
+        mesh: .generateSphere(radius: 0.5),
+        materials: [Self.scenicMaterial(UIColor(red: 0.84, green: 0.96, blue: 1.0, alpha: 0.56), roughness: 0.01)]
+      )
+      shimmer.position = SIMD3<Float>(0.10, 0.031, -0.06)
+      shimmer.scale = SIMD3<Float>(0.42, 0.002, 0.26)
+      shimmer.orientation = simd_quatf(angle: .pi / 16, axis: SIMD3<Float>(0, 1, 0))
+      pond.addChild(shimmer)
+
+      let secondaryShimmer = ModelEntity(
+        mesh: .generateSphere(radius: 0.5),
+        materials: [Self.scenicMaterial(UIColor(red: 0.76, green: 0.92, blue: 1.0, alpha: 0.34), roughness: 0.01)]
+      )
+      secondaryShimmer.position = SIMD3<Float>(-0.16, 0.030, 0.10)
+      secondaryShimmer.scale = SIMD3<Float>(0.26, 0.002, 0.16)
+      secondaryShimmer.orientation = simd_quatf(angle: -.pi / 12, axis: SIMD3<Float>(0, 1, 0))
+      pond.addChild(secondaryShimmer)
+
+      let lilyPadColor = UIColor(red: 0.52, green: 0.80, blue: 0.26, alpha: 1)
+      let lilyPads: [(position: SIMD3<Float>, scale: SIMD3<Float>, yaw: Float)] = [
+        (SIMD3<Float>(-0.20, 0.031, 0.14), SIMD3<Float>(1.05, 1.0, 0.78), -.pi / 8),
+        (SIMD3<Float>(0.22, 0.031, -0.05), SIMD3<Float>(1.18, 1.0, 0.86), .pi / 6),
+        (SIMD3<Float>(0.04, 0.031, 0.24), SIMD3<Float>(0.92, 1.0, 0.72), .pi / 10),
+      ]
+      for lilyPadSpec in lilyPads {
+        let lilyPad = ModelEntity(
+          mesh: .generateSphere(radius: 0.5),
+          materials: [Self.scenicMaterial(lilyPadColor, roughness: 0.92)]
+        )
+        lilyPad.scale = SIMD3<Float>(0.104, 0.004, 0.104) * lilyPadSpec.scale
+        lilyPad.position = lilyPadSpec.position
+        lilyPad.orientation = simd_quatf(angle: lilyPadSpec.yaw, axis: SIMD3<Float>(0, 1, 0))
+        pond.addChild(lilyPad)
+      }
 
       let shoreRockColor = UIColor(red: 0.51, green: 0.49, blue: 0.44, alpha: 1)
       let rockAngles: [Float] = [-146, -88, -26, 24, 72, 132]
@@ -20111,31 +21135,33 @@ private struct NativeARView: UIViewRepresentable {
           0.07 + (Float((index + 1) % 2) * 0.02)
         )
         let radians = angle * Float.pi / 180.0
-        rock.position = SIMD3<Float>(sin(radians) * 0.42, 0.038, cos(radians) * 0.30)
+        rock.position = SIMD3<Float>(sin(radians) * 0.60, 0.038, cos(radians) * 0.60)
         pond.addChild(rock)
       }
 
-      let reedColor = UIColor(red: 0.31, green: 0.49, blue: 0.22, alpha: 1)
-      let reedBaseOffsets: [SIMD3<Float>] = [
-        SIMD3<Float>(-0.28, 0.03, 0.16),
-        SIMD3<Float>(0.24, 0.03, -0.14),
-      ]
-      for baseOffset in reedBaseOffsets {
-        for stemIndex in 0..<3 {
-          let reed = ModelEntity(
-            mesh: .generateBox(size: SIMD3<Float>(0.009, 0.14 + (Float(stemIndex) * 0.02), 0.009)),
-            materials: [Self.scenicMaterial(reedColor, roughness: 1.0)]
-          )
-          reed.position = baseOffset + SIMD3<Float>(Float(stemIndex) * 0.018, 0.06, Float(stemIndex) * -0.014)
-          reed.orientation = simd_quatf(
-            angle: (Float(stemIndex) - 1.0) * 0.16,
-            axis: SIMD3<Float>(0, 0, 1)
-          )
-          pond.addChild(reed)
-        }
-      }
+      let fin = makeFishingPondFinEntity()
+      pond.addChild(fin)
+      fishingPondFinEntity = fin
+      let initialFinPosition = randomFishingPondFinLocalPoint()
+      fin.position = initialFinPosition
+      resetFishingPondFinPath(from: initialFinPosition)
 
       return pond
+    }
+
+    private func makeFishingPondFinEntity() -> Entity {
+      let fin = Entity()
+      fin.name = "fishing_pond_fin"
+
+      let dorsal = ModelEntity(
+        mesh: .generateBox(size: SIMD3<Float>(0.016, 0.055, 0.010)),
+        materials: [Self.scenicMaterial(UIColor(red: 0.22, green: 0.28, blue: 0.34, alpha: 1), roughness: 0.80)]
+      )
+      dorsal.position = SIMD3<Float>(0, 0, 0)
+      dorsal.orientation = simd_quatf(angle: .pi / 10, axis: SIMD3<Float>(0, 0, 1))
+      fin.addChild(dorsal)
+
+      return fin
     }
 
     @MainActor
@@ -20154,8 +21180,12 @@ private struct NativeARView: UIViewRepresentable {
       UIImpactFeedbackGenerator(style: .medium).impactOccurred()
 
       createFishingRodAnchor(cameraMatrix: frame.camera.transform)
-      animateFishingRod(to: fishingCastTransform(), duration: 0.34, timingFunction: .easeInOut)
-      castFishingBobber(from: frame.camera.transform, to: pondTarget)
+      animateFishingRod(
+        to: fishingCastTransform(cameraMatrix: frame.camera.transform, pondTarget: pondTarget),
+        duration: 0.34,
+        timingFunction: .easeInOut
+      )
+      castFishingBobber(to: pondTarget)
 
       Task { @MainActor [weak self] in
         try? await Task.sleep(nanoseconds: 780_000_000)
@@ -20166,7 +21196,11 @@ private struct NativeARView: UIViewRepresentable {
         }
         self.fishing.setWaiting()
         self.fishingBobberCastCompletedAt = CACurrentMediaTime()
-        self.animateFishingRod(to: self.fishingWaitingTransform(), duration: 0.28, timingFunction: .easeOut)
+        self.animateFishingRod(
+          to: self.currentFishingWaitingTransform(),
+          duration: 0.28,
+          timingFunction: .easeOut
+        )
       }
 
       let biteDelay = Double.random(in: Self.fishingBiteDelayRangeSeconds)
@@ -20189,7 +21223,7 @@ private struct NativeARView: UIViewRepresentable {
 
       fishing.setBite()
       UIImpactFeedbackGenerator(style: .heavy).impactOccurred()
-      animateFishingRod(to: fishingBiteTransform(), duration: 0.11, timingFunction: .easeIn)
+      animateFishingRod(to: currentFishingBiteTransform(), duration: 0.11, timingFunction: .easeIn)
       animateFishingBobberBite()
 
       Task { @MainActor [weak self] in
@@ -20200,7 +21234,11 @@ private struct NativeARView: UIViewRepresentable {
           return
         }
         self.fishing.setCatchWindow()
-        self.animateFishingRod(to: self.fishingWaitingTransform(), duration: 0.20, timingFunction: .easeOut)
+        self.animateFishingRod(
+          to: self.currentFishingWaitingTransform(),
+          duration: 0.20,
+          timingFunction: .easeOut
+        )
       }
 
       fishingCatchWindowTask = Task { @MainActor [weak self] in
@@ -20226,7 +21264,7 @@ private struct NativeARView: UIViewRepresentable {
       fishingBiteTask = nil
       fishing.setCaught()
       UIImpactFeedbackGenerator(style: .rigid).impactOccurred()
-      animateFishingRod(to: fishingCatchPullTransform(), duration: 0.18, timingFunction: .easeIn)
+      animateFishingRod(to: currentFishingCatchPullTransform(), duration: 0.18, timingFunction: .easeIn)
       animateFishingBobberHookLift()
       spawnFishingCatch()
     }
@@ -20274,21 +21312,34 @@ private struct NativeARView: UIViewRepresentable {
     private func clearFishingWorldPresentation() {
       fishingRodAnchor?.removeFromParent()
       fishingRodAnchor = nil
+      fishingRigEntity = nil
       fishingRodEntity = nil
+      fishingLeftHandEntity = nil
+      fishingRightHandEntity = nil
+      fishingRodTipEntity = nil
+      fishingCastLineAnchor?.removeFromParent()
+      fishingCastLineAnchor = nil
+      fishingCastLineEntity = nil
       fishingBobberAnchor?.removeFromParent()
       fishingBobberAnchor = nil
       fishingBobberEntity = nil
       fishingFishAnchor?.removeFromParent()
       fishingFishAnchor = nil
       fishingFishEntity = nil
+      fishingFishFloatStartedAt = nil
       fishingBobberCastCompletedAt = nil
+      baselineFishingOrientation = nil
+      baselineFishingDownwardPitch = nil
     }
 
     @MainActor
     private func updateFishingInteraction(_ frame: ARFrame) {
       updatePondFocusState(frame)
       updateFishingRodCameraFollow(frame)
+      updateFishingPondSurfaceMotion()
+      updateFishingCastLine()
       updateFishingBobberIdleMotion()
+      updateFishingCaughtFishMotion()
     }
 
     @MainActor
@@ -20316,18 +21367,38 @@ private struct NativeARView: UIViewRepresentable {
 
     @MainActor
     private func updateFishingRodCameraFollow(_ frame: ARFrame) {
-      if fishing.state == .eligible && fishing.isPondInFocus {
-        ensureFishingHeldRodPreview(cameraMatrix: frame.camera.transform)
-      } else if fishing.state == .idle {
-        clearFishingHeldRodPreview()
+      let shouldShowRig =
+        (fishing.state == .eligible && fishing.isPondInFocus) ||
+        fishing.state == .casting ||
+        fishing.state == .waiting ||
+        fishing.state == .bite ||
+        fishing.state == .catchWindow ||
+        fishing.state == .caught
+
+      guard shouldShowRig else {
+        if fishingRodAnchor != nil || fishingRigEntity != nil {
+          clearFishingHeldRodPreview()
+        }
+        return
       }
 
-      fishingRodAnchor?.setTransformMatrix(frame.camera.transform, relativeTo: nil)
+      if fishingRodAnchor == nil || fishingRigEntity == nil || fishingRodEntity == nil {
+        createFishingRodAnchor(cameraMatrix: frame.camera.transform)
+      }
 
-      if fishing.state == .eligible,
-         fishing.isPondInFocus,
-         let rod = fishingRodEntity {
-        rod.transform = fishingHeldTransform()
+      guard let rig = fishingRigEntity else {
+        return
+      }
+
+      switch fishing.state {
+      case .eligible:
+        rig.transform = fishingHeldTransform(cameraMatrix: frame.camera.transform)
+      case .waiting, .catchWindow:
+        rig.transform = fishingWaitingTransform(cameraMatrix: frame.camera.transform)
+      case .caught:
+        rig.transform = fishingCatchPullTransform(cameraMatrix: frame.camera.transform)
+      case .casting, .bite, .idle, .revealNote, .reset:
+        break
       }
     }
 
@@ -20344,157 +21415,254 @@ private struct NativeARView: UIViewRepresentable {
     }
 
     @MainActor
-    private func createFishingRodAnchor(cameraMatrix: simd_float4x4) {
+    private func updateFishingCastLine() {
+      guard let tip = fishingRodTipEntity else {
+        fishingCastLineAnchor?.removeFromParent()
+        fishingCastLineAnchor = nil
+        fishingCastLineEntity = nil
+        return
+      }
+
+      let tipPosition = tip.position(relativeTo: nil)
+      guard let lineTarget = fishingBobberAnchor?.position(relativeTo: nil) else {
+        fishingCastLineAnchor?.removeFromParent()
+        fishingCastLineAnchor = nil
+        fishingCastLineEntity = nil
+        return
+      }
+
+      guard let arView else {
+        return
+      }
+
+      if fishingCastLineAnchor == nil || fishingCastLineEntity == nil {
+        let anchor = AnchorEntity(world: worldMatrix(translation: (tipPosition + lineTarget) * 0.5))
+        let line = ModelEntity(
+          mesh: .generateBox(size: SIMD3<Float>(0.0035, 1.0, 0.0035)),
+          materials: [SimpleMaterial(color: UIColor(red: 0.92, green: 0.96, blue: 1.0, alpha: 0.92), roughness: 0.04, isMetallic: false)]
+        )
+        anchor.addChild(line)
+        arView.scene.addAnchor(anchor)
+        fishingCastLineAnchor = anchor
+        fishingCastLineEntity = line
+      }
+
+      guard let anchor = fishingCastLineAnchor,
+            let line = fishingCastLineEntity else {
+        return
+      }
+
+      let midpoint = (tipPosition + lineTarget) * 0.5
+      let delta = lineTarget - tipPosition
+      let length = max(simd_length(delta), 0.001)
+      let direction = delta / length
+      let rotation = simd_quatf(from: SIMD3<Float>(0, 1, 0), to: direction)
+
+      anchor.setTransformMatrix(worldMatrix(translation: midpoint), relativeTo: nil)
+      line.transform = Transform(
+        scale: SIMD3<Float>(1.0, length, 1.0),
+        rotation: rotation,
+        translation: SIMD3<Float>(0, 0, 0)
+      )
+    }
+
+    @MainActor
+    private func createFishingRodAnchor(cameraMatrix: simd_float4x4? = nil) {
       guard let arView else {
         return
       }
 
       fishingRodAnchor?.removeFromParent()
-      let anchor = AnchorEntity(world: cameraMatrix)
+      let activeCameraMatrix = cameraMatrix ?? arView.session.currentFrame?.camera.transform
+      captureFishingBaselineIfNeeded(cameraMatrix: activeCameraMatrix)
+      let anchor = AnchorEntity(.camera)
+      anchor.name = "fishing_camera_anchor"
+      let rig = Entity()
+      rig.name = "fishing_rig"
+      rig.transform = fishingHeldTransform(cameraMatrix: activeCameraMatrix)
+
+      let leftHand = makeFishingHandEntity(
+        side: .left,
+        sleeveColor: UIColor(red: 0.13, green: 0.16, blue: 0.20, alpha: 1),
+        skinColor: UIColor(red: 0.88, green: 0.74, blue: 0.62, alpha: 1)
+      )
+      leftHand.name = "fishing_left_hand"
+      leftHand.position = SIMD3<Float>(-0.12, -0.05, 0)
+      leftHand.orientation = simd_normalize(
+        simd_quatf(angle: .pi / 26, axis: SIMD3<Float>(0, 1, 0)) *
+          simd_quatf(angle: -.pi / 18, axis: SIMD3<Float>(0, 0, 1))
+      )
+
+      let rightHand = makeFishingHandEntity(
+        side: .right,
+        sleeveColor: UIColor(red: 0.18, green: 0.22, blue: 0.28, alpha: 1),
+        skinColor: UIColor(red: 0.88, green: 0.74, blue: 0.62, alpha: 1)
+      )
+      rightHand.name = "fishing_right_hand"
+      rightHand.position = SIMD3<Float>(0.12, -0.05, 0)
+      rightHand.orientation = simd_normalize(
+        simd_quatf(angle: -.pi / 26, axis: SIMD3<Float>(0, 1, 0)) *
+          simd_quatf(angle: .pi / 18, axis: SIMD3<Float>(0, 0, 1))
+      )
+
       let rod = makeFishingRodEntity()
-      rod.transform = fishingHeldTransform()
-      anchor.addChild(rod)
+      rod.position = SIMD3<Float>(0, -0.02, 0)
+
+      rig.addChild(leftHand)
+      rig.addChild(rightHand)
+      rig.addChild(rod)
+      anchor.addChild(rig)
       arView.scene.addAnchor(anchor)
       fishingRodAnchor = anchor
+      fishingRigEntity = rig
       fishingRodEntity = rod
+      fishingLeftHandEntity = leftHand
+      fishingRightHandEntity = rightHand
+      debugPrintFishingRigState(context: "created")
     }
 
     @MainActor
-    private func ensureFishingHeldRodPreview(cameraMatrix: simd_float4x4) {
-      guard fishingRodAnchor == nil || fishingRodEntity == nil else {
+    private func ensureFishingHeldRodPreview() {
+      guard fishingRodAnchor == nil || fishingRigEntity == nil || fishingRodEntity == nil else {
         return
       }
 
-      createFishingRodAnchor(cameraMatrix: cameraMatrix)
+      createFishingRodAnchor(cameraMatrix: arView?.session.currentFrame?.camera.transform)
     }
 
     @MainActor
     private func clearFishingHeldRodPreview() {
-      guard fishing.state == .idle || fishing.state == .eligible else {
-        return
-      }
-
       fishingRodAnchor?.removeFromParent()
       fishingRodAnchor = nil
+      fishingRigEntity = nil
       fishingRodEntity = nil
+      fishingLeftHandEntity = nil
+      fishingRightHandEntity = nil
+      fishingRodTipEntity = nil
+      baselineFishingOrientation = nil
+      baselineFishingDownwardPitch = nil
     }
 
     private func makeFishingRodEntity() -> Entity {
       let rod = Entity()
       rod.name = "fishing_rod"
 
-      let line = ModelEntity(
-        mesh: .generateBox(size: SIMD3<Float>(0.003, 0.52, 0.003)),
-        materials: [SimpleMaterial(color: UIColor(red: 0.92, green: 0.96, blue: 1.0, alpha: 0.92), roughness: 0.04, isMetallic: false)]
-      )
-      line.position = SIMD3<Float>(-0.018, 0.23, 0.006)
-      line.orientation = simd_quatf(angle: -.pi / 22, axis: SIMD3<Float>(0, 0, 1))
-      rod.addChild(line)
-
       let handle = ModelEntity(
-        mesh: .generateBox(size: SIMD3<Float>(0.020, 0.24, 0.020)),
+        mesh: .generateBox(size: SIMD3<Float>(0.042, 0.30, 0.042)),
         materials: [Self.scenicMaterial(UIColor(red: 0.34, green: 0.22, blue: 0.12, alpha: 1), roughness: 1.0)]
       )
-      handle.position = SIMD3<Float>(0, -0.04, 0)
+      handle.position = SIMD3<Float>(0, -0.17, 0.02)
       rod.addChild(handle)
+
+      let handleCap = ModelEntity(
+        mesh: .generateSphere(radius: 0.5),
+        materials: [Self.scenicMaterial(UIColor(red: 0.20, green: 0.12, blue: 0.07, alpha: 1), roughness: 0.98)]
+      )
+      handleCap.scale = SIMD3<Float>(0.052, 0.052, 0.052)
+      handleCap.position = SIMD3<Float>(0, -0.33, 0.02)
+      rod.addChild(handleCap)
 
       let reel = ModelEntity(
         mesh: .generateSphere(radius: 0.5),
         materials: [SimpleMaterial(color: UIColor(red: 0.90, green: 0.74, blue: 0.32, alpha: 1), roughness: 0.15, isMetallic: true)]
       )
-      reel.scale = SIMD3<Float>(0.040, 0.040, 0.028)
-      reel.position = SIMD3<Float>(0.020, -0.06, 0.014)
+      reel.scale = SIMD3<Float>(0.050, 0.050, 0.050)
+      reel.position = SIMD3<Float>(0.050, -0.08, 0.030)
       rod.addChild(reel)
 
-      let shaft = ModelEntity(
-        mesh: .generateBox(size: SIMD3<Float>(0.010, 0.62, 0.010)),
+      let lowerRod = ModelEntity(
+        mesh: .generateBox(size: SIMD3<Float>(0.015, 0.015, 0.76)),
         materials: [Self.scenicMaterial(UIColor(red: 0.59, green: 0.42, blue: 0.18, alpha: 1), roughness: 0.78)]
       )
-      shaft.position = SIMD3<Float>(0, 0.23, 0)
-      shaft.orientation = simd_quatf(angle: -.pi / 12, axis: SIMD3<Float>(0, 0, 1))
-      rod.addChild(shaft)
+      lowerRod.position = SIMD3<Float>(0.0, 0.17, -0.28)
+      lowerRod.orientation = simd_quatf(angle: -.pi / 3.7, axis: SIMD3<Float>(1, 0, 0))
+      rod.addChild(lowerRod)
+
+      let upperRod = ModelEntity(
+        mesh: .generateBox(size: SIMD3<Float>(0.010, 0.010, 0.48)),
+        materials: [Self.scenicMaterial(UIColor(red: 0.67, green: 0.52, blue: 0.24, alpha: 1), roughness: 0.72)]
+      )
+      upperRod.position = SIMD3<Float>(0.0, 0.38, -0.58)
+      upperRod.orientation = simd_quatf(angle: -.pi / 3.2, axis: SIMD3<Float>(1, 0, 0))
+      rod.addChild(upperRod)
 
       let tip = ModelEntity(
         mesh: .generateSphere(radius: 0.5),
         materials: [SimpleMaterial(color: UIColor(red: 0.90, green: 0.82, blue: 0.60, alpha: 1), roughness: 0.14, isMetallic: true)]
       )
-      tip.scale = SIMD3<Float>(0.018, 0.018, 0.018)
-      tip.position = SIMD3<Float>(-0.02, 0.50, 0)
+      tip.scale = SIMD3<Float>(0.020, 0.020, 0.020)
+      tip.position = SIMD3<Float>(0.0, 0.54, -0.84)
+      tip.name = "fishing_rod_tip"
       rod.addChild(tip)
+      fishingRodTipEntity = tip
 
-      let rearHand = makeFishingHandEntity(
-        sleeveColor: UIColor(red: 0.13, green: 0.16, blue: 0.20, alpha: 1),
-        skinColor: UIColor(red: 0.88, green: 0.74, blue: 0.62, alpha: 1)
+      let guide = ModelEntity(
+        mesh: .generateBox(size: SIMD3<Float>(0.003, 0.003, 0.18)),
+        materials: [SimpleMaterial(color: UIColor(red: 0.92, green: 0.96, blue: 1.0, alpha: 0.92), roughness: 0.04, isMetallic: false)]
       )
-      rearHand.position = SIMD3<Float>(0.07, -0.12, 0.04)
-      rearHand.orientation = simd_quatf(angle: -.pi / 16, axis: SIMD3<Float>(0, 1, 0))
-      rod.addChild(rearHand)
-
-      let frontHand = makeFishingHandEntity(
-        sleeveColor: UIColor(red: 0.18, green: 0.22, blue: 0.28, alpha: 1),
-        skinColor: UIColor(red: 0.88, green: 0.74, blue: 0.62, alpha: 1)
-      )
-      frontHand.position = SIMD3<Float>(-0.03, 0.01, -0.02)
-      frontHand.orientation = simd_quatf(angle: .pi / 8, axis: SIMD3<Float>(0, 1, 0))
-      frontHand.scale = SIMD3<Float>(0.92, 0.92, 0.92)
-      rod.addChild(frontHand)
+      guide.position = SIMD3<Float>(0.0, 0.46, -0.72)
+      guide.orientation = simd_quatf(angle: -.pi / 3.2, axis: SIMD3<Float>(1, 0, 0))
+      rod.addChild(guide)
 
       return rod
     }
 
-    private func makeFishingHandEntity(sleeveColor: UIColor, skinColor: UIColor) -> Entity {
+    private func makeFishingHandEntity(side: FishingHandSide, sleeveColor: UIColor, skinColor: UIColor) -> Entity {
       let hand = Entity()
+      let direction: Float = side == .left ? -1 : 1
 
       let forearm = ModelEntity(
-        mesh: .generateBox(size: SIMD3<Float>(0.10, 0.08, 0.12)),
+        mesh: .generateBox(size: SIMD3<Float>(0.14, 0.22, 0.14)),
         materials: [Self.scenicMaterial(sleeveColor, roughness: 0.96)]
       )
-      forearm.position = SIMD3<Float>(0.05, -0.02, 0.08)
+      forearm.position = SIMD3<Float>(direction * 0.05, -0.15, 0.05)
+      forearm.orientation = simd_quatf(angle: direction * -.pi / 7, axis: SIMD3<Float>(0, 0, 1))
       hand.addChild(forearm)
 
       let palm = ModelEntity(
-        mesh: .generateBox(size: SIMD3<Float>(0.062, 0.042, 0.068)),
+        mesh: .generateBox(size: SIMD3<Float>(0.078, 0.050, 0.080)),
         materials: [Self.scenicMaterial(skinColor, roughness: 0.92)]
       )
-      palm.position = SIMD3<Float>(0.0, 0.0, 0.0)
+      palm.position = SIMD3<Float>(0.0, -0.01, 0.0)
       hand.addChild(palm)
 
       let thumb = ModelEntity(
-        mesh: .generateBox(size: SIMD3<Float>(0.024, 0.026, 0.034)),
+        mesh: .generateBox(size: SIMD3<Float>(0.026, 0.028, 0.036)),
         materials: [Self.scenicMaterial(skinColor, roughness: 0.92)]
       )
-      thumb.position = SIMD3<Float>(0.025, -0.010, 0.034)
-      thumb.orientation = simd_quatf(angle: -.pi / 6, axis: SIMD3<Float>(0, 1, 0))
+      thumb.position = SIMD3<Float>(direction * 0.038, -0.008, 0.030)
+      thumb.orientation = simd_quatf(angle: direction * -.pi / 6, axis: SIMD3<Float>(0, 1, 0))
       hand.addChild(thumb)
+
+      let knuckles = ModelEntity(
+        mesh: .generateBox(size: SIMD3<Float>(0.074, 0.022, 0.030)),
+        materials: [Self.scenicMaterial(skinColor.withAlphaComponent(0.98), roughness: 0.90)]
+      )
+      knuckles.position = SIMD3<Float>(0.0, 0.020, 0.018)
+      hand.addChild(knuckles)
 
       return hand
     }
 
     @MainActor
     private func animateFishingRod(to transform: Transform, duration: TimeInterval, timingFunction: AnimationTimingFunction) {
-      guard let rod = fishingRodEntity,
-            let parent = rod.parent else {
+      guard let rig = fishingRigEntity,
+            let parent = rig.parent else {
         return
       }
 
-      rod.move(to: transform, relativeTo: parent, duration: duration, timingFunction: timingFunction)
+      rig.move(to: transform, relativeTo: parent, duration: duration, timingFunction: timingFunction)
     }
 
     @MainActor
-    private func castFishingBobber(from cameraMatrix: simd_float4x4, to pondTarget: SIMD3<Float>) {
+    private func castFishingBobber(to pondTarget: SIMD3<Float>) {
       guard let arView else {
         return
       }
 
       fishingBobberAnchor?.removeFromParent()
-      let cameraPosition = simd_make_float3(cameraMatrix.columns.3)
-      let forward = normalized3(-simd_make_float3(cameraMatrix.columns.2), fallback: SIMD3<Float>(0, 0, -1))
-      let right = normalized3(simd_make_float3(cameraMatrix.columns.0), fallback: SIMD3<Float>(1, 0, 0))
-      let up = normalized3(simd_make_float3(cameraMatrix.columns.1), fallback: SIMD3<Float>(0, 1, 0))
-      let forwardOffset: SIMD3<Float> = forward * 0.34
-      let lateralOffset: SIMD3<Float> = right * 0.12
-      let verticalOffset: SIMD3<Float> = up * -0.10
-      let startPosition: SIMD3<Float> = cameraPosition + forwardOffset + lateralOffset + verticalOffset
+      let startPosition = fishingRodTipEntity?.position(relativeTo: nil) ?? SIMD3<Float>(0, 0, 0)
+      let target = fishingCastTargetWorldPosition(from: startPosition, pondTarget: pondTarget)
 
       let anchor = AnchorEntity(world: worldMatrix(translation: startPosition))
       let bobber = makeFishingBobberEntity()
@@ -20503,13 +21671,13 @@ private struct NativeARView: UIViewRepresentable {
       fishingBobberAnchor = anchor
       fishingBobberEntity = bobber
 
-      let target = pondTarget + SIMD3<Float>(0, 0.012, 0)
       anchor.move(
         to: worldTransform(translation: target),
         relativeTo: nil as Entity?,
         duration: 0.78,
         timingFunction: AnimationTimingFunction.easeInOut
       )
+      debugPrintFishingRigState(context: "cast")
     }
 
     private func makeFishingBobberEntity() -> ModelEntity {
@@ -20528,27 +21696,38 @@ private struct NativeARView: UIViewRepresentable {
         return
       }
 
-      let dive = Transform(
-        scale: SIMD3<Float>(repeating: 1),
-        rotation: simd_quatf(angle: .pi / 10, axis: SIMD3<Float>(1, 0, 0)),
-        translation: SIMD3<Float>(0, -0.026, -0.010)
+      let dive = transformed(
+        bobber.transform,
+        translation: SIMD3<Float>(0, -0.026, -0.010),
+        rotation: simd_quatf(angle: .pi / 10, axis: SIMD3<Float>(1, 0, 0))
       )
       bobber.move(to: dive, relativeTo: parent, duration: 0.10, timingFunction: .easeIn)
     }
 
     @MainActor
     private func animateFishingBobberHookLift() {
-      guard let bobber = fishingBobberAnchor else {
+      guard let bobberAnchor = fishingBobberAnchor else {
         return
       }
 
-      let current = bobber.transform
+      if let bobberEntity = fishingBobberEntity,
+         let parent = bobberEntity.parent {
+        let tightened = transformed(
+          bobberEntity.transform,
+          translation: SIMD3<Float>(0, 0.010, 0.012),
+          rotation: simd_quatf(angle: -.pi / 12, axis: SIMD3<Float>(1, 0, 0)),
+          scale: bobberEntity.transform.scale * 0.88
+        )
+        bobberEntity.move(to: tightened, relativeTo: parent, duration: 0.18, timingFunction: .easeOut)
+      }
+
+      let current = bobberAnchor.transform
       let lifted = Transform(
         scale: current.scale,
         rotation: current.rotation,
         translation: current.translation + SIMD3<Float>(0, 0.18, 0.04)
       )
-      bobber.move(
+      bobberAnchor.move(
         to: lifted,
         relativeTo: nil as Entity?,
         duration: 0.24,
@@ -20563,24 +21742,44 @@ private struct NativeARView: UIViewRepresentable {
         return
       }
 
+      if let bobberEntity = fishingBobberEntity,
+         let parent = bobberEntity.parent {
+        let tuckedAway = transformed(
+          bobberEntity.transform,
+          translation: SIMD3<Float>(0, 0.030, 0.020),
+          scale: bobberEntity.transform.scale * 0.45
+        )
+        bobberEntity.move(to: tuckedAway, relativeTo: parent, duration: 0.16, timingFunction: .easeIn)
+      }
+
+      let bobberAnchorToClear = fishingBobberAnchor
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.20) { [weak self, weak bobberAnchorToClear] in
+        bobberAnchorToClear?.removeFromParent()
+        if self?.fishingBobberAnchor === bobberAnchorToClear {
+          self?.fishingBobberAnchor = nil
+          self?.fishingBobberEntity = nil
+        }
+      }
+
       fishingFishAnchor?.removeFromParent()
       let anchor = AnchorEntity(world: worldMatrix(translation: pondTarget))
       let fish = makeFishingFishEntity()
       fish.transform = Transform(
-        scale: SIMD3<Float>(repeating: 0.72),
+        scale: SIMD3<Float>(repeating: 0.84),
         rotation: simd_quatf(angle: -.pi / 10, axis: SIMD3<Float>(0, 1, 0)),
-        translation: SIMD3<Float>(0, -0.08, 0)
+        translation: SIMD3<Float>(0, -0.06, 0)
       )
       anchor.addChild(fish)
       arView.scene.addAnchor(anchor)
       fishingFishAnchor = anchor
       fishingFishEntity = fish
+      fishingFishFloatStartedAt = CACurrentMediaTime()
 
       fish.move(
         to: Transform(
-          scale: SIMD3<Float>(repeating: 1),
-          rotation: simd_quatf(angle: .pi / 14, axis: SIMD3<Float>(0, 1, 0)),
-          translation: SIMD3<Float>(0.02, 0.28, 0.05)
+          scale: SIMD3<Float>(repeating: 1.08),
+          rotation: simd_quatf(angle: .pi / 11, axis: SIMD3<Float>(0, 1, 0)),
+          translation: SIMD3<Float>(0.03, 0.34, 0.09)
         ),
         relativeTo: anchor,
         duration: 0.78,
@@ -20598,7 +21797,7 @@ private struct NativeARView: UIViewRepresentable {
               self.fishing.state == .caught else {
           return
         }
-        self.fishing.revealRewardNote(
+        self.fishing.armRewardFromCaughtFish(
           lines: rewardLines.isEmpty
             ? [
                 "1. No Stockfish line ready yet.",
@@ -20618,6 +21817,7 @@ private struct NativeARView: UIViewRepresentable {
         materials: [Self.scenicMaterial(UIColor(red: 0.89, green: 0.59, blue: 0.26, alpha: 1), roughness: 0.62)]
       )
       body.scale = SIMD3<Float>(0.20, 0.12, 0.10)
+      body.generateCollisionShapes(recursive: false)
       fish.addChild(body)
 
       let tail = ModelEntity(
@@ -20626,6 +21826,7 @@ private struct NativeARView: UIViewRepresentable {
       )
       tail.position = SIMD3<Float>(-0.11, 0, 0)
       tail.orientation = simd_quatf(angle: .pi / 4, axis: SIMD3<Float>(0, 0, 1))
+      tail.generateCollisionShapes(recursive: false)
       fish.addChild(tail)
 
       let fin = ModelEntity(
@@ -20634,15 +21835,19 @@ private struct NativeARView: UIViewRepresentable {
       )
       fin.position = SIMD3<Float>(0.01, 0.06, 0)
       fin.orientation = simd_quatf(angle: -.pi / 8, axis: SIMD3<Float>(0, 0, 1))
+      fin.generateCollisionShapes(recursive: false)
       fish.addChild(fin)
 
-      let eye = ModelEntity(
-        mesh: .generateSphere(radius: 0.5),
-        materials: [SimpleMaterial(color: UIColor(red: 0.10, green: 0.12, blue: 0.15, alpha: 1), roughness: 0.24, isMetallic: false)]
-      )
-      eye.scale = SIMD3<Float>(0.016, 0.016, 0.016)
-      eye.position = SIMD3<Float>(0.06, 0.02, 0.032)
-      fish.addChild(eye)
+      for side in [Float(-1), Float(1)] {
+        let eye = ModelEntity(
+          mesh: .generateSphere(radius: 0.5),
+          materials: [SimpleMaterial(color: UIColor(red: 0.10, green: 0.12, blue: 0.15, alpha: 1), roughness: 0.24, isMetallic: false)]
+        )
+        eye.scale = SIMD3<Float>(0.016, 0.016, 0.016)
+        eye.position = SIMD3<Float>(0.06, 0.02, 0.032 * side)
+        eye.generateCollisionShapes(recursive: false)
+        fish.addChild(eye)
+      }
 
       let note = ModelEntity(
         mesh: .generateBox(size: SIMD3<Float>(0.090, 0.050, 0.010)),
@@ -20650,9 +21855,91 @@ private struct NativeARView: UIViewRepresentable {
       )
       note.position = SIMD3<Float>(0.10, -0.01, 0)
       note.orientation = simd_quatf(angle: .pi / 18, axis: SIMD3<Float>(0, 0, 1))
+      note.generateCollisionShapes(recursive: false)
       fish.addChild(note)
 
       return fish
+    }
+
+    @MainActor
+    private func updateFishingPondSurfaceMotion() {
+      guard let fin = fishingPondFinEntity else {
+        return
+      }
+
+      let now = CACurrentMediaTime()
+      if fishingPondFinTravelDuration <= 0 {
+        resetFishingPondFinPath(from: fin.position)
+      }
+
+      let rawProgress = Float((now - fishingPondFinTravelStartedAt) / Double(fishingPondFinTravelDuration))
+      let progress = clamp(rawProgress, min: 0, max: 1)
+      let eased = progress * progress * (3 - (2 * progress))
+      let travelPosition = interpolatedVector(
+        fishingPondFinStartLocalPosition,
+        fishingPondFinTargetLocalPosition,
+        progress: eased
+      )
+      let bob = sin(Float(now) * 3.8) * 0.003
+      let heading = normalized3(
+        fishingPondFinTargetLocalPosition - fishingPondFinStartLocalPosition,
+        fallback: SIMD3<Float>(0, 0, 1)
+      )
+      let yaw = atan2(heading.x, heading.z)
+      fin.position = SIMD3<Float>(travelPosition.x, 0.031 + bob, travelPosition.z)
+      fin.orientation = simd_normalize(
+        simd_quatf(angle: yaw, axis: SIMD3<Float>(0, 1, 0)) *
+          simd_quatf(angle: (.pi / 12) + (sin(Float(now) * 5.0) * 0.08), axis: SIMD3<Float>(0, 0, 1))
+      )
+
+      if progress >= 0.999 {
+        resetFishingPondFinPath(from: travelPosition)
+      }
+    }
+
+    private func resetFishingPondFinPath(from start: SIMD3<Float>) {
+      fishingPondFinStartLocalPosition = SIMD3<Float>(start.x, 0.031, start.z)
+      var nextTarget = randomFishingPondFinLocalPoint()
+      var attempts = 0
+      while simd_length(nextTarget - fishingPondFinStartLocalPosition) < 0.10 && attempts < 6 {
+        nextTarget = randomFishingPondFinLocalPoint()
+        attempts += 1
+      }
+      fishingPondFinTargetLocalPosition = nextTarget
+      fishingPondFinTravelStartedAt = CACurrentMediaTime()
+      fishingPondFinTravelDuration = Float.random(in: 2.6...4.8)
+    }
+
+    private func randomFishingPondFinLocalPoint() -> SIMD3<Float> {
+      let angle = Float.random(in: 0..<(Float.pi * 2))
+      let radius = sqrt(Float.random(in: 0.04...1.0)) * 0.34
+      return SIMD3<Float>(cos(angle) * radius, 0.031, sin(angle) * radius)
+    }
+
+    @MainActor
+    private func updateFishingCaughtFishMotion() {
+      guard fishing.state == .caught,
+            let fish = fishingFishEntity,
+            let startedAt = fishingFishFloatStartedAt else {
+        return
+      }
+
+      let elapsed = Float(CACurrentMediaTime() - startedAt)
+      guard elapsed >= 0.82 else {
+        return
+      }
+
+      let hoverTime = elapsed - 0.82
+      let yaw = (.pi / 11) + (hoverTime * 0.60)
+      let roll = sin(hoverTime * 1.15) * 0.08
+      fish.transform = Transform(
+        scale: SIMD3<Float>(repeating: 1.08),
+        rotation: simd_normalize(
+          simd_quatf(angle: yaw, axis: SIMD3<Float>(0, 1, 0)) *
+            simd_quatf(angle: roll, axis: SIMD3<Float>(0, 0, 1))
+        ),
+        translation: SIMD3<Float>(0.03, 0.34 + (sin(hoverTime * 1.45) * 0.016), 0.09)
+      )
     }
 
     private func fishingPondCastTargetWorldPosition() -> SIMD3<Float>? {
@@ -20673,64 +21960,282 @@ private struct NativeARView: UIViewRepresentable {
       return matrix
     }
 
-    private func fishingHeldTransform() -> Transform {
-      Transform(
-        scale: SIMD3<Float>(repeating: 1),
-        rotation: simd_normalize(
-          simd_quatf(angle: -.pi / 3.3, axis: SIMD3<Float>(0, 1, 0)) *
-            simd_quatf(angle: -.pi / 7, axis: SIMD3<Float>(1, 0, 0)) *
-            simd_quatf(angle: .pi / 8, axis: SIMD3<Float>(0, 0, 1))
-        ),
-        translation: SIMD3<Float>(0.18, -0.18, -0.42)
+    private func fishingHeldTransform(
+      cameraMatrix: simd_float4x4? = nil,
+      pondTarget: SIMD3<Float>? = nil
+    ) -> Transform {
+      _ = pondTarget
+      return fishingFirstPersonTransform(
+        cameraMatrix: cameraMatrix,
+        translation: Self.fishingRigBasePosition,
+        scale: 1.0,
+        pitchAngle: Self.fishingRigBasePitch,
+        yawAngle: Self.fishingRigBaseYaw,
+        rollAngle: Self.fishingRigBaseRoll
       )
     }
 
-    private func fishingCastTransform() -> Transform {
-      Transform(
-        scale: SIMD3<Float>(repeating: 1),
-        rotation: simd_normalize(
-          simd_quatf(angle: -.pi / 2.3, axis: SIMD3<Float>(0, 1, 0)) *
-            simd_quatf(angle: -.pi / 11, axis: SIMD3<Float>(1, 0, 0)) *
-            simd_quatf(angle: .pi / 5.8, axis: SIMD3<Float>(0, 0, 1))
-        ),
-        translation: SIMD3<Float>(0.08, -0.10, -0.70)
+    private func fishingCastTransform(
+      cameraMatrix: simd_float4x4? = nil,
+      pondTarget: SIMD3<Float>? = nil
+    ) -> Transform {
+      _ = pondTarget
+      return fishingFirstPersonTransform(
+        cameraMatrix: cameraMatrix,
+        translation: Self.fishingRigBasePosition + SIMD3<Float>(0.00, 0.02, 0.03),
+        scale: 1.0,
+        pitchAngle: -.pi / 64,
+        yawAngle: 0,
+        rollAngle: -.pi / 96
       )
     }
 
-    private func fishingWaitingTransform() -> Transform {
-      Transform(
-        scale: SIMD3<Float>(repeating: 1),
-        rotation: simd_normalize(
-          simd_quatf(angle: -.pi / 2.7, axis: SIMD3<Float>(0, 1, 0)) *
-            simd_quatf(angle: -.pi / 14, axis: SIMD3<Float>(1, 0, 0)) *
-            simd_quatf(angle: .pi / 8.5, axis: SIMD3<Float>(0, 0, 1))
-        ),
-        translation: SIMD3<Float>(0.12, -0.12, -0.58)
+    private func fishingWaitingTransform(
+      cameraMatrix: simd_float4x4? = nil,
+      pondTarget: SIMD3<Float>? = nil
+    ) -> Transform {
+      _ = pondTarget
+      return fishingFirstPersonTransform(
+        cameraMatrix: cameraMatrix,
+        translation: Self.fishingRigBasePosition + SIMD3<Float>(0.00, 0.005, 0.00),
+        scale: 1.0,
+        pitchAngle: 0,
+        yawAngle: 0,
+        rollAngle: -.pi / 120
       )
     }
 
-    private func fishingBiteTransform() -> Transform {
-      Transform(
-        scale: SIMD3<Float>(repeating: 1),
-        rotation: simd_normalize(
-          simd_quatf(angle: -.pi / 2.35, axis: SIMD3<Float>(0, 1, 0)) *
-            simd_quatf(angle: -.pi / 5.4, axis: SIMD3<Float>(1, 0, 0)) *
-            simd_quatf(angle: .pi / 5.8, axis: SIMD3<Float>(0, 0, 1))
-        ),
-        translation: SIMD3<Float>(0.10, -0.05, -0.34)
+    private func fishingBiteTransform(
+      cameraMatrix: simd_float4x4? = nil,
+      pondTarget: SIMD3<Float>? = nil
+    ) -> Transform {
+      _ = pondTarget
+      return fishingFirstPersonTransform(
+        cameraMatrix: cameraMatrix,
+        translation: Self.fishingRigBasePosition + SIMD3<Float>(0.00, 0.03, 0.03),
+        scale: 1.0,
+        pitchAngle: -.pi / 72,
+        yawAngle: 0,
+        rollAngle: .pi / 96
       )
     }
 
-    private func fishingCatchPullTransform() -> Transform {
-      Transform(
-        scale: SIMD3<Float>(repeating: 1),
-        rotation: simd_normalize(
-          simd_quatf(angle: -.pi / 2.1, axis: SIMD3<Float>(0, 1, 0)) *
-            simd_quatf(angle: -.pi / 2.9, axis: SIMD3<Float>(1, 0, 0)) *
-            simd_quatf(angle: .pi / 9, axis: SIMD3<Float>(0, 0, 1))
-        ),
-        translation: SIMD3<Float>(0.04, 0.02, -0.26)
+    private func fishingCatchPullTransform(
+      cameraMatrix: simd_float4x4? = nil,
+      pondTarget: SIMD3<Float>? = nil
+    ) -> Transform {
+      _ = pondTarget
+      return fishingFirstPersonTransform(
+        cameraMatrix: cameraMatrix,
+        translation: Self.fishingRigBasePosition + SIMD3<Float>(0.00, 0.07, 0.07),
+        scale: 1.0,
+        pitchAngle: -.pi / 18,
+        yawAngle: 0,
+        rollAngle: -.pi / 84
       )
+    }
+
+    private func currentFishingWaitingTransform() -> Transform {
+      fishingWaitingTransform(
+        cameraMatrix: arView?.session.currentFrame?.camera.transform,
+        pondTarget: fishingPondCastTargetWorldPosition()
+      )
+    }
+
+    private func currentFishingBiteTransform() -> Transform {
+      fishingBiteTransform(
+        cameraMatrix: arView?.session.currentFrame?.camera.transform,
+        pondTarget: fishingPondCastTargetWorldPosition()
+      )
+    }
+
+    private func currentFishingCatchPullTransform() -> Transform {
+      fishingCatchPullTransform(
+        cameraMatrix: arView?.session.currentFrame?.camera.transform,
+        pondTarget: fishingPondCastTargetWorldPosition()
+      )
+    }
+
+    private func fishingFirstPersonTransform(
+      cameraMatrix: simd_float4x4? = nil,
+      translation: SIMD3<Float>,
+      scale: Float,
+      pitchAngle: Float,
+      yawAngle: Float,
+      rollAngle: Float
+    ) -> Transform {
+      let relativePitchDelta = fishingRigRelativePitchDeltaFromBaseline(cameraMatrix: cameraMatrix)
+      let finalPitch = pitchAngle - relativePitchDelta
+      let pitch = simd_quatf(angle: finalPitch, axis: SIMD3<Float>(1, 0, 0))
+      let yaw = simd_quatf(angle: yawAngle, axis: SIMD3<Float>(0, 1, 0))
+      let roll = simd_quatf(angle: rollAngle, axis: SIMD3<Float>(0, 0, 1))
+      let rotation = simd_normalize(yaw * roll * pitch)
+      var adjustedTranslation = translation
+
+      if let cameraMatrix,
+         let groundPlaneHeight = fishingGroundPlaneHeight() {
+        let lowestWorldY = fishingRigLowestWorldY(
+          cameraMatrix: cameraMatrix,
+          translation: adjustedTranslation,
+          rotation: rotation
+        )
+        let minimumAllowedY = groundPlaneHeight + Self.fishingRigGroundClearance
+        if lowestWorldY < minimumAllowedY {
+          let cameraUp = normalized3(simd_make_float3(cameraMatrix.columns.1), fallback: SIMD3<Float>(0, 1, 0))
+          let worldLiftNeeded = minimumAllowedY - lowestWorldY
+          let localLift = worldLiftNeeded / max(cameraUp.y, Self.fishingRigMinimumCameraUpComponent)
+          adjustedTranslation.y += localLift
+        }
+      }
+
+      return Transform(
+        scale: SIMD3<Float>(repeating: scale),
+        rotation: rotation,
+        translation: adjustedTranslation
+      )
+    }
+
+    private func captureFishingBaselineIfNeeded(cameraMatrix: simd_float4x4?) {
+      guard baselineFishingOrientation == nil,
+            let cameraMatrix else {
+        return
+      }
+
+      baselineFishingOrientation = cameraMatrix
+      baselineFishingDownwardPitch = fishingDownwardPitch(for: cameraMatrix)
+    }
+
+    private func fishingGroundPlaneHeight() -> Float? {
+      if let boardAnchor {
+        return boardAnchor.position(relativeTo: nil).y + Self.fishingTerrainPlaneLocalY
+      }
+
+      if let boardWorldTransform {
+        return boardWorldTransform.columns.3.y + Self.fishingTerrainPlaneLocalY
+      }
+
+      return nil
+    }
+
+    private func fishingRigLowestWorldY(
+      cameraMatrix: simd_float4x4,
+      translation: SIMD3<Float>,
+      rotation: simd_quatf
+    ) -> Float {
+      fishingRigLowestWorldY(
+        rigWorldMatrix: cameraMatrix * localMatrix(translation: translation, rotation: rotation)
+      )
+    }
+
+    private func fishingRigLowestWorldY(rigWorldMatrix: simd_float4x4) -> Float {
+      fishingRigLowestSampleLocalPoints()
+        .map { point in
+          let worldPoint = rigWorldMatrix * SIMD4<Float>(point.x, point.y, point.z, 1)
+          return worldPoint.y
+        }
+        .min() ?? rigWorldMatrix.columns.3.y
+    }
+
+    private func fishingRigLowestSampleLocalPoints() -> [SIMD3<Float>] {
+      [
+        SIMD3<Float>(0.0, -0.376, 0.020),
+        SIMD3<Float>(0.021, -0.340, 0.041),
+        SIMD3<Float>(-0.021, -0.340, -0.001),
+        SIMD3<Float>(-0.170, -0.332, 0.050),
+        SIMD3<Float>(-0.070, -0.332, 0.050),
+        SIMD3<Float>(0.070, -0.332, 0.050),
+        SIMD3<Float>(0.170, -0.332, 0.050),
+        SIMD3<Float>(0.0, 0.530, -0.840),
+        SIMD3<Float>(0.0, 0.460, -0.720),
+        SIMD3<Float>(0.0, 0.380, -0.600),
+        SIMD3<Float>(0.0, 0.250, -0.400),
+      ]
+    }
+
+    private func localMatrix(translation: SIMD3<Float>, rotation: simd_quatf) -> simd_float4x4 {
+      var matrix = simd_float4x4(rotation)
+      matrix.columns.3 = SIMD4<Float>(translation.x, translation.y, translation.z, 1)
+      return matrix
+    }
+
+    private func fishingRigRelativePitchDeltaFromBaseline(cameraMatrix: simd_float4x4?) -> Float {
+      guard let cameraMatrix,
+            let baselineDownwardPitch = baselineFishingDownwardPitch else {
+        return Self.fishingRigRelativePitchDeltaMin
+      }
+
+      let currentDownwardPitch = fishingDownwardPitch(for: cameraMatrix)
+      let upwardDeltaFromBaseline = baselineDownwardPitch - currentDownwardPitch
+      return clamp(
+        upwardDeltaFromBaseline,
+        min: Self.fishingRigRelativePitchDeltaMin,
+        max: Self.fishingRigRelativePitchDeltaMax
+      )
+    }
+
+    private func fishingDownwardPitch(for cameraMatrix: simd_float4x4) -> Float {
+      let forward = normalized3(-simd_make_float3(cameraMatrix.columns.2), fallback: SIMD3<Float>(0, 0, -1))
+      let horizontalLength = max(sqrt((forward.x * forward.x) + (forward.z * forward.z)), 0.0001)
+      return atan2(max(0, -forward.y), horizontalLength)
+    }
+
+    private func fishingCastTargetWorldPosition(
+      from rodTipWorldPosition: SIMD3<Float>,
+      pondTarget: SIMD3<Float>
+    ) -> SIMD3<Float> {
+      guard let tip = fishingRodTipEntity else {
+        return pondTarget + SIMD3<Float>(0, 0.012, 0)
+      }
+
+      let tipForward = normalized3(
+        -simd_make_float3(tip.transformMatrix(relativeTo: nil).columns.2),
+        fallback: normalized3(pondTarget - rodTipWorldPosition, fallback: SIMD3<Float>(0, -1, 0))
+      )
+      let waterY = pondTarget.y + 0.012
+      let denominator = tipForward.y
+      guard abs(denominator) > 0.0001 else {
+        return pondTarget + SIMD3<Float>(0, 0.012, 0)
+      }
+
+      let travel = (waterY - rodTipWorldPosition.y) / denominator
+      guard travel > 0 else {
+        return pondTarget + SIMD3<Float>(0, 0.012, 0)
+      }
+
+      let intersection = rodTipWorldPosition + (tipForward * travel)
+      let pondOffset = SIMD2<Float>(intersection.x - pondTarget.x, intersection.z - pondTarget.z)
+      guard simd_length(pondOffset) <= 0.72 else {
+        return pondTarget + SIMD3<Float>(0, 0.012, 0)
+      }
+
+      return SIMD3<Float>(intersection.x, waterY, intersection.z)
+    }
+
+    private func debugPrintFishingRigState(context: String) {
+      guard let anchor = fishingRodAnchor,
+            let rig = fishingRigEntity,
+            let leftHand = fishingLeftHandEntity,
+            let rightHand = fishingRightHandEntity,
+            let tip = fishingRodTipEntity else {
+        return
+      }
+
+      let usesCameraAnchor = anchor.name == "fishing_camera_anchor"
+      let currentRelativePitchDelta = fishingRigRelativePitchDeltaFromBaseline(cameraMatrix: arView?.session.currentFrame?.camera.transform)
+      let lowestDetectedY = fishingRigLowestWorldY(rigWorldMatrix: rig.transformMatrix(relativeTo: nil))
+      let groundPlaneHeight = fishingGroundPlaneHeight()
+      print("Fishing debug [\(context)] captured baseline fishing orientation: \(String(describing: baselineFishingOrientation))")
+      print("Fishing debug [\(context)] current relative pitch delta from baseline: \(currentRelativePitchDelta)")
+      print("Fishing debug [\(context)] clamp range being applied: min=\(Self.fishingRigRelativePitchDeltaMin) max=\(Self.fishingRigRelativePitchDeltaMax)")
+      print("Fishing debug [\(context)] final local transform of the fishing rig: \(rig.transform)")
+      print("Fishing debug [\(context)] rig local position: \(rig.position)")
+      print("Fishing debug [\(context)] left hand local position: \(leftHand.position)")
+      print("Fishing debug [\(context)] right hand local position: \(rightHand.position)")
+      print("Fishing debug [\(context)] rod tip world transform: \(tip.transformMatrix(relativeTo: nil))")
+      print("Fishing debug [\(context)] parent anchor is AnchorEntity(.camera): \(usesCameraAnchor)")
+      print("Fishing debug [\(context)] current fishing rig position: \(rig.position)")
+      print("Fishing debug [\(context)] lowest detected Y value of the rig: \(lowestDetectedY)")
+      print("Fishing debug [\(context)] ground plane height used for clamp: \(String(describing: groundPlaneHeight))")
     }
 
     private func refreshBoardPresentation() {
@@ -20789,6 +22294,15 @@ private struct NativeARView: UIViewRepresentable {
           )
         }
 
+        if piece.color == pieceRoleSnapshot.currentPlayer,
+           let roleAssignment = pieceRoleSnapshot.assignmentsBySquare[square] {
+          attachPieceRoleAccessory(
+            to: pieceEntity,
+            piece: piece,
+            roleType: roleAssignment.roleType
+          )
+        }
+
         piecesContainer.addChild(pieceEntity)
       }
     }
@@ -20823,6 +22337,15 @@ private struct NativeARView: UIViewRepresentable {
         )
         speakingHighlight.position = boardPosition(speakingPieceHighlightSquare, squareSize: squareSize) + SIMD3<Float>(0, 0.0034, 0)
         highlightsContainer.addChild(speakingHighlight)
+      }
+
+      if let wantedPosterHighlightSquare {
+        let wantedHighlight = makeHighlightEntity(
+          size: squareSize * 0.96,
+          color: UIColor(red: 0.94, green: 0.68, blue: 0.17, alpha: 0.48)
+        )
+        wantedHighlight.position = boardPosition(wantedPosterHighlightSquare, squareSize: squareSize) + SIMD3<Float>(0, 0.0035, 0)
+        highlightsContainer.addChild(wantedHighlight)
       }
 
       if mode.isLessonMode,
@@ -20929,6 +22452,19 @@ private struct NativeARView: UIViewRepresentable {
           return BoardSquare(file: file, rank: rank)
         }
 
+        current = candidate.parent
+      }
+
+      return nil
+    }
+
+    private func fishingFishRoot(for entity: Entity) -> Entity? {
+      var current: Entity? = entity
+
+      while let candidate = current {
+        if candidate.name == "fishing_reward_fish" {
+          return candidate
+        }
         current = candidate.parent
       }
 
