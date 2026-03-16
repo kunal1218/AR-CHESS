@@ -16,6 +16,7 @@ if str(SERVER_APP_ROOT) not in sys.path:
 
 from main import (  # noqa: E402
     app,
+    build_gemini_coach_query,
     build_passive_narrator_line_query,
     build_narrator_prompt,
     build_narrator_turn_addon,
@@ -1116,6 +1117,16 @@ def test_build_narrator_prompt_appends_selected_personality() -> None:
     assert narrator_personality_addon("silky") in silky_prompt
     assert narrator_personality_addon("fletcher") in fletcher_prompt
     assert "Do not just roleplay anger. Teach through the anger." in fletcher_prompt
+
+
+def test_build_gemini_coach_query_requires_direct_second_person_coaching() -> None:
+    prompt = build_gemini_coach_query()
+
+    assert "direct face-to-face coaching for the player in second person" in prompt
+    assert "Each coach line must begin with one of these openings" in prompt
+    assert "You should" in prompt
+    assert "I think your" in prompt
+    assert "White should" in prompt
 
 
 def test_parse_gemini_coach_response_extracts_json_object() -> None:

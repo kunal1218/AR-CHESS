@@ -135,6 +135,7 @@ def test_build_socratic_system_prompt_appends_silky_personality() -> None:
     prompt = build_socratic_system_prompt("silky")
 
     assert "You are a Socratic chess coach." in prompt
+    assert 'Start your first sentence with a direct player-facing opening such as "You should..."' in prompt
     assert "smooth, charismatic chess narrator" in prompt
     assert "Vary your commentary rhythm using two speaking styles." in prompt
     assert "never exceed 5 short sentences" in prompt

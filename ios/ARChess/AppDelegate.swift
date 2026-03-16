@@ -11297,13 +11297,48 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
   private func applyCoachCommentary(_ commentary: GeminiCoachCommentary) {
     let normalizedLines = uniquePreservingOrder(
       commentary.coachLines.map {
-        $0.trimmingCharacters(in: .whitespacesAndNewlines)
+        normalizedDirectCoachLine($0)
       }.filter { !$0.isEmpty }
     )
     coachLines = normalizedLines
     recordCoachDialogueLines(normalizedLines)
     topWorkers = Array(commentary.topWorkers.prefix(3))
     topTraitors = Array(commentary.topTraitors.prefix(3))
+  }
+
+  private func normalizedDirectCoachLine(_ rawLine: String) -> String {
+    let trimmed = rawLine
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+      .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+    guard !trimmed.isEmpty else {
+      return ""
+    }
+
+    let lowered = trimmed.lowercased()
+    let acceptedLeadIns = [
+      "you should ",
+      "you need to ",
+      "your best plan is ",
+      "i think your ",
+      "i think you ",
+    ]
+    if acceptedLeadIns.contains(where: { lowered.hasPrefix($0) }) {
+      return trimmed
+    }
+
+    if lowered.hasPrefix("your ") {
+      return "I think \(lowercasedSentenceStart(trimmed))"
+    }
+
+    return "You should think about \(lowercasedSentenceStart(trimmed))"
+  }
+
+  private func lowercasedSentenceStart(_ text: String) -> String {
+    guard let first = text.first else {
+      return text
+    }
+
+    return first.lowercased() + String(text.dropFirst())
   }
 
   private func narrateGeminiHintIfNeeded(text: String, key: String, allowRepeat: Bool = false) {
@@ -14820,8 +14855,8 @@ private final class CosmeticsCreatorRoomStore: ObservableObject {
     }
 
     selectedPieceKind = pieceKind
-    previewYaw = 0
-    previewPitch = 0
+    previewYaw = defaultYaw
+    previewPitch = defaultPitch
     previewSpinRevision += 1
     cosmetics.setLastViewed(pieceKind: pieceKind)
     ensureSelectedCategoryIsValid()
@@ -15068,9 +15103,7 @@ private enum ChessPieceVisualFactory {
 
   private static func pieceRoleCarryHand(for kind: ChessPieceKind) -> PieceCosmeticCarryHandSide {
     switch kind {
-    case .pawn:
-      return .right
-    case .rook, .bishop:
+    case .pawn, .rook, .bishop:
       return .left
     case .knight, .queen, .king:
       return .right
@@ -15392,7 +15425,7 @@ private enum ChessPieceVisualFactory {
     let chips = Entity()
     let handSign: Float = handSide == .left ? -1 : 1
     _ = kind
-    chips.position = SIMD3<Float>(0.0065 * handSign, -0.003, 0.011)
+    chips.position = SIMD3<Float>(-0.0065 * handSign, -0.003, -0.011)
     chips.orientation = simd_normalize(
       simd_quatf(angle: .pi, axis: SIMD3<Float>(0, 1, 0)) *
         simd_quatf(angle: handSign * (.pi / 7), axis: SIMD3<Float>(0, 1, 0)) *
@@ -17105,11 +17138,11 @@ private struct NativeARExperienceView: View {
         VStack {
           Spacer()
           PieceSpeechBubble(caption: caption)
-            .allowsHitTesting(false)
             .transition(.move(edge: .bottom).combined(with: .opacity))
             .padding(.horizontal, 18)
             .padding(.bottom, 24)
         }
+        .allowsHitTesting(false)
       }
 
       if gameReview.phase == .idle {
@@ -24241,7 +24274,7 @@ private struct NativeARView: UIViewRepresentable {
       let chips = Entity()
       let handSign: Float = handSide == .left ? -1 : 1
       _ = kind
-      chips.position = SIMD3<Float>(0.0065 * handSign, -0.003, 0.011)
+      chips.position = SIMD3<Float>(-0.0065 * handSign, -0.003, -0.011)
       chips.orientation = simd_normalize(
         simd_quatf(angle: .pi, axis: SIMD3<Float>(0, 1, 0)) *
           simd_quatf(angle: handSign * (.pi / 7), axis: SIMD3<Float>(0, 1, 0)) *
@@ -24340,9 +24373,7 @@ private struct NativeARView: UIViewRepresentable {
 
     private func pieceRoleCarryHand(for kind: ChessPieceKind) -> PieceAccessoryHandSide {
       switch kind {
-      case .pawn:
-        return .right
-      case .rook, .bishop:
+      case .pawn, .rook, .bishop:
         return .left
       case .knight, .queen, .king:
         return .right

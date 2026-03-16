@@ -1555,7 +1555,11 @@ def build_gemini_lesson_feedback_query(payload: GeminiLessonFeedbackRequest) -> 
 def build_gemini_coach_query() -> str:
     return (
         "Analyze this FEN and return the top 3 workers, top 3 traitors, "
-        "and 1 to 3 coach lines for the side to move."
+        "and 1 to 3 coach lines for the side to move. "
+        "Write every coach line as direct face-to-face coaching for the player in second person. "
+        "Each coach line must begin with one of these openings: "
+        "'You should', 'You need to', 'Your best plan is', or 'I think your'. "
+        "Avoid detached phrasing like 'White should...', 'Black should...', or 'The position wants...'."
     )
 
 
@@ -1943,7 +1947,9 @@ def build_gemini_coach_repair_query(payload: GeminiCoachRequest, previous_respon
         "If the previous response was malformed, ignore its formatting but preserve any useful chess ideas. "
         f"Current FEN: {payload.fen}. "
         f"Previous response: {trimmed_previous or '(empty)'}. "
-        "Return exactly one JSON object with side_to_move, top_3_workers, top_3_traitors, and coach_lines."
+        "Return exactly one JSON object with side_to_move, top_3_workers, top_3_traitors, and coach_lines. "
+        "Each coach line must address the player directly in second person and begin with "
+        "'You should', 'You need to', 'Your best plan is', or 'I think your'."
     )
 
 
