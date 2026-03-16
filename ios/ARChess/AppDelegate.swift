@@ -17041,6 +17041,7 @@ private struct PieceRoleEvaluationCache {
   var influenceSquaresBySquare: [BoardSquare: [BoardSquare]] = [:]
   var legalMovesBySquare: [BoardSquare: [ChessMove]] = [:]
   var removedFriendlyPressureBySquare: [BoardSquare: Set<BoardSquare>] = [:]
+  var kingShieldSquaresByColor: [ChessColor: Set<BoardSquare>] = [:]
 }
 
 extension ChessGameState {
@@ -17129,21 +17130,44 @@ extension ChessGameState {
       )
     }
 
-    for (square, piece) in orderedPieces(for: currentPlayer) {
+    let friendlyPieces = orderedPieces(for: currentPlayer)
+    let kingShieldWorkerSquares = kingShieldSquares(for: currentPlayer, cache: &cache)
+    var lazySquares = Set<BoardSquare>()
+    var workerSquares = Set<BoardSquare>()
+
+    for (square, piece) in friendlyPieces {
+      let enemyHalfInfluenceSquares = roleInfluenceSquares(from: square, cache: &cache)
+        .filter { isOnEnemyHalf($0, for: currentPlayer) }
+      let isLazy = isLazyPiece(at: square, piece: piece, cache: &cache)
+      if isLazy {
+        lazySquares.insert(square)
+      }
+
+      if kingShieldWorkerSquares.contains(square) || !enemyHalfInfluenceSquares.isEmpty || !isLazy {
+        workerSquares.insert(square)
+      }
+    }
+
+    workerSquares = propagatedWorkerSupportSquares(
+      initialWorkers: workerSquares,
+      friendlyColor: currentPlayer
+    )
+
+    for (square, piece) in friendlyPieces {
       let enemyHalfInfluenceSquares = roleInfluenceSquares(from: square, cache: &cache)
         .filter { isOnEnemyHalf($0, for: currentPlayer) }
       let influenceCount = enemyHalfInfluenceSquares.count
       let roleType: PieceRoleType
-      if isTraitorPiece(
+      if workerSquares.contains(square) {
+        roleType = .worker
+      } else if isTraitorPiece(
         at: square,
         friendlyColor: currentPlayer,
         baselineFriendlyPressure: baselineFriendlyPressure,
         cache: &cache
       ) {
         roleType = .traitor
-      } else if !enemyHalfInfluenceSquares.isEmpty {
-        roleType = .worker
-      } else if isLazyPiece(at: square, piece: piece, cache: &cache) {
+      } else if lazySquares.contains(square) {
         roleType = .lazy
       } else {
         roleType = .worker
@@ -17314,6 +17338,87 @@ extension ChessGameState {
     )
   }
 
+  private func kingShieldSquares(
+    for color: ChessColor,
+    cache: inout PieceRoleEvaluationCache
+  ) -> Set<BoardSquare> {
+    if let cached = cache.kingShieldSquaresByColor[color] {
+      return cached
+    }
+
+    guard let kingSquare = kingSquare(for: color) else {
+      let empty = Set<BoardSquare>()
+      cache.kingShieldSquaresByColor[color] = empty
+      return empty
+    }
+
+    let directions: [(Int, Int)] = [
+      (1, 0), (-1, 0), (0, 1), (0, -1),
+      (1, 1), (1, -1), (-1, -1), (-1, 1),
+    ]
+    var shieldSquares = Set<BoardSquare>()
+
+    for direction in directions {
+      var current = kingSquare
+      var firstFriendlyBlocker: BoardSquare?
+
+      while let next = current.offset(file: direction.0, rank: direction.1) {
+        current = next
+        guard let occupant = board[next] else {
+          continue
+        }
+
+        if let firstFriendlyBlocker {
+          if occupant.color == color {
+            continue
+          }
+
+          if isDirectionalSliderThreat(piece: occupant.kind, along: direction) {
+            shieldSquares.insert(firstFriendlyBlocker)
+          }
+          break
+        }
+
+        guard occupant.color == color else {
+          break
+        }
+
+        firstFriendlyBlocker = next
+      }
+    }
+
+    cache.kingShieldSquaresByColor[color] = shieldSquares
+    return shieldSquares
+  }
+
+  private func propagatedWorkerSupportSquares(
+    initialWorkers: Set<BoardSquare>,
+    friendlyColor: ChessColor
+  ) -> Set<BoardSquare> {
+    var workerSquares = initialWorkers
+    var changed = true
+
+    while changed {
+      changed = false
+      for (square, piece) in orderedPieces(for: friendlyColor) where !workerSquares.contains(square) {
+        let protectsWorker = workerSquares.contains { workerSquare in
+          guard workerSquare != square else {
+            return false
+          }
+
+          return attackOrigins(on: workerSquare, by: piece.color).contains(square)
+        }
+
+        if protectsWorker {
+          workerSquares.insert(square)
+          changed = true
+        }
+      }
+    }
+
+    return workerSquares
+  }
+
   private func isLazyPiece(
     at square: BoardSquare,
     piece: ChessPieceState,
@@ -17369,6 +17474,23 @@ extension ChessGameState {
 
   private func isOnHomeHalf(_ square: BoardSquare, for color: ChessColor) -> Bool {
     !isOnEnemyHalf(square, for: color)
+  }
+
+  private func isDirectionalSliderThreat(
+    piece kind: ChessPieceKind,
+    along direction: (Int, Int)
+  ) -> Bool {
+    let isOrthogonal = direction.0 == 0 || direction.1 == 0
+    switch kind {
+    case .queen:
+      return true
+    case .rook:
+      return isOrthogonal
+    case .bishop:
+      return !isOrthogonal
+    case .pawn, .knight, .king:
+      return false
+    }
   }
 
   private func kingZone(for color: ChessColor) -> Set<BoardSquare> {
