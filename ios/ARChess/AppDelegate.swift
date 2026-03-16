@@ -14099,6 +14099,11 @@ private enum PieceCosmeticVisualStyle: String, Hashable {
   case lazyChips
 }
 
+private enum PieceCosmeticCarryHandSide {
+  case left
+  case right
+}
+
 private struct PieceCosmeticLoadout: Hashable {
   var equippedIDsBySlot: [PieceCosmeticSlot: String] = [:]
 
@@ -14307,13 +14312,14 @@ private final class PieceCosmeticsStore: ObservableObject {
 
   func activeCosmetics(for pieceKind: ChessPieceKind, color: ChessColor) -> [PieceCosmeticReward] {
     loadout(for: pieceKind, color: color)
+      .removingPreviewOnlySlots()
       .equippedIDsBySlot
       .values
       .compactMap { PieceCosmeticReward.definition(id: $0) }
   }
 
   func equip(_ cosmetic: PieceCosmeticReward, for pieceKind: ChessPieceKind, color: ChessColor) {
-    guard cosmetic.targetPiece == pieceKind else {
+    guard cosmetic.targetPiece == pieceKind, cosmetic.slot != .roleAccessory else {
       return
     }
 
@@ -14624,6 +14630,7 @@ private final class CosmeticsCreatorRoomStore: ObservableObject {
   @Published var previewYaw: Float
   @Published var previewPitch: Float
   @Published var previewCameraDistance: Float
+  @Published private var previewOnlyRoleCosmeticIDsByPieceKind: [ChessPieceKind: String] = [:]
   @Published private(set) var statusText: String?
 
   private let cosmetics: PieceCosmeticsStore
@@ -14666,8 +14673,19 @@ private final class CosmeticsCreatorRoomStore: ObservableObject {
     cosmetics.loadout(for: selectedPieceKind, color: selectedColor)
   }
 
+  var currentPreviewLoadout: PieceCosmeticLoadout {
+    var loadout = currentLoadout.removingPreviewOnlySlots()
+    if let previewCosmeticID = previewOnlyRoleCosmeticIDsByPieceKind[selectedPieceKind],
+       let previewCosmetic = cosmetics.cosmeticDefinition(id: previewCosmeticID),
+       previewCosmetic.slot == .roleAccessory,
+       previewCosmetic.targetPiece == selectedPieceKind {
+      loadout = loadout.equipping(previewCosmetic)
+    }
+    return loadout
+  }
+
   var currentLoadoutSignature: String {
-    currentLoadout.signature
+    currentPreviewLoadout.signature
   }
 
   func setPieceKind(_ pieceKind: ChessPieceKind) {
@@ -14702,11 +14720,17 @@ private final class CosmeticsCreatorRoomStore: ObservableObject {
   }
 
   func isEquipped(_ cosmetic: PieceCosmeticReward) -> Bool {
-    currentLoadout.equippedID(for: cosmetic.slot) == cosmetic.id
+    currentPreviewLoadout.equippedID(for: cosmetic.slot) == cosmetic.id
   }
 
   func equip(_ cosmetic: PieceCosmeticReward) {
     guard cosmetic.targetPiece == selectedPieceKind else {
+      return
+    }
+
+    if cosmetic.slot == .roleAccessory {
+      previewOnlyRoleCosmeticIDsByPieceKind[selectedPieceKind] = cosmetic.id
+      showStatus("\(cosmetic.displayName) is preview-only and will not be equipped in gameplay.")
       return
     }
 
@@ -14721,6 +14745,12 @@ private final class CosmeticsCreatorRoomStore: ObservableObject {
   }
 
   func clearSelectedCategory() {
+    if selectedCategory.slot == .roleAccessory {
+      previewOnlyRoleCosmeticIDsByPieceKind.removeValue(forKey: selectedPieceKind)
+      showStatus("\(selectedCategory.displayName) preview cleared.")
+      return
+    }
+
     cosmetics.unequip(slot: selectedCategory.slot, for: selectedPieceKind, color: selectedColor)
     showStatus("\(selectedCategory.displayName) cleared.")
     objectWillChange.send()
@@ -14890,36 +14920,74 @@ private enum ChessPieceVisualFactory {
     let baseColor = cosmetic.previewBackgroundColor
 
     let anchor = Entity()
-    switch cosmetic.id {
-    case "king-cowboy-hat":
+    switch cosmetic.visualStyle {
+    case .cowboyHat:
       anchor.position = profile.headPosition + SIMD3<Float>(0, -0.0045, 0)
       anchor.scale = SIMD3<Float>(repeating: profile.headScale * 1.05)
       anchor.addChild(makeCowboyHatEntity(baseColor: baseColor, accentColor: accentColor, detailColor: detailColor))
-    case "bishop-wizard-hat":
+    case .wizardHat:
       anchor.position = profile.headPosition + SIMD3<Float>(0, -0.0095, 0)
       anchor.scale = SIMD3<Float>(repeating: profile.headScale * 1.10)
       anchor.addChild(makeWizardHatEntity(baseColor: baseColor, accentColor: accentColor, detailColor: detailColor))
-    case "knight-golden-armor":
+    case .goldenArmor:
       anchor.position = profile.bodyPosition
       anchor.scale = SIMD3<Float>(repeating: profile.bodyScale)
       anchor.addChild(makeGoldenArmorEntity(accentColor: accentColor, detailColor: detailColor))
-    case "rook-bandit-mask":
+    case .banditMask:
       anchor.position = profile.headPosition + SIMD3<Float>(0, -0.010, 0)
       anchor.scale = SIMD3<Float>(repeating: profile.headScale * 1.06)
       anchor.addChild(makeBanditMaskEntity(baseColor: baseColor, detailColor: detailColor, pieceColor: color))
-    case "queen-tiny-cape":
+    case .tinyCape:
       anchor.position = profile.backPosition
       anchor.scale = SIMD3<Float>(repeating: profile.backScale)
       anchor.addChild(makeCapeEntity(accentColor: accentColor, detailColor: detailColor))
-    case "pawn-miner-helmet":
+    case .minerHelmet:
       anchor.position = profile.headPosition + SIMD3<Float>(0, -0.0040, 0)
       anchor.scale = SIMD3<Float>(repeating: profile.headScale * 1.04)
       anchor.addChild(makeMinerHelmetEntity(accentColor: accentColor, detailColor: detailColor))
-    default:
-      return nil
+    case .traitorHorns:
+      anchor.addChild(makeTraitorHornsEntity(for: pieceKind))
+    case .lazyChips:
+      let handSide = pieceRoleCarryHand(for: pieceKind)
+      anchor.position = pieceRoleHandPosition(for: pieceKind, side: handSide)
+      anchor.addChild(makeLazyChipsEntity(for: pieceKind, handSide: handSide))
+    case .workerBriefcase:
+      let handSide = pieceRoleCarryHand(for: pieceKind)
+      anchor.position = pieceRoleHandPosition(for: pieceKind, side: handSide)
+      anchor.addChild(makeWorkerBriefcaseEntity(for: pieceKind, handSide: handSide))
     }
 
     return anchor
+  }
+
+  private static func pieceRoleCarryHand(for kind: ChessPieceKind) -> PieceCosmeticCarryHandSide {
+    switch kind {
+    case .pawn, .rook, .bishop:
+      return .left
+    case .knight, .queen, .king:
+      return .right
+    }
+  }
+
+  private static func pieceRoleHandPosition(
+    for kind: ChessPieceKind,
+    side: PieceCosmeticCarryHandSide
+  ) -> SIMD3<Float> {
+    let sign: Float = side == .left ? -1 : 1
+    switch kind {
+    case .pawn:
+      return SIMD3<Float>(0.017 * sign, 0.020, 0.002)
+    case .rook:
+      return SIMD3<Float>(0.020 * sign, 0.024, 0.003)
+    case .knight:
+      return SIMD3<Float>(0.019 * sign, 0.023, 0.002)
+    case .bishop:
+      return SIMD3<Float>(0.018 * sign, 0.026, 0.002)
+    case .queen:
+      return SIMD3<Float>(0.020 * sign, 0.028, 0.002)
+    case .king:
+      return SIMD3<Float>(0.022 * sign, 0.029, 0.001)
+    }
   }
 
   private static func attachmentProfile(for kind: ChessPieceKind) -> AttachmentProfile {
@@ -15178,6 +15246,129 @@ private enum ChessPieceVisualFactory {
     mask.addChild(neckCloth)
 
     return mask
+  }
+
+  private static func makeTraitorHornsEntity(for kind: ChessPieceKind) -> Entity {
+    let horns = Entity()
+    horns.position = SIMD3<Float>(0, pieceRoleHeadHeight(for: kind), -0.003)
+    let hornMaterial = accessoryMaterial(color: UIColor(red: 0.74, green: 0.12, blue: 0.12, alpha: 1), metallic: true)
+
+    for side in [Float(-1), Float(1)] {
+      let horn = Entity()
+      horn.position = SIMD3<Float>(0.007 * side, 0, 0)
+      horn.orientation = simd_normalize(
+        simd_quatf(angle: side * (.pi / 9), axis: SIMD3<Float>(0, 0, 1)) *
+          simd_quatf(angle: -.pi / 8, axis: SIMD3<Float>(1, 0, 0))
+      )
+
+      let base = ModelEntity(mesh: .generateSphere(radius: 0.003), materials: [hornMaterial])
+      horn.addChild(base)
+
+      let tip = ModelEntity(
+        mesh: .generateBox(size: SIMD3<Float>(0.0032, 0.011, 0.0032)),
+        materials: [hornMaterial]
+      )
+      tip.position = SIMD3<Float>(0, 0.006, 0)
+      horn.addChild(tip)
+
+      horns.addChild(horn)
+    }
+
+    return horns
+  }
+
+  private static func makeLazyChipsEntity(
+    for kind: ChessPieceKind,
+    handSide: PieceCosmeticCarryHandSide
+  ) -> Entity {
+    let chips = Entity()
+    let handSign: Float = handSide == .left ? -1 : 1
+    _ = kind
+    chips.position = SIMD3<Float>(0.0065 * handSign, -0.003, 0.011)
+    chips.orientation = simd_normalize(
+      simd_quatf(angle: handSign * (.pi / 7), axis: SIMD3<Float>(0, 1, 0)) *
+        simd_quatf(angle: handSign * (.pi / 11), axis: SIMD3<Float>(0, 0, 1))
+    )
+
+    let bagMaterial = accessoryMaterial(color: UIColor(red: 0.93, green: 0.74, blue: 0.22, alpha: 1), metallic: false)
+    let stripeMaterial = accessoryMaterial(color: UIColor(red: 0.81, green: 0.16, blue: 0.13, alpha: 1), metallic: false)
+    let chipMaterial = accessoryMaterial(color: UIColor(red: 0.98, green: 0.90, blue: 0.64, alpha: 1), metallic: false)
+
+    let bag = ModelEntity(
+      mesh: .generateBox(size: SIMD3<Float>(0.012, 0.016, 0.005)),
+      materials: [bagMaterial]
+    )
+    chips.addChild(bag)
+
+    let stripe = ModelEntity(
+      mesh: .generateBox(size: SIMD3<Float>(0.004, 0.0165, 0.0056)),
+      materials: [stripeMaterial]
+    )
+    stripe.position = SIMD3<Float>(0.002, 0, 0.0006)
+    chips.addChild(stripe)
+
+    let chip = ModelEntity(mesh: .generateSphere(radius: 0.0024), materials: [chipMaterial])
+    chip.scale = SIMD3<Float>(1.4, 0.4, 1.0)
+    chip.position = SIMD3<Float>(-0.002, 0.010, 0.001)
+    chips.addChild(chip)
+
+    return chips
+  }
+
+  private static func makeWorkerBriefcaseEntity(
+    for kind: ChessPieceKind,
+    handSide: PieceCosmeticCarryHandSide
+  ) -> Entity {
+    let briefcase = Entity()
+    let handSign: Float = handSide == .left ? -1 : 1
+    _ = kind
+    briefcase.position = SIMD3<Float>(0.006 * handSign, -0.004, 0.010)
+    briefcase.orientation = simd_normalize(
+      simd_quatf(angle: handSign * (.pi / 7), axis: SIMD3<Float>(0, 1, 0)) *
+        simd_quatf(angle: handSign * (.pi / 16), axis: SIMD3<Float>(0, 0, 1))
+    )
+
+    let caseMaterial = accessoryMaterial(color: UIColor(red: 0.34, green: 0.20, blue: 0.10, alpha: 1), metallic: false)
+    let latchMaterial = accessoryMaterial(color: UIColor(red: 0.84, green: 0.67, blue: 0.24, alpha: 1), metallic: true)
+
+    let caseBody = ModelEntity(
+      mesh: .generateBox(size: SIMD3<Float>(0.014, 0.010, 0.006)),
+      materials: [caseMaterial]
+    )
+    briefcase.addChild(caseBody)
+
+    let handle = ModelEntity(
+      mesh: .generateBox(size: SIMD3<Float>(0.007, 0.002, 0.002)),
+      materials: [caseMaterial]
+    )
+    handle.position = SIMD3<Float>(0, 0.007, 0)
+    briefcase.addChild(handle)
+
+    let latch = ModelEntity(
+      mesh: .generateBox(size: SIMD3<Float>(0.003, 0.003, 0.0014)),
+      materials: [latchMaterial]
+    )
+    latch.position = SIMD3<Float>(0, 0, 0.0034)
+    briefcase.addChild(latch)
+
+    return briefcase
+  }
+
+  private static func pieceRoleHeadHeight(for kind: ChessPieceKind) -> Float {
+    switch kind {
+    case .pawn:
+      return 0.040
+    case .rook:
+      return 0.041
+    case .knight:
+      return 0.041
+    case .bishop:
+      return 0.055
+    case .queen:
+      return 0.049
+    case .king:
+      return 0.052
+    }
   }
 
   private static func makeCapeEntity(
@@ -15804,7 +15995,7 @@ private struct CosmeticsCreatorView: View {
           CosmeticsPiecePreviewView(
             pieceKind: roomStore.selectedPieceKind,
             color: roomStore.selectedColor,
-            loadout: roomStore.currentLoadout,
+            loadout: roomStore.currentPreviewLoadout,
             yaw: roomStore.previewYaw,
             pitch: roomStore.previewPitch,
             cameraDistance: roomStore.previewCameraDistance
@@ -25796,7 +25987,7 @@ private struct NativeARView: UIViewRepresentable {
         skinColor: UIColor(red: 0.88, green: 0.74, blue: 0.62, alpha: 1)
       )
       leftHand.name = "fishing_left_hand"
-      leftHand.position = SIMD3<Float>(-0.12, -0.05, 0)
+      leftHand.position = SIMD3<Float>(-0.068, -0.10, 0.018)
       leftHand.orientation = simd_normalize(
         simd_quatf(angle: .pi / 26, axis: SIMD3<Float>(0, 1, 0)) *
           simd_quatf(angle: -.pi / 18, axis: SIMD3<Float>(0, 0, 1))
@@ -25808,7 +25999,7 @@ private struct NativeARView: UIViewRepresentable {
         skinColor: UIColor(red: 0.88, green: 0.74, blue: 0.62, alpha: 1)
       )
       rightHand.name = "fishing_right_hand"
-      rightHand.position = SIMD3<Float>(0.12, -0.05, 0)
+      rightHand.position = SIMD3<Float>(0.068, -0.10, 0.018)
       rightHand.orientation = simd_normalize(
         simd_quatf(angle: -.pi / 26, axis: SIMD3<Float>(0, 1, 0)) *
           simd_quatf(angle: .pi / 18, axis: SIMD3<Float>(0, 0, 1))
@@ -25883,8 +26074,9 @@ private struct NativeARView: UIViewRepresentable {
         mesh: .generateBox(size: SIMD3<Float>(0.015, 0.015, 0.76)),
         materials: [Self.scenicMaterial(UIColor(red: 0.59, green: 0.42, blue: 0.18, alpha: 1), roughness: 0.78)]
       )
-      lowerRod.position = SIMD3<Float>(0.0, 0.17, -0.28)
-      lowerRod.orientation = simd_quatf(angle: -.pi / 3.7, axis: SIMD3<Float>(1, 0, 0))
+      // Bridge the top of the handle to the upper shaft so the rod reads as one continuous piece.
+      lowerRod.position = SIMD3<Float>(0.0, 0.0805, -0.3465)
+      lowerRod.orientation = simd_quatf(angle: .pi / 11.7, axis: SIMD3<Float>(1, 0, 0))
       rod.addChild(lowerRod)
 
       let upperRod = ModelEntity(
@@ -26863,7 +27055,9 @@ private struct NativeARView: UIViewRepresentable {
     }
 
     private func applyEquippedCosmetics(to pieceEntity: Entity, piece: ChessPieceState) {
-      let loadout = PieceCosmeticsStore.shared.loadout(for: piece.kind, color: piece.color)
+      let loadout = PieceCosmeticsStore.shared
+        .loadout(for: piece.kind, color: piece.color)
+        .removingPreviewOnlySlots()
       ChessPieceVisualFactory.applyCosmetics(
         loadout,
         to: pieceEntity,
