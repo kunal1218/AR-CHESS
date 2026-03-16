@@ -8006,35 +8006,78 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     await prepare(with: state, force: true)
   }
 
-  func fishingRewardMoveLines(limit: Int = 5) async -> [String] {
+  func fishingRewardPages(limit: Int = 5) async -> [FishingRewardPage] {
     guard let state = stateProvider?() else {
       return [
-        "1. No board state was available for Stockfish.",
-        "2. Try casting again after the board settles.",
+        fishingFallbackRewardPage(
+          title: "No board yet",
+          summary: "Stockfish couldn't sketch a move diagram.",
+          detailText: "Try casting again after the board settles."
+        )
       ]
     }
 
     guard let analysis = await analysisForCurrentTurn(state: state) else {
       return [
-        "1. Stockfish is still thinking.",
-        "2. Cast again once the engine has a fresh line.",
+        fishingFallbackRewardPage(
+          title: "Still thinking",
+          summary: "The engine has not finished a line for this position.",
+          detailText: "Cast again once Stockfish has a fresh suggestion."
+        )
       ]
     }
 
     let candidates = Array(analysis.topUniqueMoves.prefix(max(1, limit)))
     guard !candidates.isEmpty else {
       return [
-        "1. Stockfish returned no candidate moves.",
-        "2. Try another cast from a new position.",
+        fishingFallbackRewardPage(
+          title: "No move lines",
+          summary: "Stockfish returned no candidate diagrams.",
+          detailText: "Try another cast from a new position."
+        )
       ]
     }
 
-    return candidates.map { candidate in
-      let move = fishingReadableMove(candidate.move ?? "(none)")
-      let preview = candidate.pvPreview.prefix(3).map(fishingReadableMove).joined(separator: " -> ")
-      let pvSuffix = preview.isEmpty ? "pv: —" : "pv: \(preview)"
-      return "\(candidate.rank). \(move) | \(candidate.formattedScore) | \(pvSuffix)"
+    let pages = candidates.compactMap { candidate -> FishingRewardPage? in
+      guard let moveUCI = candidate.move,
+            let move = state.move(forUCI: moveUCI) else {
+        return nil
+      }
+
+      let nextState = state.applying(move)
+      let continuation = candidate.pvPreview
+        .dropFirst()
+        .prefix(2)
+        .map(fishingReadableMove)
+        .joined(separator: "  •  ")
+      let footerText = continuation.isEmpty
+        ? "Eval \(candidate.formattedScore)  •  depth \(candidate.depth)"
+        : "Eval \(candidate.formattedScore)  •  Then \(continuation)"
+
+      return FishingRewardPage(
+        id: "fishing-reward-\(candidate.rank)-\(move.uciString)-\(state.fenString)",
+        title: candidate.rank == 1 ? "Best move" : "Line \(candidate.rank)",
+        summary: fishingRewardMoveSummary(move),
+        detailText: "Board after \(state.turn.displayName.lowercased()) plays \(fishingReadableMove(move.uciString)).",
+        footerText: footerText,
+        boardState: nextState,
+        fromSquare: move.from,
+        toSquare: move.to,
+        perspective: state.turn
+      )
     }
+
+    if !pages.isEmpty {
+      return pages
+    }
+
+    return [
+      fishingFallbackRewardPage(
+        title: "Unreadable line",
+        summary: "Stockfish suggested moves, but they could not be drawn.",
+        detailText: "Cast again to fetch another note."
+      )
+    ]
   }
 
   func stockfishRank(for move: ChessMove, before state: ChessGameState) async -> Int? {
@@ -8084,6 +8127,46 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     }
 
     return "\(from) to \(to) = \(promotionName)"
+  }
+
+  private func fishingRewardMoveSummary(_ move: ChessMove) -> String {
+    let mover = move.piece.color.displayName
+    let piece = move.piece.kind.displayName
+    let destination = move.to.algebraic.uppercased()
+    let origin = move.from.algebraic.uppercased()
+
+    if let promotion = move.promotion {
+      return "\(mover) \(piece) from \(origin) to \(destination), promoting to \(promotion.displayName.lowercased())."
+    }
+
+    if move.rookMove != nil {
+      let side = move.to.file == 6 ? "kingside" : "queenside"
+      return "\(mover) castles \(side)."
+    }
+
+    if move.captured != nil || move.isEnPassant {
+      return "\(mover) \(piece) captures on \(destination) from \(origin)."
+    }
+
+    return "\(mover) \(piece) steps from \(origin) to \(destination)."
+  }
+
+  private func fishingFallbackRewardPage(
+    title: String,
+    summary: String,
+    detailText: String
+  ) -> FishingRewardPage {
+    FishingRewardPage(
+      id: "fishing-fallback-\(title)-\(summary)",
+      title: title,
+      summary: summary,
+      detailText: detailText,
+      footerText: nil,
+      boardState: nil,
+      fromSquare: nil,
+      toSquare: nil,
+      perspective: .white
+    )
   }
 
   private func engineReplyMove(
@@ -12179,8 +12262,10 @@ private struct PiecePortraitView: View {
 }
 
 private struct ARChessRootView: View {
+  @AppStorage("archess.dailyCosmetic.devModeEnabled") private var isDailyCosmeticDevModeEnabled = false
   @State private var screen: NativeScreen = .modeSelection
   @StateObject private var queueMatch = QueueMatchStore()
+  @StateObject private var cosmeticRewards = DailyCosmeticRewardStore()
   @State private var completedLessonIDs: Set<String> = []
   @State private var selectedNarrator: NarratorType = .silky
 
@@ -12188,7 +12273,10 @@ private struct ARChessRootView: View {
     ZStack {
       switch screen {
       case .modeSelection:
-        ModeSelectionView(selectedNarrator: $selectedNarrator) { mode in
+        ModeSelectionView(
+          selectedNarrator: $selectedNarrator,
+          isDailyCosmeticDevModeEnabled: $isDailyCosmeticDevModeEnabled
+        ) { mode in
           withAnimation(.spring(response: 0.42, dampingFraction: 0.88)) {
             switch mode {
             case .course:
@@ -12274,6 +12362,7 @@ private struct ARChessRootView: View {
           mode: mode,
           narrator: selectedNarrator,
           queueMatch: queueMatch,
+          cosmeticRewards: cosmeticRewards,
           closeExperience: {
             switch mode {
             case .lesson:
@@ -12319,6 +12408,12 @@ private struct ARChessRootView: View {
           }
         )
       }
+    }
+    .onAppear {
+      cosmeticRewards.setDevModeEnabled(isDailyCosmeticDevModeEnabled)
+    }
+    .onChange(of: isDailyCosmeticDevModeEnabled) { isEnabled in
+      cosmeticRewards.setDevModeEnabled(isEnabled)
     }
   }
 
@@ -12450,6 +12545,7 @@ private struct ExperienceLoadingView: View {
 
 private struct ModeSelectionView: View {
   @Binding var selectedNarrator: NarratorType
+  @Binding var isDailyCosmeticDevModeEnabled: Bool
   let onSelect: (PlayModeChoice) -> Void
   @State private var isPiperAuditionPresented = false
 
@@ -12486,6 +12582,9 @@ private struct ModeSelectionView: View {
         }
 
         NarratorSelectionCard(selectedNarrator: $selectedNarrator)
+          .frame(maxWidth: 340)
+
+        DailyCosmeticDevToggleCard(isEnabled: $isDailyCosmeticDevModeEnabled)
           .frame(maxWidth: 340)
 
         NativeActionButton(title: "Piper Voice Lab", style: .outline) {
@@ -12527,6 +12626,56 @@ private struct ModeSelectionView: View {
       PiperVoiceAuditionView()
         .piperVoiceLabSheetPresentation()
     }
+  }
+}
+
+private struct DailyCosmeticDevToggleCard: View {
+  @Binding var isEnabled: Bool
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 12) {
+      HStack(alignment: .top, spacing: 14) {
+        VStack(alignment: .leading, spacing: 6) {
+          Text("Daily Cosmetic Dev Mode")
+            .font(.system(size: 14, weight: .black, design: .rounded))
+            .foregroundStyle(.white)
+
+          Text("Lets the vending machine dispense multiple cosmetics per day while testing.")
+            .font(.system(size: 12, weight: .semibold, design: .rounded))
+            .foregroundStyle(Color.white.opacity(0.72))
+            .lineSpacing(2)
+        }
+
+        Spacer(minLength: 12)
+
+        Toggle("", isOn: $isEnabled)
+          .labelsHidden()
+          .tint(Color(red: 0.95, green: 0.88, blue: 0.73))
+      }
+
+      Text(
+        isEnabled
+          ? "Dev mode is live. Daily lockout is bypassed until the mock cosmetic pool is exhausted."
+          : "Daily lockout is active. Players can claim one cosmetic per calendar day."
+      )
+      .font(.system(size: 11, weight: .bold, design: .rounded))
+      .foregroundStyle(
+        isEnabled
+          ? Color(red: 0.82, green: 0.92, blue: 0.74)
+          : Color.white.opacity(0.64)
+      )
+      .lineSpacing(2)
+    }
+    .padding(.horizontal, 18)
+    .padding(.vertical, 16)
+    .background(
+      RoundedRectangle(cornerRadius: 24, style: .continuous)
+        .fill(Color.white.opacity(0.06))
+        .overlay(
+          RoundedRectangle(cornerRadius: 24, style: .continuous)
+            .stroke(Color.white.opacity(0.14), lineWidth: 1)
+        )
+    )
   }
 }
 
@@ -13618,6 +13767,203 @@ private struct QueueMatchView: View {
   }
 }
 
+private struct PieceCosmeticReward: Identifiable {
+  let id: String
+  let displayName: String
+  let targetPiece: ChessPieceKind
+  let previewGlyph: String
+  let flavorText: String
+  let rarityLabel: String
+  let previewBackgroundColor: UIColor
+  let previewAccentColor: UIColor
+  let previewDetailColor: UIColor
+
+  static let mockPool: [PieceCosmeticReward] = [
+    PieceCosmeticReward(
+      id: "king-cowboy-hat",
+      displayName: "Cowboy Hat",
+      targetPiece: .king,
+      previewGlyph: "🤠",
+      flavorText: "The king finally looks like he runs the frontier.",
+      rarityLabel: "Legendary",
+      previewBackgroundColor: UIColor(red: 0.36, green: 0.21, blue: 0.12, alpha: 1),
+      previewAccentColor: UIColor(red: 0.91, green: 0.69, blue: 0.31, alpha: 1),
+      previewDetailColor: UIColor(red: 0.98, green: 0.94, blue: 0.82, alpha: 1)
+    ),
+    PieceCosmeticReward(
+      id: "bishop-wizard-hat",
+      displayName: "Wizard Hat",
+      targetPiece: .bishop,
+      previewGlyph: "🧙",
+      flavorText: "A little mysticism goes a long way on diagonals.",
+      rarityLabel: "Epic",
+      previewBackgroundColor: UIColor(red: 0.18, green: 0.14, blue: 0.36, alpha: 1),
+      previewAccentColor: UIColor(red: 0.55, green: 0.42, blue: 0.96, alpha: 1),
+      previewDetailColor: UIColor(red: 0.86, green: 0.82, blue: 0.98, alpha: 1)
+    ),
+    PieceCosmeticReward(
+      id: "knight-golden-armor",
+      displayName: "Golden Armor",
+      targetPiece: .knight,
+      previewGlyph: "🛡",
+      flavorText: "Polished enough to blind anything it forks.",
+      rarityLabel: "Rare",
+      previewBackgroundColor: UIColor(red: 0.30, green: 0.24, blue: 0.10, alpha: 1),
+      previewAccentColor: UIColor(red: 0.94, green: 0.80, blue: 0.28, alpha: 1),
+      previewDetailColor: UIColor(red: 0.99, green: 0.95, blue: 0.79, alpha: 1)
+    ),
+    PieceCosmeticReward(
+      id: "rook-bandit-mask",
+      displayName: "Bandit Mask",
+      targetPiece: .rook,
+      previewGlyph: "🥷",
+      flavorText: "For silent file pressure and very loud captures.",
+      rarityLabel: "Rare",
+      previewBackgroundColor: UIColor(red: 0.12, green: 0.14, blue: 0.18, alpha: 1),
+      previewAccentColor: UIColor(red: 0.82, green: 0.24, blue: 0.22, alpha: 1),
+      previewDetailColor: UIColor(red: 0.92, green: 0.92, blue: 0.94, alpha: 1)
+    ),
+    PieceCosmeticReward(
+      id: "queen-tiny-cape",
+      displayName: "Tiny Cape",
+      targetPiece: .queen,
+      previewGlyph: "🦸",
+      flavorText: "Dramatic enough for the most overpowered piece on the board.",
+      rarityLabel: "Epic",
+      previewBackgroundColor: UIColor(red: 0.34, green: 0.10, blue: 0.18, alpha: 1),
+      previewAccentColor: UIColor(red: 0.96, green: 0.34, blue: 0.54, alpha: 1),
+      previewDetailColor: UIColor(red: 0.99, green: 0.89, blue: 0.93, alpha: 1)
+    ),
+    PieceCosmeticReward(
+      id: "pawn-miner-helmet",
+      displayName: "Miner Helmet",
+      targetPiece: .pawn,
+      previewGlyph: "⛏",
+      flavorText: "Built for the pawns that keep grinding through the dirt.",
+      rarityLabel: "Uncommon",
+      previewBackgroundColor: UIColor(red: 0.22, green: 0.20, blue: 0.16, alpha: 1),
+      previewAccentColor: UIColor(red: 0.98, green: 0.78, blue: 0.26, alpha: 1),
+      previewDetailColor: UIColor(red: 0.98, green: 0.95, blue: 0.82, alpha: 1)
+    ),
+  ]
+}
+
+private enum DailyCosmeticRewardClaimOutcome {
+  case granted(PieceCosmeticReward)
+  case unavailable(String)
+}
+
+@MainActor
+private final class DailyCosmeticRewardStore: ObservableObject {
+  private static let unlockedCosmeticIDsDefaultsKey = "archess.dailyCosmetic.unlockedIDs"
+  private static let lastClaimDateDefaultsKey = "archess.dailyCosmetic.lastClaimDate"
+
+  @Published private(set) var presentedReward: PieceCosmeticReward?
+  @Published private(set) var statusMessage: String?
+  @Published private(set) var unlockedCosmeticIDs: Set<String>
+
+  private let defaults = UserDefaults.standard
+  private let calendar = Calendar.autoupdatingCurrent
+  private var lastClaimDate: Date?
+  private var isDevModeEnabled = false
+  private var isDispenseInFlight = false
+  private var statusMessageTask: Task<Void, Never>?
+
+  init() {
+    unlockedCosmeticIDs = Set(
+      defaults.stringArray(forKey: Self.unlockedCosmeticIDsDefaultsKey) ?? []
+    )
+    lastClaimDate = defaults.object(forKey: Self.lastClaimDateDefaultsKey) as? Date
+  }
+
+  deinit {
+    statusMessageTask?.cancel()
+  }
+
+  func setDevModeEnabled(_ isEnabled: Bool) {
+    isDevModeEnabled = isEnabled
+  }
+
+  func claimRewardIfAvailable(now: Date = Date()) -> DailyCosmeticRewardClaimOutcome {
+    guard !isDispenseInFlight else {
+      let message = "Reward is already dispensing."
+      showStatusMessage(message)
+      return .unavailable(message)
+    }
+
+    if !isDevModeEnabled,
+       let lastClaimDate,
+       calendar.isDate(lastClaimDate, inSameDayAs: now) {
+      let message = "Come back tomorrow for another cosmetic."
+      showStatusMessage(message)
+      return .unavailable(message)
+    }
+
+    let availableRewards = PieceCosmeticReward.mockPool.filter { reward in
+      !unlockedCosmeticIDs.contains(reward.id)
+    }
+    guard let reward = availableRewards.randomElement() else {
+      let message = "The machine is out of mock cosmetics for now."
+      showStatusMessage(message)
+      return .unavailable(message)
+    }
+
+    isDispenseInFlight = true
+    unlockedCosmeticIDs.insert(reward.id)
+    defaults.set(Array(unlockedCosmeticIDs).sorted(), forKey: Self.unlockedCosmeticIDsDefaultsKey)
+    lastClaimDate = now
+    defaults.set(now, forKey: Self.lastClaimDateDefaultsKey)
+    clearStatusMessage()
+    return .granted(reward)
+  }
+
+  func presentDispensedReward(_ reward: PieceCosmeticReward) {
+    isDispenseInFlight = false
+    clearStatusMessage()
+    presentedReward = reward
+  }
+
+  func dismissPresentedReward() {
+    presentedReward = nil
+  }
+
+  func clearTransientPresentation() {
+    isDispenseInFlight = false
+    presentedReward = nil
+    clearStatusMessage()
+  }
+
+  private func showStatusMessage(_ message: String) {
+    statusMessageTask?.cancel()
+    statusMessage = message
+    statusMessageTask = Task { @MainActor [weak self] in
+      try? await Task.sleep(nanoseconds: 2_600_000_000)
+      guard let self, !Task.isCancelled else {
+        return
+      }
+      self.statusMessage = nil
+    }
+  }
+
+  private func clearStatusMessage() {
+    statusMessageTask?.cancel()
+    statusMessageTask = nil
+    statusMessage = nil
+  }
+}
+
+private struct FishingRewardPage: Identifiable {
+  let id: String
+  let title: String
+  let summary: String
+  let detailText: String
+  let footerText: String?
+  let boardState: ChessGameState?
+  let fromSquare: BoardSquare?
+  let toSquare: BoardSquare?
+  let perspective: ChessColor
+}
+
 @MainActor
 private final class FishingInteractionStore: ObservableObject {
   enum State: String {
@@ -13635,11 +13981,11 @@ private final class FishingInteractionStore: ObservableObject {
   @Published private(set) var state: State = .idle
   @Published private(set) var isPondInFocus = false
   @Published private(set) var statusText = "Look toward the pond beside the board."
-  @Published private(set) var rewardMoves: [String] = []
+  @Published private(set) var rewardPages: [FishingRewardPage] = []
 
   private var castHandler: (() -> Void)?
   private var dismissNoteHandler: (() -> Void)?
-  private var armedRewardMoves: [String] = []
+  private var armedRewardPages: [FishingRewardPage] = []
 
   var showsFishingButton: Bool {
     isPondInFocus && state == .eligible
@@ -13668,7 +14014,7 @@ private final class FishingInteractionStore: ObservableObject {
   }
 
   var canRevealRewardFromFish: Bool {
-    state == .caught && !armedRewardMoves.isEmpty
+    state == .caught && !armedRewardPages.isEmpty
   }
 
   var canAcceptCatchFlick: Bool {
@@ -13733,22 +14079,22 @@ private final class FishingInteractionStore: ObservableObject {
     transition(to: .caught, status: "Reeling in the catch...")
   }
 
-  func armRewardFromCaughtFish(lines: [String]) {
-    armedRewardMoves = lines
+  func armRewardFromCaughtFish(pages: [FishingRewardPage]) {
+    armedRewardPages = pages
     transition(to: .caught, status: "Tap the fish to read the note.")
   }
 
-  func revealRewardNote(lines: [String]) {
-    rewardMoves = lines
+  func revealRewardNote(pages: [FishingRewardPage]) {
+    rewardPages = pages
     transition(to: .revealNote, status: "Stockfish sent a note back with the fish.")
   }
 
   func revealArmedRewardNote() {
-    guard !armedRewardMoves.isEmpty else {
+    guard !armedRewardPages.isEmpty else {
       return
     }
 
-    rewardMoves = armedRewardMoves
+    rewardPages = armedRewardPages
     transition(to: .revealNote, status: "Stockfish sent a note back with the fish.")
   }
 
@@ -13757,8 +14103,8 @@ private final class FishingInteractionStore: ObservableObject {
   }
 
   func finishReset() {
-    rewardMoves = []
-    armedRewardMoves = []
+    rewardPages = []
+    armedRewardPages = []
     transition(
       to: isPondInFocus ? .eligible : .idle,
       status: isPondInFocus ? "Cast toward the pond." : "Look toward the pond beside the board."
@@ -13905,6 +14251,7 @@ private struct NativeARExperienceView: View {
   let mode: ExperienceMode
   let narrator: NarratorType
   @ObservedObject var queueMatch: QueueMatchStore
+  @ObservedObject var cosmeticRewards: DailyCosmeticRewardStore
   let closeExperience: () -> Void
   let returnHome: () -> Void
   let markLessonComplete: (String) -> Void
@@ -13927,6 +14274,7 @@ private struct NativeARExperienceView: View {
     mode: ExperienceMode,
     narrator: NarratorType,
     queueMatch: QueueMatchStore,
+    cosmeticRewards: DailyCosmeticRewardStore,
     closeExperience: @escaping () -> Void,
     returnHome: @escaping () -> Void,
     markLessonComplete: @escaping (String) -> Void
@@ -13934,6 +14282,7 @@ private struct NativeARExperienceView: View {
     self.mode = mode
     self.narrator = narrator
     _queueMatch = ObservedObject(wrappedValue: queueMatch)
+    _cosmeticRewards = ObservedObject(wrappedValue: cosmeticRewards)
     self.closeExperience = closeExperience
     self.returnHome = returnHome
     self.markLessonComplete = markLessonComplete
@@ -13952,6 +14301,7 @@ private struct NativeARExperienceView: View {
         lessonStore: lessonStore,
         socraticCoach: socraticCoach,
         fishing: fishing,
+        cosmeticRewards: cosmeticRewards,
         pieceRoles: pieceRoles,
         onReviewFinished: returnHome
       )
@@ -14318,6 +14668,11 @@ private struct NativeARExperienceView: View {
         fishingPromptOverlay
       }
 
+      if let cosmeticStatusMessage = cosmeticRewards.statusMessage,
+         gameReview.phase == .idle {
+        DailyCosmeticRewardStatusOverlay(message: cosmeticStatusMessage)
+      }
+
       if gameReview.isAwaitingEntryDecision {
         reviewDecisionOverlay
       } else if gameReview.isLoading {
@@ -14332,8 +14687,15 @@ private struct NativeARExperienceView: View {
 
       if fishing.showsRewardNote {
         FishingRewardOverlay(
-          rewardMoves: fishing.rewardMoves,
+          rewardPages: fishing.rewardPages,
           onDismiss: { fishing.dismissRewardNote() }
+        )
+      }
+
+      if let presentedReward = cosmeticRewards.presentedReward {
+        DailyCosmeticRewardOverlay(
+          reward: presentedReward,
+          onDismiss: { cosmeticRewards.dismissPresentedReward() }
         )
       }
     }
@@ -14412,6 +14774,7 @@ private struct NativeARExperienceView: View {
       socraticCoach.unbindMoveHandler()
       socraticCoach.unbindDirectVoiceCommandHandler()
       pieceRoles.reset()
+      cosmeticRewards.clearTransientPresentation()
       socraticCoach.disconnect()
       switch mode {
       case .lesson:
@@ -15667,8 +16030,9 @@ private struct FishingOverlayHand: View {
 }
 
 private struct FishingRewardOverlay: View {
-  let rewardMoves: [String]
+  let rewardPages: [FishingRewardPage]
   let onDismiss: () -> Void
+  @State private var selectedPage = 0
 
   var body: some View {
     ZStack {
@@ -15678,7 +16042,7 @@ private struct FishingRewardOverlay: View {
 
       VStack(alignment: .leading, spacing: 16) {
         header
-        moveList
+        pageViewer
 
         HStack(spacing: 12) {
           NativeActionButton(title: "Cast again", style: .solid, action: onDismiss)
@@ -15687,6 +16051,12 @@ private struct FishingRewardOverlay: View {
       .padding(24)
       .background(cardBackground)
       .padding(.horizontal, 24)
+    }
+    .onAppear {
+      selectedPage = 0
+    }
+    .onChange(of: rewardPages.count) { newCount in
+      selectedPage = min(selectedPage, max(0, newCount - 1))
     }
   }
 
@@ -15702,10 +16072,17 @@ private struct FishingRewardOverlay: View {
           .font(.system(size: 28, weight: .heavy, design: .rounded))
           .foregroundStyle(.white)
 
-        Text("The fish dragged back a short move list from the engine.")
+        Text("Swipe through Stockfish's suggested move diagrams instead of reading a dry notation list.")
           .font(.system(size: 15, weight: .semibold, design: .rounded))
           .foregroundStyle(Color.white.opacity(0.78))
           .lineSpacing(3)
+
+        if rewardPages.count > 1 {
+          Text("Page \(selectedPage + 1) of \(rewardPages.count)")
+            .font(.system(size: 11, weight: .bold, design: .rounded))
+            .tracking(1.6)
+            .foregroundStyle(Color(red: 0.92, green: 0.84, blue: 0.68))
+        }
       }
 
       Spacer(minLength: 12)
@@ -15724,16 +16101,32 @@ private struct FishingRewardOverlay: View {
     }
   }
 
-  private var moveList: some View {
-    ScrollView(showsIndicators: true) {
-      VStack(alignment: .leading, spacing: 10) {
-        ForEach(Array(rewardMoves.enumerated()), id: \.offset) { _, line in
-          FishingRewardLine(text: line)
+  private var pageViewer: some View {
+    VStack(spacing: 14) {
+      TabView(selection: $selectedPage) {
+        ForEach(Array(rewardPages.enumerated()), id: \.element.id) { index, page in
+          FishingRewardPageCard(page: page)
+            .padding(18)
+            .tag(index)
         }
       }
-      .padding(18)
+      .tabViewStyle(.page(indexDisplayMode: .never))
+      .frame(height: min(UIScreen.main.bounds.height * 0.54, 430))
+
+      if rewardPages.count > 1 {
+        HStack(spacing: 8) {
+          ForEach(Array(rewardPages.enumerated()), id: \.element.id) { index, _ in
+            Capsule(style: .continuous)
+              .fill(
+                index == selectedPage
+                  ? Color(red: 0.36, green: 0.26, blue: 0.18)
+                  : Color(red: 0.36, green: 0.26, blue: 0.18).opacity(0.22)
+              )
+              .frame(width: index == selectedPage ? 26 : 10, height: 8)
+          }
+        }
+      }
     }
-    .frame(maxHeight: UIScreen.main.bounds.height * 0.38)
     .background(noteBackground)
   }
 
@@ -15761,21 +16154,428 @@ private struct FishingRewardOverlay: View {
   }
 }
 
-private struct FishingRewardLine: View {
-  let text: String
+private struct FishingRewardPageCard: View {
+  let page: FishingRewardPage
 
   var body: some View {
-    Text(text)
-      .font(.system(size: 13, weight: .semibold, design: .monospaced))
-      .foregroundStyle(Color(red: 0.12, green: 0.15, blue: 0.18))
-      .lineSpacing(3)
-      .frame(maxWidth: .infinity, alignment: .leading)
-      .padding(.horizontal, 14)
-      .padding(.vertical, 10)
+    VStack(alignment: .leading, spacing: 14) {
+      VStack(alignment: .leading, spacing: 6) {
+        Text(page.title)
+          .font(.system(size: 12, weight: .bold, design: .rounded))
+          .tracking(1.8)
+          .foregroundStyle(Color(red: 0.44, green: 0.30, blue: 0.18))
+
+        Text(page.summary)
+          .font(.system(size: 20, weight: .heavy, design: .serif))
+          .foregroundStyle(Color(red: 0.16, green: 0.12, blue: 0.10))
+          .fixedSize(horizontal: false, vertical: true)
+
+        Text(page.detailText)
+          .font(.system(size: 13, weight: .semibold, design: .rounded))
+          .foregroundStyle(Color(red: 0.26, green: 0.20, blue: 0.16))
+          .lineSpacing(2)
+      }
+
+      if let boardState = page.boardState {
+        FishingRewardBoardDiagram(
+          state: boardState,
+          perspective: page.perspective,
+          fromSquare: page.fromSquare,
+          toSquare: page.toSquare
+        )
+        .frame(maxWidth: .infinity)
+        .aspectRatio(1, contentMode: .fit)
+      } else {
+        FishingRewardEmptyPage(summary: page.summary, detailText: page.detailText)
+      }
+
+      if let footerText = page.footerText {
+        Text(footerText)
+          .font(.system(size: 12, weight: .bold, design: .rounded))
+          .foregroundStyle(Color(red: 0.36, green: 0.28, blue: 0.20))
+          .lineSpacing(2)
+      }
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+  }
+}
+
+private struct FishingRewardBoardDiagram: View {
+  let state: ChessGameState
+  let perspective: ChessColor
+  let fromSquare: BoardSquare?
+  let toSquare: BoardSquare?
+
+  var body: some View {
+    GeometryReader { geometry in
+      let boardSize = min(geometry.size.width, geometry.size.height)
+      let squareSize = boardSize / 8.0
+      let files = perspective == .white ? Array(0..<8) : Array((0..<8).reversed())
+      let ranks = perspective == .white ? Array((0..<8).reversed()) : Array(0..<8)
+
+      ZStack {
+        RoundedRectangle(cornerRadius: 24, style: .continuous)
+          .fill(Color(red: 0.36, green: 0.24, blue: 0.12))
+
+        RoundedRectangle(cornerRadius: 20, style: .continuous)
+          .fill(Color(red: 0.17, green: 0.12, blue: 0.09))
+          .padding(8)
+
+        VStack(spacing: 0) {
+          ForEach(ranks, id: \.self) { rank in
+            HStack(spacing: 0) {
+              ForEach(files, id: \.self) { file in
+                let square = BoardSquare(file: file, rank: rank)
+                FishingRewardBoardSquare(
+                  piece: state.piece(at: square),
+                  square: square,
+                  fromSquare: fromSquare,
+                  toSquare: toSquare,
+                  size: squareSize
+                )
+              }
+            }
+          }
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .padding(14)
+      }
+      .frame(width: boardSize, height: boardSize)
+    }
+  }
+}
+
+private struct FishingRewardBoardSquare: View {
+  let piece: ChessPieceState?
+  let square: BoardSquare
+  let fromSquare: BoardSquare?
+  let toSquare: BoardSquare?
+  let size: CGFloat
+
+  private var isDark: Bool {
+    (square.file + square.rank).isMultiple(of: 2)
+  }
+
+  var body: some View {
+    ZStack {
+      Rectangle()
+        .fill(
+          isDark
+            ? Color(red: 0.66, green: 0.51, blue: 0.32)
+            : Color(red: 0.93, green: 0.88, blue: 0.76)
+        )
+
+      if square == fromSquare {
+        RoundedRectangle(cornerRadius: 8, style: .continuous)
+          .stroke(
+            Color(red: 0.15, green: 0.47, blue: 0.54),
+            style: StrokeStyle(lineWidth: max(size * 0.08, 2), dash: [max(size * 0.22, 4)])
+          )
+          .padding(max(size * 0.10, 3))
+      }
+
+      if square == toSquare {
+        RoundedRectangle(cornerRadius: 10, style: .continuous)
+          .fill(Color(red: 0.94, green: 0.73, blue: 0.30).opacity(0.42))
+          .padding(max(size * 0.08, 3))
+      }
+
+      if let piece {
+        ZStack {
+          Circle()
+            .fill(
+              piece.color == .white
+                ? Color(red: 0.97, green: 0.95, blue: 0.89)
+                : Color(red: 0.19, green: 0.15, blue: 0.13)
+            )
+            .overlay(
+              Circle()
+                .stroke(
+                  piece.color == .white
+                    ? Color(red: 0.52, green: 0.39, blue: 0.26).opacity(0.55)
+                    : Color.white.opacity(0.12),
+                  lineWidth: max(size * 0.04, 1)
+                )
+            )
+
+          Text(fishingRewardPieceGlyph(for: piece))
+            .font(.system(size: size * 0.48, weight: .bold, design: .serif))
+            .foregroundStyle(
+              piece.color == .white
+                ? Color(red: 0.17, green: 0.13, blue: 0.11)
+                : Color(red: 0.96, green: 0.94, blue: 0.88)
+            )
+        }
+        .padding(size * 0.10)
+      }
+    }
+    .frame(width: size, height: size)
+  }
+
+  private func fishingRewardPieceGlyph(for piece: ChessPieceState) -> String {
+    switch (piece.color, piece.kind) {
+    case (.white, .pawn):
+      return "♙"
+    case (.white, .rook):
+      return "♖"
+    case (.white, .knight):
+      return "♘"
+    case (.white, .bishop):
+      return "♗"
+    case (.white, .queen):
+      return "♕"
+    case (.white, .king):
+      return "♔"
+    case (.black, .pawn):
+      return "♟"
+    case (.black, .rook):
+      return "♜"
+    case (.black, .knight):
+      return "♞"
+    case (.black, .bishop):
+      return "♝"
+    case (.black, .queen):
+      return "♛"
+    case (.black, .king):
+      return "♚"
+    }
+  }
+}
+
+private struct FishingRewardEmptyPage: View {
+  let summary: String
+  let detailText: String
+
+  var body: some View {
+    VStack(spacing: 14) {
+      Image(systemName: "doc.text.image")
+        .font(.system(size: 34, weight: .bold))
+        .foregroundStyle(Color(red: 0.36, green: 0.28, blue: 0.20))
+
+      Text(summary)
+        .font(.system(size: 19, weight: .heavy, design: .serif))
+        .foregroundStyle(Color(red: 0.16, green: 0.12, blue: 0.10))
+        .multilineTextAlignment(.center)
+
+      Text(detailText)
+        .font(.system(size: 13, weight: .semibold, design: .rounded))
+        .foregroundStyle(Color(red: 0.26, green: 0.20, blue: 0.16))
+        .multilineTextAlignment(.center)
+        .lineSpacing(2)
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .padding(.horizontal, 12)
+    .background(
+      RoundedRectangle(cornerRadius: 20, style: .continuous)
+        .fill(Color.white.opacity(0.30))
+    )
+  }
+}
+
+private struct DailyCosmeticRewardStatusOverlay: View {
+  let message: String
+
+  var body: some View {
+    VStack {
+      Spacer()
+
+      Text(message)
+        .font(.system(size: 14, weight: .bold, design: .rounded))
+        .foregroundStyle(.white)
+        .multilineTextAlignment(.center)
+        .lineSpacing(2)
+        .padding(.horizontal, 18)
+        .padding(.vertical, 12)
+        .background(
+          Capsule(style: .continuous)
+            .fill(Color(red: 0.08, green: 0.11, blue: 0.15).opacity(0.90))
+            .overlay(
+              Capsule(style: .continuous)
+                .stroke(Color.white.opacity(0.16), lineWidth: 1)
+            )
+        )
+        .padding(.horizontal, 24)
+        .padding(.bottom, 138)
+    }
+    .transition(.move(edge: .bottom).combined(with: .opacity))
+    .allowsHitTesting(false)
+  }
+}
+
+private struct DailyCosmeticRewardOverlay: View {
+  let reward: PieceCosmeticReward
+  let onDismiss: () -> Void
+
+  var body: some View {
+    let modalSize = min(UIScreen.main.bounds.width - 36, 340)
+
+    ZStack {
+      Color.black.opacity(0.64)
+        .ignoresSafeArea()
+        .onTapGesture(perform: onDismiss)
+
+      VStack(spacing: 0) {
+        VStack(spacing: 14) {
+          Text("Daily Cosmetic")
+            .font(.system(size: 12, weight: .black, design: .rounded))
+            .tracking(2.0)
+            .foregroundStyle(Color(red: 0.96, green: 0.86, blue: 0.66))
+
+          CosmeticRewardPreviewTile(reward: reward)
+            .frame(width: modalSize * 0.58, height: modalSize * 0.58)
+
+          VStack(spacing: 6) {
+            Text(reward.displayName)
+              .font(.system(size: 24, weight: .heavy, design: .rounded))
+              .foregroundStyle(.white)
+              .multilineTextAlignment(.center)
+
+            Text("\(reward.targetPiece.displayName) cosmetic • \(reward.rarityLabel)")
+              .font(.system(size: 13, weight: .bold, design: .rounded))
+              .foregroundStyle(Color.white.opacity(0.76))
+
+            Text("New cosmetic unlocked!")
+              .font(.system(size: 14, weight: .black, design: .rounded))
+              .foregroundStyle(Color(red: 0.96, green: 0.86, blue: 0.66))
+
+            Text(reward.flavorText)
+              .font(.system(size: 13, weight: .semibold, design: .rounded))
+              .foregroundStyle(Color.white.opacity(0.82))
+              .multilineTextAlignment(.center)
+              .lineSpacing(2)
+              .frame(maxWidth: modalSize * 0.78)
+          }
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.top, 22)
+        .padding(.horizontal, 18)
+
+        Spacer(minLength: 12)
+
+        NativeActionButton(title: "Collect", style: .solid, action: onDismiss)
+          .padding(.horizontal, 18)
+          .padding(.bottom, 18)
+      }
+      .frame(width: modalSize, height: modalSize)
       .background(
-        RoundedRectangle(cornerRadius: 14, style: .continuous)
-          .fill(Color.white.opacity(0.82))
+        RoundedRectangle(cornerRadius: 32, style: .continuous)
+          .fill(
+            LinearGradient(
+              colors: [
+                Color(red: 0.07, green: 0.11, blue: 0.15),
+                Color(red: 0.04, green: 0.06, blue: 0.09),
+              ],
+              startPoint: .topLeading,
+              endPoint: .bottomTrailing
+            )
+          )
+          .overlay(
+            RoundedRectangle(cornerRadius: 32, style: .continuous)
+              .stroke(Color.white.opacity(0.12), lineWidth: 1)
+          )
       )
+      .padding(.horizontal, 18)
+    }
+  }
+}
+
+private struct CosmeticRewardPreviewTile: View {
+  let reward: PieceCosmeticReward
+
+  var body: some View {
+    let background = Color(uiColor: reward.previewBackgroundColor)
+    let accent = Color(uiColor: reward.previewAccentColor)
+    let detail = Color(uiColor: reward.previewDetailColor)
+
+    ZStack {
+      RoundedRectangle(cornerRadius: 28, style: .continuous)
+        .fill(
+          LinearGradient(
+            colors: [
+              background,
+              accent.opacity(0.92),
+            ],
+            startPoint: .topLeading,
+            endPoint: .bottomTrailing
+          )
+        )
+
+      RoundedRectangle(cornerRadius: 28, style: .continuous)
+        .stroke(Color.white.opacity(0.18), lineWidth: 1)
+
+      VStack(alignment: .leading, spacing: 12) {
+        HStack(alignment: .top) {
+          Text(reward.rarityLabel.uppercased())
+            .font(.system(size: 10, weight: .black, design: .rounded))
+            .tracking(1.4)
+            .foregroundStyle(Color.white.opacity(0.88))
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(
+              Capsule(style: .continuous)
+                .fill(Color.black.opacity(0.18))
+            )
+
+          Spacer(minLength: 12)
+
+          HStack(spacing: 6) {
+            Text(cosmeticRewardTargetGlyph(for: reward.targetPiece))
+              .font(.system(size: 18, weight: .bold, design: .serif))
+            Text(reward.targetPiece.displayName)
+              .font(.system(size: 11, weight: .black, design: .rounded))
+          }
+          .foregroundStyle(detail.opacity(0.95))
+          .padding(.horizontal, 10)
+          .padding(.vertical, 6)
+          .background(
+            Capsule(style: .continuous)
+              .fill(Color.white.opacity(0.16))
+          )
+        }
+
+        Spacer(minLength: 0)
+
+        HStack {
+          Spacer(minLength: 0)
+
+          ZStack {
+            Circle()
+              .fill(Color.white.opacity(0.14))
+              .frame(width: 108, height: 108)
+
+            Text(reward.previewGlyph)
+              .font(.system(size: 58))
+          }
+
+          Spacer(minLength: 0)
+        }
+
+        Spacer(minLength: 0)
+
+        Text(reward.displayName.uppercased())
+          .font(.system(size: 15, weight: .black, design: .rounded))
+          .tracking(1.6)
+          .foregroundStyle(detail)
+      }
+      .padding(18)
+    }
+  }
+
+  private func cosmeticRewardTargetGlyph(for piece: ChessPieceKind) -> String {
+    switch piece {
+    case .pawn:
+      return "♙"
+    case .rook:
+      return "♖"
+    case .knight:
+      return "♘"
+    case .bishop:
+      return "♗"
+    case .queen:
+      return "♕"
+    case .king:
+      return "♔"
+    }
   }
 }
 
@@ -17540,6 +18340,7 @@ private struct NativeARView: UIViewRepresentable {
   @ObservedObject var lessonStore: OpeningLessonStore
   @ObservedObject var socraticCoach: SocraticCoachStore
   @ObservedObject var fishing: FishingInteractionStore
+  @ObservedObject var cosmeticRewards: DailyCosmeticRewardStore
   @ObservedObject var pieceRoles: PieceRoleStore
   let onReviewFinished: () -> Void
 
@@ -17553,6 +18354,7 @@ private struct NativeARView: UIViewRepresentable {
       lessonStore: lessonStore,
       socraticCoach: socraticCoach,
       fishing: fishing,
+      cosmeticRewards: cosmeticRewards,
       pieceRoles: pieceRoles,
       onReviewFinished: onReviewFinished
     )
@@ -17618,9 +18420,11 @@ private struct NativeARView: UIViewRepresentable {
     private struct FishingRigPoseResponse {
       let baselinePitch: Float?
       let currentPitch: Float?
-      let signedPitchDelta: Float
+      let relativePitchDelta: Float
       let appliedPitchDelta: Float
+      let unclampedFinalPitchAngle: Float
       let finalPitchAngle: Float
+      let unclampedHandYOffset: Float
       let handYOffset: Float
       let hitLowerPitchClamp: Bool
       let hitUpperPitchClamp: Bool
@@ -17648,6 +18452,8 @@ private struct NativeARView: UIViewRepresentable {
     private static let fishingTerrainPlaneLocalY: Float = -0.041
     private static let fishingRigGroundClearance: Float = 0.012
     private static let fishingRigMinimumCameraUpComponent: Float = 0.22
+    private static let cosmeticVendingDispenseGlowBaseColor = UIColor(red: 0.98, green: 0.80, blue: 0.44, alpha: 0.84)
+    private static let cosmeticVendingDispenseDurationNanoseconds: UInt64 = 620_000_000
     private static let fishingRigLiveDebugLoggingEnabled = true
     private static let fishingRigLiveDebugLogInterval: CFTimeInterval = 0.20
     private static let neutralHoldCalibrationDuration: CFTimeInterval = 2.5
@@ -17710,6 +18516,7 @@ private struct NativeARView: UIViewRepresentable {
     private let lessonStore: OpeningLessonStore
     private let socraticCoach: SocraticCoachStore
     private let fishing: FishingInteractionStore
+    private let cosmeticRewards: DailyCosmeticRewardStore
     private let pieceRoles: PieceRoleStore
     private let onReviewFinished: () -> Void
     private weak var arView: ARView?
@@ -17772,6 +18579,10 @@ private struct NativeARView: UIViewRepresentable {
     private weak var fishingPondEntity: Entity?
     private weak var fishingPondWaterEntity: Entity?
     private weak var fishingPondFinEntity: Entity?
+    private weak var cosmeticVendingMachineEntity: Entity?
+    private weak var cosmeticVendingMachineGlowEntity: ModelEntity?
+    private weak var cosmeticVendingMachineTrayEntity: Entity?
+    private var cosmeticVendingDispenseTask: Task<Void, Never>?
     private var fishingRodAnchor: AnchorEntity?
     private weak var fishingRigEntity: Entity?
     private weak var fishingRodEntity: Entity?
@@ -17816,6 +18627,7 @@ private struct NativeARView: UIViewRepresentable {
       lessonStore: OpeningLessonStore,
       socraticCoach: SocraticCoachStore,
       fishing: FishingInteractionStore,
+      cosmeticRewards: DailyCosmeticRewardStore,
       pieceRoles: PieceRoleStore,
       onReviewFinished: @escaping () -> Void
     ) {
@@ -17827,6 +18639,7 @@ private struct NativeARView: UIViewRepresentable {
       self.lessonStore = lessonStore
       self.socraticCoach = socraticCoach
       self.fishing = fishing
+      self.cosmeticRewards = cosmeticRewards
       self.pieceRoles = pieceRoles
       self.onReviewFinished = onReviewFinished
 
@@ -17859,6 +18672,7 @@ private struct NativeARView: UIViewRepresentable {
       fishingCatchWindowTask?.cancel()
       fishingRevealTask?.cancel()
       fishingResetTask?.cancel()
+      cosmeticVendingDispenseTask?.cancel()
       fishingRodAnchor?.removeFromParent()
       fishingCastLineAnchor?.removeFromParent()
       fishingBobberAnchor?.removeFromParent()
@@ -18096,6 +18910,10 @@ private struct NativeARView: UIViewRepresentable {
           return
         }
 
+        if handleCosmeticVendingMachineTap(entity) {
+          return
+        }
+
         if wantedPosterRoot(for: entity) != nil {
           UIImpactFeedbackGenerator(style: .medium).impactOccurred()
           highlightEmployeeOfTheMonth()
@@ -18133,6 +18951,21 @@ private struct NativeARView: UIViewRepresentable {
 
       UIImpactFeedbackGenerator(style: .light).impactOccurred()
       fishing.revealArmedRewardNote()
+      return true
+    }
+
+    private func handleCosmeticVendingMachineTap(_ entity: Entity) -> Bool {
+      guard cosmeticVendingMachineRoot(for: entity) != nil else {
+        return false
+      }
+
+      switch cosmeticRewards.claimRewardIfAvailable() {
+      case .granted(let reward):
+        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        dispenseCosmeticReward(reward)
+      case .unavailable:
+        UINotificationFeedbackGenerator().notificationOccurred(.warning)
+      }
       return true
     }
 
@@ -18427,6 +19260,7 @@ private struct NativeARView: UIViewRepresentable {
     private func applyBoardScale() {
       boardRoot.scale = SIMD3<Float>(repeating: boardScale)
       updateFishingPondPlacement()
+      updateCosmeticVendingMachinePlacement()
     }
 
     private func desiredBoardViewerColor() -> ChessColor {
@@ -21157,6 +21991,13 @@ private struct NativeARView: UIViewRepresentable {
       pond.position = fishingPondOffset()
       backdrop.addChild(pond)
 
+      let cosmeticVendingMachine = makeCosmeticVendingMachineEntity()
+      cosmeticVendingMachine.position = cosmeticVendingMachineOffset()
+      cosmeticVendingMachine.orientation = cosmeticVendingMachineOrientation(
+        for: cosmeticVendingMachine.position
+      )
+      backdrop.addChild(cosmeticVendingMachine)
+
       let wantedPosterTree = makeWantedPosterTreeEntity()
       backdrop.addChild(wantedPosterTree)
 
@@ -21221,6 +22062,98 @@ private struct NativeARView: UIViewRepresentable {
       }
 
       return backdrop
+    }
+
+    private func makeCosmeticVendingMachineEntity() -> Entity {
+      let machine = Entity()
+      machine.name = "daily_cosmetic_vending_machine"
+
+      let bodyWidth: Float = 0.24
+      let bodyHeight: Float = 0.44
+      let bodyDepth: Float = 0.18
+      let body = ModelEntity(
+        mesh: .generateBox(size: SIMD3<Float>(bodyWidth, bodyHeight, bodyDepth)),
+        materials: [Self.scenicMaterial(UIColor(red: 0.54, green: 0.16, blue: 0.14, alpha: 1), roughness: 0.74)]
+      )
+      body.position = SIMD3<Float>(0, bodyHeight * 0.5, 0)
+      body.generateCollisionShapes(recursive: false)
+      machine.addChild(body)
+
+      let sideStripe = ModelEntity(
+        mesh: .generateBox(size: SIMD3<Float>(0.024, bodyHeight * 0.90, bodyDepth + 0.006)),
+        materials: [Self.scenicMaterial(UIColor(red: 0.96, green: 0.76, blue: 0.30, alpha: 1), roughness: 0.42)]
+      )
+      sideStripe.position = SIMD3<Float>(-(bodyWidth * 0.36), bodyHeight * 0.5, 0)
+      machine.addChild(sideStripe)
+
+      let glass = ModelEntity(
+        mesh: .generateBox(size: SIMD3<Float>(bodyWidth * 0.66, bodyHeight * 0.42, 0.010)),
+        materials: [Self.scenicMaterial(UIColor(red: 0.70, green: 0.88, blue: 0.96, alpha: 0.92), roughness: 0.08)]
+      )
+      glass.position = SIMD3<Float>(0, bodyHeight * 0.64, (bodyDepth * 0.5) + 0.010)
+      glass.generateCollisionShapes(recursive: false)
+      machine.addChild(glass)
+
+      let marquee = ModelEntity(
+        mesh: .generateBox(size: SIMD3<Float>(bodyWidth * 0.82, 0.074, 0.042)),
+        materials: [Self.scenicMaterial(UIColor(red: 0.19, green: 0.11, blue: 0.08, alpha: 1), roughness: 0.86)]
+      )
+      marquee.position = SIMD3<Float>(0, bodyHeight + 0.046, (bodyDepth * 0.5) - 0.010)
+      marquee.generateCollisionShapes(recursive: false)
+      machine.addChild(marquee)
+
+      let glow = ModelEntity(
+        mesh: .generateBox(size: SIMD3<Float>(bodyWidth * 0.64, 0.026, 0.010)),
+        materials: [SimpleMaterial(color: Self.cosmeticVendingDispenseGlowBaseColor, roughness: 0.08, isMetallic: false)]
+      )
+      glow.position = SIMD3<Float>(0, bodyHeight + 0.046, (bodyDepth * 0.5) + 0.018)
+      machine.addChild(glow)
+      cosmeticVendingMachineGlowEntity = glow
+
+      let tray = ModelEntity(
+        mesh: .generateBox(size: SIMD3<Float>(0.10, 0.036, 0.082)),
+        materials: [Self.scenicMaterial(UIColor(red: 0.16, green: 0.09, blue: 0.08, alpha: 1), roughness: 0.92)]
+      )
+      tray.position = SIMD3<Float>(0, 0.094, (bodyDepth * 0.5) + 0.036)
+      tray.generateCollisionShapes(recursive: false)
+      machine.addChild(tray)
+      cosmeticVendingMachineTrayEntity = tray
+
+      let trayLip = ModelEntity(
+        mesh: .generateBox(size: SIMD3<Float>(0.112, 0.016, 0.010)),
+        materials: [Self.scenicMaterial(UIColor(red: 0.28, green: 0.16, blue: 0.12, alpha: 1), roughness: 0.92)]
+      )
+      trayLip.position = tray.position + SIMD3<Float>(0, 0.008, 0.040)
+      machine.addChild(trayLip)
+
+      let coinSlot = ModelEntity(
+        mesh: .generateBox(size: SIMD3<Float>(0.070, 0.008, 0.010)),
+        materials: [Self.scenicMaterial(UIColor(red: 0.12, green: 0.08, blue: 0.07, alpha: 1), roughness: 0.96)]
+      )
+      coinSlot.position = SIMD3<Float>(0.050, bodyHeight * 0.46, (bodyDepth * 0.5) + 0.016)
+      machine.addChild(coinSlot)
+
+      let actionButton = ModelEntity(
+        mesh: .generateSphere(radius: 0.5),
+        materials: [SimpleMaterial(color: UIColor(red: 0.94, green: 0.82, blue: 0.38, alpha: 1), roughness: 0.14, isMetallic: true)]
+      )
+      actionButton.scale = SIMD3<Float>(0.034, 0.034, 0.034)
+      actionButton.position = SIMD3<Float>(0.074, bodyHeight * 0.32, (bodyDepth * 0.5) + 0.020)
+      machine.addChild(actionButton)
+
+      let feetOffsets: [Float] = [-0.070, 0.070]
+      for xOffset in feetOffsets {
+        let foot = ModelEntity(
+          mesh: .generateBox(size: SIMD3<Float>(0.022, 0.042, 0.022)),
+          materials: [Self.scenicMaterial(UIColor(red: 0.18, green: 0.10, blue: 0.08, alpha: 1), roughness: 0.94)]
+        )
+        foot.position = SIMD3<Float>(xOffset, 0.021, 0)
+        machine.addChild(foot)
+      }
+
+      machine.generateCollisionShapes(recursive: true)
+      cosmeticVendingMachineEntity = machine
+      return machine
     }
 
     private func makeWantedPosterTreeEntity() -> Entity {
@@ -21925,6 +22858,24 @@ private struct NativeARView: UIViewRepresentable {
       return SIMD3<Float>(-lateralDistance, Self.fishingPondVerticalOffset, 0.04)
     }
 
+    private func cosmeticVendingMachineOffset() -> SIMD3<Float> {
+      let halfBoardExtent = (boardSize * boardScale) * 0.5
+      let sideDistance = max(halfBoardExtent + 0.50, 0.70)
+      let behindPlayerDistance = max(halfBoardExtent + 0.78, 0.98)
+      return SIMD3<Float>(sideDistance, Self.fishingPondVerticalOffset, -behindPlayerDistance)
+    }
+
+    private func cosmeticVendingMachineOrientation(for position: SIMD3<Float>) -> simd_quatf {
+      let halfBoardExtent = (boardSize * boardScale) * 0.5
+      let playerFacingTarget = SIMD2<Float>(0, -(halfBoardExtent + 0.44))
+      let facingDirection = normalized(
+        playerFacingTarget - SIMD2<Float>(position.x, position.z),
+        fallback: SIMD2<Float>(0, 1)
+      )
+      let yaw = atan2(facingDirection.x, facingDirection.y)
+      return simd_quatf(angle: yaw, axis: SIMD3<Float>(0, 1, 0))
+    }
+
     private func wantedPosterTreeOffset() -> SIMD3<Float> {
       let halfBoardExtent = (boardSize * boardScale) * 0.5
       let leftDistance = max(halfBoardExtent + 0.22, 0.42)
@@ -21935,6 +22886,131 @@ private struct NativeARView: UIViewRepresentable {
     @MainActor
     private func updateFishingPondPlacement() {
       fishingPondEntity?.position = fishingPondOffset()
+    }
+
+    @MainActor
+    private func updateCosmeticVendingMachinePlacement() {
+      guard let cosmeticVendingMachineEntity else {
+        return
+      }
+
+      let position = cosmeticVendingMachineOffset()
+      cosmeticVendingMachineEntity.position = position
+      cosmeticVendingMachineEntity.orientation = cosmeticVendingMachineOrientation(for: position)
+    }
+
+    @MainActor
+    private func dispenseCosmeticReward(_ reward: PieceCosmeticReward) {
+      cosmeticVendingDispenseTask?.cancel()
+
+      guard let cosmeticVendingMachineEntity,
+            let parent = cosmeticVendingMachineEntity.parent else {
+        cosmeticRewards.presentDispensedReward(reward)
+        return
+      }
+
+      let originalTransform = cosmeticVendingMachineEntity.transform
+      let dispenseCard = makeCosmeticRewardDispenseCardEntity(for: reward)
+      let trayPosition = cosmeticVendingMachineTrayEntity?.position(relativeTo: cosmeticVendingMachineEntity)
+        ?? SIMD3<Float>(0, 0.10, 0.14)
+      dispenseCard.transform = Transform(
+        scale: SIMD3<Float>(repeating: 0.55),
+        rotation: simd_quatf(angle: -.pi / 18, axis: SIMD3<Float>(1, 0, 0)),
+        translation: trayPosition + SIMD3<Float>(0, 0.018, 0.012)
+      )
+      cosmeticVendingMachineEntity.addChild(dispenseCard)
+
+      let shakeTransform = transformed(
+        originalTransform,
+        translation: SIMD3<Float>(0.012, 0, 0),
+        rotation: simd_quatf(angle: .pi / 96, axis: SIMD3<Float>(0, 1, 0))
+      )
+      cosmeticVendingMachineEntity.move(
+        to: shakeTransform,
+        relativeTo: parent,
+        duration: 0.10,
+        timingFunction: .easeInOut
+      )
+
+      setCosmeticVendingGlowColor(reward.previewAccentColor)
+
+      cosmeticVendingDispenseTask = Task { @MainActor [weak self, weak dispenseCard] in
+        guard let self else {
+          return
+        }
+
+        try? await Task.sleep(nanoseconds: 120_000_000)
+        guard !Task.isCancelled else {
+          self.setCosmeticVendingGlowColor(Self.cosmeticVendingDispenseGlowBaseColor)
+          dispenseCard?.removeFromParent()
+          return
+        }
+
+        cosmeticVendingMachineEntity.move(
+          to: originalTransform,
+          relativeTo: parent,
+          duration: 0.18,
+          timingFunction: .easeOut
+        )
+
+        dispenseCard?.move(
+          to: Transform(
+            scale: SIMD3<Float>(repeating: 1.0),
+            rotation: simd_normalize(
+              simd_quatf(angle: -.pi / 12, axis: SIMD3<Float>(1, 0, 0)) *
+                simd_quatf(angle: .pi / 18, axis: SIMD3<Float>(0, 1, 0))
+            ),
+            translation: trayPosition + SIMD3<Float>(0, 0.11, 0.10)
+          ),
+          relativeTo: cosmeticVendingMachineEntity,
+          duration: 0.42,
+          timingFunction: .easeOut
+        )
+
+        try? await Task.sleep(nanoseconds: Self.cosmeticVendingDispenseDurationNanoseconds)
+        guard !Task.isCancelled else {
+          self.setCosmeticVendingGlowColor(Self.cosmeticVendingDispenseGlowBaseColor)
+          dispenseCard?.removeFromParent()
+          return
+        }
+
+        self.setCosmeticVendingGlowColor(Self.cosmeticVendingDispenseGlowBaseColor)
+        dispenseCard?.removeFromParent()
+        self.cosmeticRewards.presentDispensedReward(reward)
+      }
+    }
+
+    private func setCosmeticVendingGlowColor(_ color: UIColor) {
+      cosmeticVendingMachineGlowEntity?.model?.materials = [
+        SimpleMaterial(color: color, roughness: 0.08, isMetallic: false)
+      ]
+    }
+
+    private func makeCosmeticRewardDispenseCardEntity(for reward: PieceCosmeticReward) -> Entity {
+      let card = Entity()
+
+      let body = ModelEntity(
+        mesh: .generateBox(size: SIMD3<Float>(0.076, 0.094, 0.010)),
+        materials: [Self.scenicMaterial(reward.previewBackgroundColor, roughness: 0.18)]
+      )
+      card.addChild(body)
+
+      let accentBand = ModelEntity(
+        mesh: .generateBox(size: SIMD3<Float>(0.076, 0.022, 0.011)),
+        materials: [Self.scenicMaterial(reward.previewAccentColor, roughness: 0.10)]
+      )
+      accentBand.position = SIMD3<Float>(0, 0.026, 0.001)
+      card.addChild(accentBand)
+
+      let badge = ModelEntity(
+        mesh: .generateSphere(radius: 0.5),
+        materials: [SimpleMaterial(color: reward.previewDetailColor, roughness: 0.06, isMetallic: false)]
+      )
+      badge.scale = SIMD3<Float>(0.026, 0.026, 0.010)
+      badge.position = SIMD3<Float>(0, -0.016, 0.006)
+      card.addChild(badge)
+
+      return card
     }
 
     private static func scenicMaterial(_ color: UIColor, roughness: Float) -> SimpleMaterial {
@@ -22675,20 +23751,28 @@ private struct NativeARView: UIViewRepresentable {
         guard let self else {
           return
         }
-        let rewardLines = await self.commentary.fishingRewardMoveLines(limit: 5)
+        let rewardPages = await self.commentary.fishingRewardPages(limit: 5)
         try? await Task.sleep(nanoseconds: 860_000_000)
         guard self.fishingSequenceID == sequenceID,
               self.fishing.state == .caught else {
           return
         }
-        self.fishing.armRewardFromCaughtFish(
-          lines: rewardLines.isEmpty
-            ? [
-                "1. No Stockfish line ready yet.",
-                "2. Trigger a fresh position analysis and cast again.",
-              ]
-            : rewardLines
-        )
+        let resolvedPages = rewardPages.isEmpty
+          ? [
+              FishingRewardPage(
+                id: "fishing-reward-empty",
+                title: "No line yet",
+                summary: "Stockfish has not finished a diagram for this catch.",
+                detailText: "Trigger a fresh position analysis and cast again.",
+                footerText: nil,
+                boardState: nil,
+                fromSquare: nil,
+                toSquare: nil,
+                perspective: .white
+              )
+            ]
+          : rewardPages
+        self.fishing.armRewardFromCaughtFish(pages: resolvedPages)
       }
     }
 
@@ -22958,6 +24042,8 @@ private struct NativeARView: UIViewRepresentable {
       let rotation = simd_normalize(yaw * roll * pitch)
       var adjustedTranslation = baseTranslation
       adjustedTranslation.y += poseResponse.handYOffset
+      let handYBeforeTranslation = baseTranslation.y
+      let handYAfterTranslation = baseTranslation.y + poseResponse.handYOffset
       var groundLift: Float = 0
 
       if let cameraMatrix,
@@ -22977,10 +24063,12 @@ private struct NativeARView: UIViewRepresentable {
         }
       }
 
-      logFishingRigPoseIfNeeded(
+      fishingRigDiagnostics(
         poseResponse,
-        finalHandYOffset: adjustedTranslation.y - baseTranslation.y,
-        groundLift: groundLift
+        handYBeforeTranslation: handYBeforeTranslation,
+        handYAfterTranslation: handYAfterTranslation,
+        finalHandY: adjustedTranslation.y,
+        groundLiftApplied: groundLift > 0.0001
       )
 
       return Transform(
@@ -23001,31 +24089,24 @@ private struct NativeARView: UIViewRepresentable {
       } else {
         currentPitch = nil
       }
-      let signedPitchDelta: Float
+      let relativePitchDelta: Float
       if let baselinePitch, let currentPitch {
-        signedPitchDelta = currentPitch - baselinePitch
+        relativePitchDelta = currentPitch - baselinePitch
       } else {
-        signedPitchDelta = 0
+        relativePitchDelta = 0
       }
 
-      let unclampedFinalPitchAngle = basePitchAngle + (signedPitchDelta * Self.fishingRigPitchResponseMultiplier)
+      let appliedPitchDelta = relativePitchDelta
+      let unclampedFinalPitchAngle = basePitchAngle - appliedPitchDelta
       let finalPitchAngle = clamp(
         unclampedFinalPitchAngle,
         min: Self.fishingRigFinalPitchAngleMin,
         max: Self.fishingRigFinalPitchAngleMax
       )
-      let appliedPitchDelta = finalPitchAngle - basePitchAngle
       let hitLowerPitchClamp = unclampedFinalPitchAngle < Self.fishingRigFinalPitchAngleMin
       let hitUpperPitchClamp = unclampedFinalPitchAngle > Self.fishingRigFinalPitchAngleMax
 
-      let effectiveSignedPitchDelta: Float
-      if abs(Self.fishingRigPitchResponseMultiplier) > 0.0001 {
-        effectiveSignedPitchDelta = appliedPitchDelta / Self.fishingRigPitchResponseMultiplier
-      } else {
-        effectiveSignedPitchDelta = 0
-      }
-
-      let unclampedHandYOffset = effectiveSignedPitchDelta * Self.fishingRigVerticalResponseMultiplier
+      let unclampedHandYOffset = -(appliedPitchDelta * Self.fishingRigVerticalResponseMultiplier)
       let handYOffset = clamp(
         unclampedHandYOffset,
         min: Self.fishingRigFinalYOffsetMin,
@@ -23035,9 +24116,11 @@ private struct NativeARView: UIViewRepresentable {
       return FishingRigPoseResponse(
         baselinePitch: baselinePitch,
         currentPitch: currentPitch,
-        signedPitchDelta: signedPitchDelta,
+        relativePitchDelta: relativePitchDelta,
         appliedPitchDelta: appliedPitchDelta,
+        unclampedFinalPitchAngle: unclampedFinalPitchAngle,
         finalPitchAngle: finalPitchAngle,
+        unclampedHandYOffset: unclampedHandYOffset,
         handYOffset: handYOffset,
         hitLowerPitchClamp: hitLowerPitchClamp,
         hitUpperPitchClamp: hitUpperPitchClamp,
@@ -23131,7 +24214,7 @@ private struct NativeARView: UIViewRepresentable {
 
     private func fishingSignedPitch(forward: SIMD3<Float>) -> Float {
       let horizontalLength = max(sqrt((forward.x * forward.x) + (forward.z * forward.z)), 0.0001)
-      return atan2(forward.y, horizontalLength)
+      return atan2(-forward.y, horizontalLength)
     }
 
     private func fishingDownwardPitch(for cameraMatrix: simd_float4x4) -> Float {
@@ -23208,10 +24291,12 @@ private struct NativeARView: UIViewRepresentable {
       print("Fishing debug [\(context)] ground plane height used for clamp: \(String(describing: groundPlaneHeight))")
     }
 
-    private func logFishingRigPoseIfNeeded(
+    private func fishingRigDiagnostics(
       _ poseResponse: FishingRigPoseResponse,
-      finalHandYOffset: Float,
-      groundLift: Float
+      handYBeforeTranslation: Float,
+      handYAfterTranslation: Float,
+      finalHandY: Float,
+      groundLiftApplied: Bool
     ) {
       guard Self.fishingRigLiveDebugLoggingEnabled else {
         return
@@ -23223,18 +24308,8 @@ private struct NativeARView: UIViewRepresentable {
       }
       lastFishingRigPoseDebugLogTime = now
 
-      let clampStatus = [
-        poseResponse.hitLowerPitchClamp ? "pitch_min" : nil,
-        poseResponse.hitUpperPitchClamp ? "pitch_max" : nil,
-        poseResponse.hitLowerHandClamp ? "hand_min" : nil,
-        poseResponse.hitUpperHandClamp ? "hand_max" : nil,
-        groundLift > 0.0001 ? "ground_lift" : nil,
-      ]
-      .compactMap { $0 }
-      .joined(separator: ",")
-
       print(
-        "Fishing live pose state=\(fishing.state) baseline=\(debugFloatString(poseResponse.baselinePitch)) current=\(debugFloatString(poseResponse.currentPitch)) signedDelta=\(poseResponse.signedPitchDelta) appliedPitchDelta=\(poseResponse.appliedPitchDelta) finalRodPitch=\(poseResponse.finalPitchAngle) finalHandYOffset=\(finalHandYOffset) groundLift=\(groundLift) clampHit=\(clampStatus.isEmpty ? "none" : clampStatus)"
+        "FISHING_DIAG: state=\(fishing.state) appliedPitchDelta=\(poseResponse.appliedPitchDelta) rodEulerXPreClamp=\(poseResponse.unclampedFinalPitchAngle) rodEulerXPostClamp=\(poseResponse.finalPitchAngle) handYBeforeTranslation=\(handYBeforeTranslation) handYAfterTranslation=\(handYAfterTranslation) handYFinal=\(finalHandY) groundLiftApplied=\(groundLiftApplied)"
       )
     }
 
@@ -23471,6 +24546,19 @@ private struct NativeARView: UIViewRepresentable {
 
       while let candidate = current {
         if candidate.name == "fishing_reward_fish" {
+          return candidate
+        }
+        current = candidate.parent
+      }
+
+      return nil
+    }
+
+    private func cosmeticVendingMachineRoot(for entity: Entity) -> Entity? {
+      var current: Entity? = entity
+
+      while let candidate = current {
+        if candidate.name == "daily_cosmetic_vending_machine" {
           return candidate
         }
         current = candidate.parent
