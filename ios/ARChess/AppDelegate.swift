@@ -13801,7 +13801,15 @@ private final class PieceRoleStore: ObservableObject {
       return nil
     }
 
-    return "Threatens \(employee.influenceCount) home-half squares"
+    let score = Double(employee.employeeThreatScoreHalfPoints) / 2.0
+    let kingZoneText = employee.attacksKingZone ? " • king ring" : ""
+    return String(
+      format: "Score %.1f • %d piece targets • %d home-half%@",
+      score,
+      employee.attackedFriendlyPieceCount,
+      employee.influenceCount,
+      kingZoneText
+    )
   }
 
   func update(snapshot: PieceRoleSnapshot) {
@@ -16992,6 +17000,9 @@ private struct PieceRoleAssignment {
   let piece: ChessPieceState
   let roleType: PieceRoleType
   let influenceCount: Int
+  let attackedFriendlyPieceCount: Int
+  let attacksKingZone: Bool
+  let employeeThreatScoreHalfPoints: Int
 }
 
 private struct PieceRoleSnapshot {
@@ -17016,6 +17027,16 @@ private struct PieceRoleSnapshot {
   }
 }
 
+private struct EmployeeThreatRating {
+  let attackedFriendlyPieceCount: Int
+  let attacksKingZone: Bool
+  let homeHalfInfluenceCount: Int
+
+  var scoreHalfPoints: Int {
+    (attackedFriendlyPieceCount * 3) + (attacksKingZone ? 2 : 0) + homeHalfInfluenceCount
+  }
+}
+
 private struct PieceRoleEvaluationCache {
   var influenceSquaresBySquare: [BoardSquare: [BoardSquare]] = [:]
   var legalMovesBySquare: [BoardSquare: [ChessMove]] = [:]
@@ -17036,16 +17057,42 @@ extension ChessGameState {
     )
 
     let enemyPieces = orderedPieces(for: enemyColor)
+    let enemyThreatRatingsBySquare = Dictionary(
+      uniqueKeysWithValues: enemyPieces.map { square, _ in
+        (
+          square,
+          employeeThreatRating(
+            for: square,
+            defendingColor: currentPlayer,
+            cache: &cache
+          )
+        )
+      }
+    )
     let employeeCandidate = enemyPieces
-      .map { square, piece -> (square: BoardSquare, piece: ChessPieceState, count: Int) in
-        let count = roleInfluenceSquares(from: square, cache: &cache)
-          .filter { isOnHomeHalf($0, for: currentPlayer) }
-          .count
-        return (square, piece, count)
+      .map { square, piece -> (square: BoardSquare, piece: ChessPieceState, rating: EmployeeThreatRating) in
+        let rating = enemyThreatRatingsBySquare[square] ?? EmployeeThreatRating(
+          attackedFriendlyPieceCount: 0,
+          attacksKingZone: false,
+          homeHalfInfluenceCount: 0
+        )
+        return (square, piece, rating)
       }
       .max { lhs, rhs in
-        if lhs.count != rhs.count {
-          return lhs.count < rhs.count
+        if lhs.rating.scoreHalfPoints != rhs.rating.scoreHalfPoints {
+          return lhs.rating.scoreHalfPoints < rhs.rating.scoreHalfPoints
+        }
+
+        if lhs.rating.attackedFriendlyPieceCount != rhs.rating.attackedFriendlyPieceCount {
+          return lhs.rating.attackedFriendlyPieceCount < rhs.rating.attackedFriendlyPieceCount
+        }
+
+        if lhs.rating.attacksKingZone != rhs.rating.attacksKingZone {
+          return lhs.rating.attacksKingZone == false && rhs.rating.attacksKingZone == true
+        }
+
+        if lhs.rating.homeHalfInfluenceCount != rhs.rating.homeHalfInfluenceCount {
+          return lhs.rating.homeHalfInfluenceCount < rhs.rating.homeHalfInfluenceCount
         }
 
         let lhsValue = lhs.piece.kind.strategicRoleTradeValue
@@ -17063,23 +17110,29 @@ extension ChessGameState {
 
     let employeeSquare = employeeCandidate?.square
     for (square, piece) in enemyPieces {
-      let influenceCount = roleInfluenceSquares(from: square, cache: &cache)
-        .filter { isOnHomeHalf($0, for: currentPlayer) }
-        .count
+      let rating = enemyThreatRatingsBySquare[square] ?? EmployeeThreatRating(
+        attackedFriendlyPieceCount: 0,
+        attacksKingZone: false,
+        homeHalfInfluenceCount: 0
+      )
+      let influenceCount = rating.homeHalfInfluenceCount
       let roleType: PieceRoleType = square == employeeSquare ? .employee : .worker
       assignmentsBySquare[square] = PieceRoleAssignment(
         pieceId: rolePieceIdentifier(for: piece, at: square),
         square: square,
         piece: piece,
         roleType: roleType,
-        influenceCount: influenceCount
+        influenceCount: influenceCount,
+        attackedFriendlyPieceCount: rating.attackedFriendlyPieceCount,
+        attacksKingZone: rating.attacksKingZone,
+        employeeThreatScoreHalfPoints: rating.scoreHalfPoints
       )
     }
 
     for (square, piece) in orderedPieces(for: currentPlayer) {
-      let influenceCount = roleInfluenceSquares(from: square, cache: &cache)
+      let enemyHalfInfluenceSquares = roleInfluenceSquares(from: square, cache: &cache)
         .filter { isOnEnemyHalf($0, for: currentPlayer) }
-        .count
+      let influenceCount = enemyHalfInfluenceSquares.count
       let roleType: PieceRoleType
       if isTraitorPiece(
         at: square,
@@ -17088,6 +17141,8 @@ extension ChessGameState {
         cache: &cache
       ) {
         roleType = .traitor
+      } else if !enemyHalfInfluenceSquares.isEmpty {
+        roleType = .worker
       } else if isLazyPiece(at: square, piece: piece, cache: &cache) {
         roleType = .lazy
       } else {
@@ -17099,7 +17154,10 @@ extension ChessGameState {
         square: square,
         piece: piece,
         roleType: roleType,
-        influenceCount: influenceCount
+        influenceCount: influenceCount,
+        attackedFriendlyPieceCount: 0,
+        attacksKingZone: false,
+        employeeThreatScoreHalfPoints: 0
       )
     }
 
@@ -17233,6 +17291,29 @@ extension ChessGameState {
     return pressuredSquares
   }
 
+  private func employeeThreatRating(
+    for attackerSquare: BoardSquare,
+    defendingColor: ChessColor,
+    cache: inout PieceRoleEvaluationCache
+  ) -> EmployeeThreatRating {
+    let attackedSquares = roleInfluenceSquares(from: attackerSquare, cache: &cache)
+    let defendingKingZone = kingZone(for: defendingColor)
+    let attackedFriendlyPieceCount = attackedSquares.reduce(into: 0) { count, square in
+      guard let occupant = board[square], occupant.color == defendingColor else {
+        return
+      }
+      count += 1
+    }
+    let homeHalfInfluenceCount = attackedSquares.filter { isOnHomeHalf($0, for: defendingColor) }.count
+    let attacksKingZone = !defendingKingZone.isEmpty && attackedSquares.contains { defendingKingZone.contains($0) }
+
+    return EmployeeThreatRating(
+      attackedFriendlyPieceCount: attackedFriendlyPieceCount,
+      attacksKingZone: attacksKingZone,
+      homeHalfInfluenceCount: homeHalfInfluenceCount
+    )
+  }
+
   private func isLazyPiece(
     at square: BoardSquare,
     piece: ChessPieceState,
@@ -17288,6 +17369,25 @@ extension ChessGameState {
 
   private func isOnHomeHalf(_ square: BoardSquare, for color: ChessColor) -> Bool {
     !isOnEnemyHalf(square, for: color)
+  }
+
+  private func kingZone(for color: ChessColor) -> Set<BoardSquare> {
+    guard let kingSquare = kingSquare(for: color) else {
+      return []
+    }
+
+    var zone: Set<BoardSquare> = [kingSquare]
+    for deltaFile in -1...1 {
+      for deltaRank in -1...1 {
+        guard deltaFile != 0 || deltaRank != 0,
+              let target = kingSquare.offset(file: deltaFile, rank: deltaRank) else {
+          continue
+        }
+        zone.insert(target)
+      }
+    }
+
+    return zone
   }
 
   private func removingPiece(at square: BoardSquare) -> ChessGameState {
@@ -17391,6 +17491,11 @@ private struct NativeARView: UIViewRepresentable {
     }
 
     private enum FishingHandSide {
+      case left
+      case right
+    }
+
+    private enum PieceAccessoryHandSide {
       case left
       case right
     }
@@ -17592,7 +17697,6 @@ private struct NativeARView: UIViewRepresentable {
     }
 
     deinit {
-      pieceRoles.unbindEmployeeHighlightHandler()
       initialAnalysisTask?.cancel()
       moveAnimationTask?.cancel()
       liveEngineTask?.cancel()
@@ -20238,9 +20342,9 @@ private struct NativeARView: UIViewRepresentable {
       case .traitor:
         accessory = makeTraitorHornsEntity(for: piece.kind)
       case .lazy:
-        accessory = makeLazyChipsEntity(for: piece.kind)
+        accessory = makeLazyChipsEntity(for: piece.kind, handSide: pieceRoleCarryHand(for: piece.kind))
       case .worker:
-        accessory = makeWorkerBriefcaseEntity(for: piece.kind)
+        accessory = makeWorkerBriefcaseEntity(for: piece.kind, handSide: pieceRoleCarryHand(for: piece.kind))
       }
 
       guard let accessory else {
@@ -20248,7 +20352,12 @@ private struct NativeARView: UIViewRepresentable {
       }
 
       accessory.name = "piece_role_accessory"
-      pieceEntity.addChild(accessory)
+      if roleType == .lazy || roleType == .worker,
+         let handEntity = pieceRoleHandEntity(in: pieceEntity, for: piece.kind, side: pieceRoleCarryHand(for: piece.kind)) {
+        handEntity.addChild(accessory)
+      } else {
+        pieceEntity.addChild(accessory)
+      }
     }
 
     private func makeTraitorHornsEntity(for kind: ChessPieceKind) -> Entity {
@@ -20280,12 +20389,13 @@ private struct NativeARView: UIViewRepresentable {
       return horns
     }
 
-    private func makeLazyChipsEntity(for kind: ChessPieceKind) -> Entity {
+    private func makeLazyChipsEntity(for kind: ChessPieceKind, handSide: PieceAccessoryHandSide) -> Entity {
       let chips = Entity()
-      chips.position = SIMD3<Float>(0.020, pieceRoleCarryHeight(for: kind), 0.012)
+      let handSign: Float = handSide == .left ? -1 : 1
+      chips.position = SIMD3<Float>(0.0065 * handSign, -0.003, 0.011)
       chips.orientation = simd_normalize(
-        simd_quatf(angle: -.pi / 7, axis: SIMD3<Float>(0, 1, 0)) *
-          simd_quatf(angle: .pi / 16, axis: SIMD3<Float>(0, 0, 1))
+        simd_quatf(angle: handSign * (.pi / 7), axis: SIMD3<Float>(0, 1, 0)) *
+          simd_quatf(angle: handSign * (.pi / 11), axis: SIMD3<Float>(0, 0, 1))
       )
 
       let bagMaterial = accessoryMaterial(color: UIColor(red: 0.93, green: 0.74, blue: 0.22, alpha: 1), metallic: false)
@@ -20313,10 +20423,14 @@ private struct NativeARView: UIViewRepresentable {
       return chips
     }
 
-    private func makeWorkerBriefcaseEntity(for kind: ChessPieceKind) -> Entity {
+    private func makeWorkerBriefcaseEntity(for kind: ChessPieceKind, handSide: PieceAccessoryHandSide) -> Entity {
       let briefcase = Entity()
-      briefcase.position = SIMD3<Float>(-0.020, pieceRoleCarryHeight(for: kind), 0.010)
-      briefcase.orientation = simd_quatf(angle: .pi / 8, axis: SIMD3<Float>(0, 1, 0))
+      let handSign: Float = handSide == .left ? -1 : 1
+      briefcase.position = SIMD3<Float>(0.006 * handSign, -0.004, 0.010)
+      briefcase.orientation = simd_normalize(
+        simd_quatf(angle: handSign * (.pi / 7), axis: SIMD3<Float>(0, 1, 0)) *
+          simd_quatf(angle: handSign * (.pi / 16), axis: SIMD3<Float>(0, 0, 1))
+      )
 
       let caseMaterial = accessoryMaterial(color: UIColor(red: 0.34, green: 0.20, blue: 0.10, alpha: 1), metallic: false)
       let latchMaterial = accessoryMaterial(color: UIColor(red: 0.84, green: 0.67, blue: 0.24, alpha: 1), metallic: true)
@@ -20344,6 +20458,35 @@ private struct NativeARView: UIViewRepresentable {
       return briefcase
     }
 
+    private func pieceRoleCarryHand(for kind: ChessPieceKind) -> PieceAccessoryHandSide {
+      switch kind {
+      case .pawn, .rook, .bishop:
+        return .left
+      case .knight, .queen, .king:
+        return .right
+      }
+    }
+
+    private func pieceRoleHandEntity(
+      in pieceEntity: Entity,
+      for kind: ChessPieceKind,
+      side: PieceAccessoryHandSide
+    ) -> Entity? {
+      let name: String
+      switch (kind, side) {
+      case (.king, .left):
+        name = "king_hand_left"
+      case (.king, .right):
+        name = "king_hand_right"
+      case (_, .left):
+        name = "piece_hand_left"
+      case (_, .right):
+        name = "piece_hand_right"
+      }
+
+      return pieceEntity.findEntity(named: name)
+    }
+
     private func pieceRoleHeadHeight(for kind: ChessPieceKind) -> Float {
       switch kind {
       case .pawn:
@@ -20358,23 +20501,6 @@ private struct NativeARView: UIViewRepresentable {
         return 0.049
       case .king:
         return 0.052
-      }
-    }
-
-    private func pieceRoleCarryHeight(for kind: ChessPieceKind) -> Float {
-      switch kind {
-      case .pawn:
-        return 0.021
-      case .rook:
-        return 0.025
-      case .knight:
-        return 0.024
-      case .bishop:
-        return 0.027
-      case .queen:
-        return 0.029
-      case .king:
-        return 0.030
       }
     }
 
