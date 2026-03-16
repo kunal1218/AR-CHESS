@@ -12586,6 +12586,7 @@ private struct ModeSelectionView: View {
   @Binding var isDailyCosmeticDevModeEnabled: Bool
   let onSelect: (PlayModeChoice) -> Void
   @State private var isPiperAuditionPresented = false
+  @State private var selectedTab: MenuSelectionTab = .play
 
   var body: some View {
     ZStack {
@@ -12601,71 +12602,204 @@ private struct ModeSelectionView: View {
       )
       .ignoresSafeArea()
 
-      VStack(spacing: 26) {
-        Spacer()
+      ScrollView(showsIndicators: false) {
+        VStack(spacing: 24) {
+          VStack(spacing: 12) {
+            Text("Native iOS")
+              .font(.system(size: 12, weight: .bold, design: .rounded))
+              .tracking(2.2)
+              .foregroundStyle(Color(red: 0.85, green: 0.78, blue: 0.64))
 
-        VStack(spacing: 12) {
-          Text("Native iOS")
-            .font(.system(size: 12, weight: .bold, design: .rounded))
-            .tracking(2.2)
-            .foregroundStyle(Color(red: 0.85, green: 0.78, blue: 0.64))
+            WarChessTitle()
 
-          WarChessTitle()
+            Text(selectedTab.subtitle)
+              .font(.system(size: 18, weight: .medium, design: .rounded))
+              .foregroundStyle(Color.white.opacity(0.82))
+              .multilineTextAlignment(.center)
+              .frame(maxWidth: 340)
+          }
 
-          Text("Choose Course, pass-and-play, a full game versus Stockfish, or a synced queue match.")
-            .font(.system(size: 18, weight: .medium, design: .rounded))
-            .foregroundStyle(Color.white.opacity(0.82))
-            .multilineTextAlignment(.center)
-            .frame(maxWidth: 340)
+          menuTabBar
+            .frame(maxWidth: 360)
+
+          Group {
+            switch selectedTab {
+            case .play:
+              playTabContent
+            case .settings:
+              settingsTabContent
+            case .cosmetics:
+              cosmeticsTabContent
+            }
+          }
+          .frame(maxWidth: 360)
         }
-
-        NarratorSelectionCard(selectedNarrator: $selectedNarrator)
-          .frame(maxWidth: 340)
-
-        DailyCosmeticDevToggleCard(isEnabled: $isDailyCosmeticDevModeEnabled)
-          .frame(maxWidth: 340)
-
-        ARDeveloperButtonsToggleCard(isEnabled: $hidesDeveloperButtons)
-          .frame(maxWidth: 340)
-
-        NativeActionButton(title: "Piper Voice Lab", style: .outline) {
-          isPiperAuditionPresented = true
-        }
-        .frame(maxWidth: 340)
-
-        VStack(spacing: 14) {
-          NativeActionButton(title: "Course", style: .solid) {
-            onSelect(.course)
-          }
-
-          NativeActionButton(title: "Pass & Play", style: .solid) {
-            onSelect(.passAndPlay)
-          }
-
-          NativeActionButton(title: "Play vs Stockfish", style: .outline) {
-            onSelect(.playVsStockfish)
-          }
-
-          NativeActionButton(title: "Queue Match", style: .outline) {
-            onSelect(.queueMatch)
-          }
-        }
-        .frame(maxWidth: 340)
-
-        Text("Post-game review runs after Queue Match and full Play vs Stockfish games only. Course opens the mock lesson catalog.")
-          .font(.system(size: 14, weight: .medium, design: .rounded))
-          .foregroundStyle(Color.white.opacity(0.72))
-          .multilineTextAlignment(.center)
-          .frame(maxWidth: 340)
-
-        Spacer()
+        .frame(maxWidth: .infinity)
+        .padding(.horizontal, 24)
+        .padding(.vertical, 30)
       }
-      .padding(.horizontal, 24)
-      .padding(.vertical, 30)
     }
     .sheet(isPresented: $isPiperAuditionPresented) {
       PiperVoiceAuditionView()
         .piperVoiceLabSheetPresentation()
+    }
+  }
+
+  private var menuTabBar: some View {
+    HStack(spacing: 10) {
+      ForEach(MenuSelectionTab.allCases) { tab in
+        Button {
+          withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
+            selectedTab = tab
+          }
+        } label: {
+          Text(tab.title)
+            .font(.system(size: 13, weight: .black, design: .rounded))
+            .foregroundStyle(
+              selectedTab == tab
+                ? Color(red: 0.07, green: 0.10, blue: 0.13)
+                : Color.white.opacity(0.84)
+            )
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 13)
+            .background(
+              Capsule(style: .continuous)
+                .fill(
+                  selectedTab == tab
+                    ? Color(red: 0.95, green: 0.88, blue: 0.73)
+                    : Color.white.opacity(0.07)
+                )
+                .overlay(
+                  Capsule(style: .continuous)
+                    .stroke(Color.white.opacity(selectedTab == tab ? 0.0 : 0.12), lineWidth: 1)
+                )
+            )
+        }
+        .buttonStyle(.plain)
+      }
+    }
+    .padding(8)
+    .background(
+      RoundedRectangle(cornerRadius: 28, style: .continuous)
+        .fill(Color(red: 0.07, green: 0.10, blue: 0.14).opacity(0.82))
+        .overlay(
+          RoundedRectangle(cornerRadius: 28, style: .continuous)
+            .stroke(Color.white.opacity(0.10), lineWidth: 1)
+        )
+    )
+  }
+
+  private var playTabContent: some View {
+    VStack(spacing: 16) {
+      VStack(spacing: 14) {
+        NativeActionButton(title: "Course", style: .solid) {
+          onSelect(.course)
+        }
+
+        NativeActionButton(title: "Pass & Play", style: .solid) {
+          onSelect(.passAndPlay)
+        }
+
+        NativeActionButton(title: "Play vs Stockfish", style: .outline) {
+          onSelect(.playVsStockfish)
+        }
+
+        NativeActionButton(title: "Queue Match", style: .outline) {
+          onSelect(.queueMatch)
+        }
+      }
+
+      modeSelectionInfoCard {
+        Text("Post-game review runs after Queue Match and full Play vs Stockfish games only. Course opens the mock lesson catalog.")
+          .font(.system(size: 14, weight: .medium, design: .rounded))
+          .foregroundStyle(Color.white.opacity(0.72))
+          .multilineTextAlignment(.center)
+          .lineSpacing(3)
+      }
+    }
+  }
+
+  private var settingsTabContent: some View {
+    VStack(spacing: 16) {
+      NarratorSelectionCard(selectedNarrator: $selectedNarrator)
+      DailyCosmeticDevToggleCard(isEnabled: $isDailyCosmeticDevModeEnabled)
+      ARDeveloperButtonsToggleCard(isEnabled: $hidesDeveloperButtons)
+
+      NativeActionButton(title: "Piper Voice Lab", style: .outline) {
+        isPiperAuditionPresented = true
+      }
+    }
+  }
+
+  private var cosmeticsTabContent: some View {
+    modeSelectionInfoCard {
+      VStack(spacing: 18) {
+        Image(systemName: "shippingbox.fill")
+          .font(.system(size: 34, weight: .bold))
+          .foregroundStyle(Color(red: 0.95, green: 0.88, blue: 0.73))
+
+        VStack(spacing: 8) {
+          Text("Cosmetics")
+            .font(.system(size: 28, weight: .heavy, design: .rounded))
+            .foregroundStyle(.white)
+
+          Text("This tab is ready for the cosmetic system. Tell me what you want in here next and I’ll wire it in.")
+            .font(.system(size: 15, weight: .medium, design: .rounded))
+            .foregroundStyle(Color.white.opacity(0.76))
+            .multilineTextAlignment(.center)
+            .lineSpacing(3)
+        }
+      }
+      .frame(maxWidth: .infinity)
+      .padding(.vertical, 10)
+    }
+  }
+
+  private func modeSelectionInfoCard<Content: View>(
+    @ViewBuilder content: () -> Content
+  ) -> some View {
+    VStack(spacing: 0) {
+      content()
+    }
+    .padding(.horizontal, 18)
+    .padding(.vertical, 18)
+    .background(
+      RoundedRectangle(cornerRadius: 26, style: .continuous)
+        .fill(Color(red: 0.07, green: 0.10, blue: 0.14).opacity(0.90))
+        .overlay(
+          RoundedRectangle(cornerRadius: 26, style: .continuous)
+            .stroke(Color.white.opacity(0.12), lineWidth: 1)
+        )
+    )
+  }
+}
+
+private enum MenuSelectionTab: String, CaseIterable, Identifiable {
+  case play
+  case settings
+  case cosmetics
+
+  var id: String { rawValue }
+
+  var title: String {
+    switch self {
+    case .play:
+      return "Play"
+    case .settings:
+      return "Settings"
+    case .cosmetics:
+      return "Cosmetics"
+    }
+  }
+
+  var subtitle: String {
+    switch self {
+    case .play:
+      return "Choose Course, pass-and-play, a full game versus Stockfish, or a synced queue match."
+    case .settings:
+      return "Adjust coach voice, AR HUD visibility, and cosmetic reward testing from one cleaner settings screen."
+    case .cosmetics:
+      return "A dedicated cosmetics tab is ready so we can build that system out next without cluttering the main menu."
     }
   }
 }
@@ -13218,7 +13352,7 @@ private struct NarratorSelectionCard: View {
 
   var body: some View {
     VStack(alignment: .leading, spacing: 12) {
-      Text("Narrator")
+      Text("Coach Voice")
         .font(.system(size: 12, weight: .bold, design: .rounded))
         .tracking(1.8)
         .foregroundStyle(Color(red: 0.95, green: 0.88, blue: 0.73))
