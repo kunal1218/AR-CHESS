@@ -201,6 +201,18 @@ PASSIVE_NARRATOR_CHESS_ANCHOR_PATTERN = re.compile(
     r"open files|open diagonal|open diagonals|weak square|weak squares|promotion|endgame)\b",
     re.IGNORECASE,
 )
+PASSIVE_NARRATOR_SCENE_ACTION_PATTERN = re.compile(
+    r"\b(?:stands?|pressure|press(?:es|ed|ing)?|build(?:s|ing)?|fight(?:s|ing)?|grab(?:s|bed|bing)?|"
+    r"claim(?:s|ed|ing)?|watch(?:es|ed|ing)?|tighten(?:s|ed|ing)?|squeez(?:e|es|ed|ing)|"
+    r"expos(?:e|es|ed|ing)|hunt(?:s|ed|ing)?|corner(?:s|ed|ing)?|trap(?:s|ped|ping)?|"
+    r"pin(?:s|ned|ning)?|fork(?:s|ed|ing)?|attack(?:s|ed|ing)?|defend(?:s|ed|ing)?|"
+    r"open(?:s|ed|ing)?|close(?:s|d|ing)?|crack(?:s|ed|ing)?|collapse(?:s|d|ing)?|"
+    r"fold(?:s|ed|ing)?|scrambl(?:e|es|ed|ing)|lean(?:s|ed|ing)?|tilt(?:s|ed|ing)?|"
+    r"favor(?:s|ed|ing)?|shift(?:s|ed|ing)?|race(?:s|d|ing)?|run(?:s|ning)?|"
+    r"breathe(?:s|d|ing)?|shelter|cover|initiative|momentum|space|storm|thunder|"
+    r"cannon|noose|walls?)\b",
+    re.IGNORECASE,
+)
 
 app = FastAPI(title="AR Chess Server", version="0.3.0")
 PIPER_TTS_SERVICE = PiperTTSService()
@@ -943,6 +955,13 @@ Avoid move notation, square names, engine jargon, and coordinate callouts.
 Paint a verbal picture of the fight using concrete chess reality: tension in the center, development races, king safety, open lines, pressure, trades, weak squares, pawn structure, or momentum shifts.
 Never write fortune-cookie lines, ominous prophecies, vague riddles, or empty mood-setting.
 If you mention tension or danger, explain what on the board is creating it.
+Priority order:
+1. Sensible spoken English.
+2. Clear connection to the board situation.
+3. Cinematic, metaphorical, or dramatic color.
+4. Reasonable live-play brevity.
+Prefer clear and dramatic over clever but confusing, and prefer clever but confusing over ultra-short and broken.
+If a metaphor cannot fit cleanly, choose the simpler line.
 """.strip()
 GEMINI_HINT_MOVE_PATTERN = re.compile(r"\b[a-h][1-8][a-h][1-8][qrbn]?\b|\b[a-h][1-8]\b", re.IGNORECASE)
 GEMINI_COACH_BASE_SYSTEM_PROMPT = """
@@ -1358,7 +1377,12 @@ def is_passive_narrator_line_too_vague(text: str, payload: GeminiPassiveNarrator
         return True
 
     # Keep narrator lines grounded in a real chess feature rather than generic mood-setting.
-    return not bool(PASSIVE_NARRATOR_CHESS_ANCHOR_PATTERN.search(normalized))
+    if not PASSIVE_NARRATOR_CHESS_ANCHOR_PATTERN.search(normalized):
+        return True
+
+    # Reject lines that mention chess nouns but still read like decorative nonsense instead of
+    # describing pressure, structure, movement, or a visible battle dynamic.
+    return not bool(PASSIVE_NARRATOR_SCENE_ACTION_PATTERN.search(normalized))
 
 
 def sample_piece_dialogue_intent() -> str:
@@ -1758,10 +1782,12 @@ def build_passive_narrator_line_query(payload: GeminiPassiveNarratorRequest) -> 
         return (
             "Write one opening-of-match narrator line for an automatic chess broadcast. "
             "Set the stage by painting a clear verbal picture of the fight that is starting on the board right now. "
-            "Use 1 or 2 concise sentences. "
+            "Use one short sentence or two very short clauses. "
             "Use the Current FEN and Recent Sequence with strong chess understanding, but keep the line introductory and easy to understand. "
             "Mention at least one concrete opening feature such as the center, development, king safety, pawn structure, space, open lines, or which side is grabbing the initiative. "
             "Sound like a sharp live commentator describing visible tension, not a poet, fortune cookie, prophecy, or riddle. "
+            "Prioritize clear spoken English first, real chess grounding second, atmosphere third, and brevity fourth. "
+            "Clear and dramatic beats clever but confusing. Clever but confusing beats ultra-short and broken. "
             "Do not be cryptic. Do not talk about fate, silence, secrets, storms, or something 'about to happen' unless you also name the actual chess reason. "
             "Do not speak as a coach. Do not speak as a chess piece. "
             "Never address the player as you or your. Never give advice or commands. "
@@ -1820,7 +1846,10 @@ def build_passive_narrator_line_query(payload: GeminiPassiveNarratorRequest) -> 
         "Every line must contain at least one concrete chess idea, not just mood or vague tension. "
         "Never sound like a fortune cookie, prophecy, or riddle. "
         f"{narrator_dialogue_instruction} "
-        "Keep it concise and polished. Use 1 or 2 short sentences. "
+        "Keep it concise and polished. Prefer one short sentence or two very short clauses. "
+        "Prioritize clear spoken English first, real chess grounding second, atmosphere third, and brevity fourth. "
+        "Clear and dramatic beats clever but confusing. Clever but confusing beats ultra-short and broken. "
+        "If a metaphor becomes awkward under compression, simplify it instead of forcing it. "
         "Never address the player as you or your. Never give advice, commands, or imperatives. "
         "Do not say what a side must, should, or needs to do. You are a conveyer, not a caller to action. "
         "Do not mention squares, coordinates, move notation, SAN, or engine terms. "
@@ -1860,6 +1889,7 @@ def build_passive_narrator_line_retry_query(payload: GeminiPassiveNarratorReques
         + "Return one fresh alternative right now with noticeably different phrasing. "
         + "Keep it concise, natural to speak aloud, and grounded in one real chess reason from the position. "
         + "Make it clearer and more concrete than before. Do not be cryptic, poetic, or portentous. "
+        + "If the metaphorical version feels awkward or confusing, rewrite it in a simpler, cleaner dramatic style instead. "
         + "Do not address the player. Do not give instructions. "
         + "Do not reuse the same opening words or core phrase. "
         + "Do not return labels, quotes, or explanations. "

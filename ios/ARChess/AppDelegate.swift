@@ -322,7 +322,7 @@ private enum ExperienceMode: Hashable {
     case .lesson:
       return false
     case .passAndPlay:
-      return false
+      return true
     case .queueMatch:
       return true
     case .playVsStockfish(let configuration):
@@ -5215,6 +5215,7 @@ private final class GameReviewStore: ObservableObject {
   @Published private(set) var reviewCheckpoints: [GameReviewCheckpoint] = []
   @Published private(set) var currentReviewIndex = 0
   @Published private(set) var checkpointReloadVersion = 0
+  @Published private(set) var outcomeSummary: String?
 
   private var recordedDrops: [GameReviewCheckpoint] = []
   private var stagedCheckpoints: [GameReviewCheckpoint] = []
@@ -5251,16 +5252,13 @@ private final class GameReviewStore: ObservableObject {
     recordedDrops.append(checkpoint)
   }
 
-  func stageReviewPrompt() -> Bool {
+  func stageReviewPrompt(outcomeSummary: String) -> Bool {
     guard phase == .idle else {
       return false
     }
 
+    self.outcomeSummary = outcomeSummary
     let selected = selectedCheckpoints()
-    guard !selected.isEmpty else {
-      return false
-    }
-
     stagedCheckpoints = selected
     phase = .prompt
     return true
@@ -5324,6 +5322,7 @@ private final class GameReviewStore: ObservableObject {
     reviewCheckpoints = []
     currentReviewIndex = 0
     checkpointReloadVersion = 0
+    outcomeSummary = nil
     recordedDrops = []
     stagedCheckpoints = []
   }
@@ -8807,8 +8806,9 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     before beforeState: ChessGameState,
     after afterState: ChessGameState
   ) async -> MoveEvaluationDelta? {
-    if afterState.isCheckmate(for: afterState.turn) {
-      latestAssessment = "Checkmate."
+    let outcomeSummary = outcomeAssessmentText(for: afterState.outcome)
+    if let outcomeSummary {
+      latestAssessment = outcomeSummary
     }
 
     let beforeAnalysis = await analysisForCurrentTurn(state: beforeState)
@@ -8847,7 +8847,9 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       moverColor: beforeState.turn
     )
 
-    if let assessment {
+    if let outcomeSummary {
+      latestAssessment = outcomeSummary
+    } else if let assessment {
       latestAssessment = "\(assessment.label): \(swingDescription(before: beforeAnalysis, after: afterAnalysis, moverColor: beforeState.turn))"
     } else {
       let stockfishMessage = analyzer.lastError ?? analyzer.lastStatus
@@ -8876,6 +8878,19 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     }
 
     return evaluationDelta
+  }
+
+  private func outcomeAssessmentText(for outcome: ChessGameState.GameOutcome?) -> String? {
+    guard let outcome else {
+      return nil
+    }
+
+    switch outcome {
+    case .checkmate(let winner):
+      return "\(winner.displayName) wins by checkmate."
+    case .stalemate:
+      return "Draw by stalemate."
+    }
   }
 
   func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didStart utterance: AVSpeechUtterance) {
@@ -10491,9 +10506,9 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     if context.phase == .opening {
       return pickDistinctPassiveNarratorOption(
         [
-          "The center is still untouched, but both kings already have a future to answer for.",
-          "Development has not begun, and already the center is waiting for a fight.",
-          "Before the first clash, the center and the kings are already part of the story."
+          "Both sides are still building, and the first fight for the center will shape the whole game.",
+          "Development is only just beginning, but the tension in the center is already real.",
+          "The pieces are still gathering, and the battle for space is about to start in earnest."
         ],
         extraAvoiding: additionalLines
       )
@@ -12921,7 +12936,7 @@ private struct ModeSelectionView: View {
       }
 
       modeSelectionInfoCard {
-        Text("Post-game review runs after Queue Match and full Play vs Stockfish games only. Course opens the mock lesson catalog.")
+        Text("Post-game review runs after Pass & Play, Queue Match, and full Play vs Stockfish games. Course opens the mock lesson catalog.")
           .font(.system(size: 14, weight: .medium, design: .rounded))
           .foregroundStyle(Color.white.opacity(0.72))
           .multilineTextAlignment(.center)
@@ -17796,7 +17811,18 @@ private struct NativeARExperienceView: View {
             .font(.system(size: 34, weight: .heavy, design: .rounded))
             .foregroundStyle(.white)
 
-          Text("Review your \(gameReview.stagedCheckpointCount) biggest evaluation drops, or leave the match now.")
+          if let outcomeSummary = gameReview.outcomeSummary {
+            Text(outcomeSummary)
+              .font(.system(size: 18, weight: .heavy, design: .rounded))
+              .foregroundStyle(Color(red: 0.96, green: 0.89, blue: 0.74))
+              .lineSpacing(2)
+          }
+
+          Text(
+            gameReview.stagedCheckpointCount > 0
+              ? "Review your \(gameReview.stagedCheckpointCount) biggest evaluation drops, or leave the match now."
+              : "No major evaluation drops were recorded in this game. Leave the match when you're ready."
+          )
             .font(.system(size: 16, weight: .semibold, design: .rounded))
             .foregroundStyle(Color.white.opacity(0.84))
             .lineSpacing(3)
@@ -17807,10 +17833,12 @@ private struct NativeARExperienceView: View {
               returnHome()
             }
 
-            NativeActionButton(title: "Game Review", style: .solid) {
-              Task {
-                if !(await gameReview.startStagedReviewSequence()) {
-                  returnHome()
+            if gameReview.stagedCheckpointCount > 0 {
+              NativeActionButton(title: "Game Review", style: .solid) {
+                Task {
+                  if !(await gameReview.startStagedReviewSequence()) {
+                    returnHome()
+                  }
                 }
               }
             }
@@ -23074,7 +23102,20 @@ private struct NativeARView: UIViewRepresentable {
         return false
       }
 
+      if case .passAndPlay = mode {
+        return true
+      }
+
       return mode.humanPlayerColor(queueAssignedColor: queueAssignedColor) == moverColor
+    }
+
+    private func postGameOutcomeSummary(for outcome: ChessGameState.GameOutcome) -> String {
+      switch outcome {
+      case .checkmate(let winner):
+        return "\(winner.displayName) wins by checkmate."
+      case .stalemate:
+        return "Draw by stalemate."
+      }
     }
 
     @MainActor
@@ -23082,7 +23123,7 @@ private struct NativeARView: UIViewRepresentable {
       guard mode.supportsPostGameReview,
             gameReview.phase == .idle,
             !hasTriggeredPostGameFlow,
-            state.outcome != nil else {
+            let outcome = state.outcome else {
         return
       }
 
@@ -23094,8 +23135,9 @@ private struct NativeARView: UIViewRepresentable {
       reviewEngineTask?.cancel()
       reviewEngineTask = nil
       clearSelection()
+      commentary.noteExternalStatus(postGameOutcomeSummary(for: outcome))
 
-      if !gameReview.stageReviewPrompt() {
+      if !gameReview.stageReviewPrompt(outcomeSummary: postGameOutcomeSummary(for: outcome)) {
         onReviewFinished()
       }
     }

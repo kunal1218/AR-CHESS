@@ -926,6 +926,8 @@ def test_build_passive_narrator_line_query_includes_story_context() -> None:
     assert "same level of chess understanding as a strong coach" in query
     assert "Every line must contain at least one concrete chess idea" in query
     assert "Never sound like a fortune cookie, prophecy, or riddle." in query
+    assert "Prioritize clear spoken English first" in query
+    assert "Clear and dramatic beats clever but confusing." in query
     assert "Never address the player as you or your." in query
     assert "Turns since last narrator line: 3" in query
     assert "Moving piece: black pawn" in query
@@ -949,6 +951,7 @@ def test_build_passive_narrator_line_query_opening_requires_clear_scene_setting(
     assert "Mention at least one concrete opening feature" in query
     assert "Do not be cryptic." in query
     assert "fortune cookie, prophecy, or riddle" in query
+    assert "Clear and dramatic beats clever but confusing." in query
     assert "Recent narrator lines to avoid repeating:" in query
 
 
@@ -1049,6 +1052,43 @@ def test_is_passive_narrator_line_too_vague_rejects_cryptic_opening_lines() -> N
     assert is_passive_narrator_line_too_vague("The board is holding its breath.", payload) is True
     assert is_passive_narrator_line_too_vague(
         "Both sides are still developing, and the fight for the center is about to shape the whole game.",
+        payload,
+    ) is False
+
+
+def test_is_passive_narrator_line_too_vague_rejects_fake_depth_with_chess_nouns() -> None:
+    from main import GeminiPassiveNarratorRequest, is_passive_narrator_line_too_vague
+
+    payload = GeminiPassiveNarratorRequest(
+        fen="rnbqkbnr/pppp1ppp/8/4p3/3PP3/8/PPP2PPP/RNBQKBNR b KQkq - 0 2",
+        phase="move",
+        turns_since_last_narrator_line=3,
+        move_san="...exd4",
+        moving_piece="pawn",
+        moving_color="black",
+        from_square="e5",
+        to_square="d4",
+        is_capture=True,
+        is_check=False,
+        is_checkmate=False,
+        is_near_enemy_king=False,
+        is_attacked=True,
+        is_pinned=False,
+        is_retreat=False,
+        is_aggressive_advance=True,
+        is_fork_threat=False,
+        attacker_count=1,
+        defender_count=0,
+        eval_before=18,
+        eval_after=-42,
+        eval_delta=-60,
+        position_state="equal",
+        move_quality="tactical",
+    )
+
+    assert is_passive_narrator_line_too_vague("Tension whispers a broken moon of pawns.", payload) is True
+    assert is_passive_narrator_line_too_vague(
+        "That rook now watches the file like a loaded cannon.",
         payload,
     ) is False
 
