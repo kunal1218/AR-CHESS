@@ -8056,12 +8056,12 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       ]
     }
 
-    guard let analysis = await analysisForCurrentTurn(state: state) else {
+    guard let analysis = cachedAnalysisForState(state) else {
       return [
         fishingFallbackRewardPage(
           title: "Still thinking",
-          summary: "The engine has not finished a line for this position.",
-          detailText: "Cast again once Stockfish has a fresh suggestion."
+          summary: "The engine has not finished a cached line for this position.",
+          detailText: "Cast again after Stockfish finishes the current board analysis."
         )
       ]
     }
@@ -8913,6 +8913,14 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     } catch {
       return nil
     }
+  }
+
+  private func cachedAnalysisForState(_ state: ChessGameState) -> StockfishAnalysis? {
+    guard cachedAnalysis?.fen == state.fenString else {
+      return nil
+    }
+
+    return cachedAnalysis?.analysis
   }
 
   private func refreshStockfishDebugMoves(
@@ -12098,13 +12106,35 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
 
     appendGeminiDebug("Speech start: \(generatedNarrationDebugLabel(style)) via Piper -> \(text)")
     guard piperAutomaticSpeaker.speakLine(speechLine) else {
-      appendGeminiDebug("Piper automatic audio unavailable right now; using local speech fallback.")
+      let piperWasBusy = piperAutomaticSpeaker.isBusy
       activePassiveAutomaticPlaybackRecord = nil
       activePassiveAutomaticPlaybackDidStart = false
       liveNarratorPlaybackOwnsCaption = false
+      setSpeakingPieceHighlight(square: nil)
       clearCommentaryCaption(ifOwnedBy: .automaticPlayback(captionToken))
       activeAutomaticPlaybackCaptionToken = nil
       activeAutomaticPlaybackSource = .none
+
+      if piperWasBusy {
+        switch style {
+        case .automaticNarrator:
+          pieceVoiceStatusText = "Queued narrator line behind Piper playback."
+        case .pieceVoice(let speaker):
+          pieceVoiceStatusText = "Queued \(speaker.displayName) voice behind Piper playback."
+        case .gemini:
+          break
+        }
+        appendGeminiDebug("Piper was already busy. Requeueing \(generatedNarrationDebugLabel(style)) instead of falling back.")
+        queuePendingGeneratedNarration(
+          text: text,
+          style: style,
+          playbackRecord: playbackRecord,
+          retryAfter: 0.10
+        )
+        return true
+      }
+
+      appendGeminiDebug("Piper automatic audio unavailable right now; using local speech fallback.")
       switch style {
       case .automaticNarrator:
         return startLocalAutomaticNarratorUtterance(
@@ -27450,28 +27480,30 @@ private struct NativeARView: UIViewRepresentable {
       from rodTipWorldPosition: SIMD3<Float>,
       pondTarget: SIMD3<Float>
     ) -> SIMD3<Float> {
-      guard let tip = fishingRodTipEntity else {
+      guard let water = fishingPondWaterEntity else {
         return clampedFishingPondSurfacePoint(pondTarget) ?? pondTarget
       }
 
-      let tipForward = normalized3(
-        -simd_make_float3(tip.transformMatrix(relativeTo: nil).columns.2),
-        fallback: normalized3(pondTarget - rodTipWorldPosition, fallback: SIMD3<Float>(0, -1, 0))
+      let bounds = water.visualBounds(relativeTo: nil)
+      let pondCenter = SIMD3<Float>(bounds.center.x, bounds.center.y + 0.012, bounds.center.z)
+      let safeHalfWidth = max(bounds.extents.x * 0.26, 0.16)
+      let safeHalfDepth = max(bounds.extents.z * 0.26, 0.16)
+      let fromPondToRodTip = normalized(
+        SIMD2<Float>(rodTipWorldPosition.x - pondCenter.x, rodTipWorldPosition.z - pondCenter.z),
+        fallback: SIMD2<Float>(0, -1)
       )
-      let waterY = pondTarget.y
-      let denominator = tipForward.y
-      guard abs(denominator) > 0.0001 else {
-        return clampedFishingPondSurfacePoint(pondTarget) ?? pondTarget
-      }
 
-      let travel = (waterY - rodTipWorldPosition.y) / denominator
-      guard travel > 0 else {
-        return clampedFishingPondSurfacePoint(pondTarget) ?? pondTarget
-      }
+      // Place the bobber on the near half of the pond relative to the rod tip so
+      // every cast reads as landing in the lake instead of projecting toward the horizon.
+      let preferredSurfacePoint = SIMD3<Float>(
+        pondCenter.x + (fromPondToRodTip.x * safeHalfWidth * 0.42),
+        pondCenter.y,
+        pondCenter.z + (fromPondToRodTip.y * safeHalfDepth * 0.42)
+      )
 
-      let intersection = rodTipWorldPosition + (tipForward * travel)
-      let worldIntersection = SIMD3<Float>(intersection.x, waterY, intersection.z)
-      return clampedFishingPondSurfacePoint(worldIntersection) ?? pondTarget
+      return clampedFishingPondSurfacePoint(preferredSurfacePoint)
+        ?? clampedFishingPondSurfacePoint(pondTarget)
+        ?? pondTarget
     }
 
     private func fishingPondWorldCenter() -> SIMD3<Float>? {

@@ -1026,8 +1026,8 @@ def build_narrator_prompt(narrator: str) -> str:
 
 PIECE_VOICE_PERSONALITY_RULES = {
     "pawn": (
-        "Pawn: bloodthirsty barbarian frontline warrior. Loves combat. "
-        "Proud to be in the trenches. Aggressive, savage, eager for battle."
+        "Pawn: cartoonish barbarian frontline scrapper. Loves a good brawl and is proud to be in the trenches. "
+        "Rowdy, reckless, and battle-happy in a playful looney-tunes way, not truly deranged."
     ),
     "queen": (
         "Queen: arrogant backseat driver. Bossy, elite, judgmental, hates getting her hands dirty, "
@@ -1679,8 +1679,8 @@ def build_piece_voice_line_query(
         "Prefer novel wording over signature catchphrases. "
         "Output only the line itself.\n\n"
         "Piece personality rules:\n"
-        "Pawn: bloodthirsty barbarian frontline warrior. Loves combat. Proud to be in the trenches. "
-        "Aggressive, savage, eager for battle.\n"
+        "Pawn: cartoonish barbarian frontline scrapper. Loves a good brawl. Proud to be in the trenches. "
+        "Rowdy, reckless, and battle-happy in a playful looney-tunes way, not truly deranged.\n"
         "Queen: arrogant backseat driver. Bossy, elite, judgmental, hates getting her hands dirty, annoyed when forced into danger.\n"
         "King: aggressive and commanding when safe or winning; cowardly, panicked, and whiny when unsafe or losing.\n"
         "Bishop: ultra-religious and militant. Speaks with righteous, zealous, aggressive conviction. Sounds holy but dangerous.\n"
