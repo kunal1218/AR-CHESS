@@ -14014,6 +14014,7 @@ private enum PieceCosmeticCategory: String, CaseIterable, Hashable, Identifiable
   case armor
   case face
   case back
+  case roles
 
   var id: String { rawValue }
 
@@ -14027,6 +14028,8 @@ private enum PieceCosmeticCategory: String, CaseIterable, Hashable, Identifiable
       return "Face"
     case .back:
       return "Back"
+    case .roles:
+      return "Roles"
     }
   }
 
@@ -14040,6 +14043,8 @@ private enum PieceCosmeticCategory: String, CaseIterable, Hashable, Identifiable
       return .facewear
     case .back:
       return .backwear
+    case .roles:
+      return .roleAccessory
     }
   }
 
@@ -14053,6 +14058,8 @@ private enum PieceCosmeticCategory: String, CaseIterable, Hashable, Identifiable
       return "eye"
     case .back:
       return "flag.fill"
+    case .roles:
+      return "sparkles"
     }
   }
 }
@@ -14062,6 +14069,7 @@ private enum PieceCosmeticSlot: String, CaseIterable, Hashable {
   case bodywear
   case facewear
   case backwear
+  case roleAccessory
 
   var displayName: String {
     switch self {
@@ -14073,8 +14081,22 @@ private enum PieceCosmeticSlot: String, CaseIterable, Hashable {
       return "Facewear"
     case .backwear:
       return "Backwear"
+    case .roleAccessory:
+      return "Role"
     }
   }
+}
+
+private enum PieceCosmeticVisualStyle: String, Hashable {
+  case cowboyHat
+  case wizardHat
+  case goldenArmor
+  case banditMask
+  case tinyCape
+  case minerHelmet
+  case traitorHorns
+  case workerBriefcase
+  case lazyChips
 }
 
 private struct PieceCosmeticLoadout: Hashable {
@@ -14103,6 +14125,10 @@ private struct PieceCosmeticLoadout: Hashable {
     var updated = self
     updated.equippedIDsBySlot.removeValue(forKey: slot)
     return updated
+  }
+
+  func removingPreviewOnlySlots() -> PieceCosmeticLoadout {
+    removing(slot: .roleAccessory)
   }
 }
 
@@ -14244,7 +14270,7 @@ private final class PieceCosmeticsStore: ObservableObject {
   }
 
   var allCosmetics: [PieceCosmeticReward] {
-    PieceCosmeticReward.mockPool
+    PieceCosmeticReward.catalog
   }
 
   func availableCategories(for pieceKind: ChessPieceKind) -> [PieceCosmeticCategory] {
@@ -14263,11 +14289,11 @@ private final class PieceCosmeticsStore: ObservableObject {
   }
 
   func isUnlocked(_ cosmetic: PieceCosmeticReward) -> Bool {
-    unlockedCosmeticIDs.contains(cosmetic.id)
+    cosmetic.isDefaultUnlocked || unlockedCosmeticIDs.contains(cosmetic.id)
   }
 
   func unlock(_ cosmetic: PieceCosmeticReward) {
-    guard !unlockedCosmeticIDs.contains(cosmetic.id) else {
+    guard !cosmetic.isDefaultUnlocked, !unlockedCosmeticIDs.contains(cosmetic.id) else {
       return
     }
 
@@ -14327,30 +14353,38 @@ private struct PieceCosmeticReward: Identifiable {
   let targetPiece: ChessPieceKind
   let category: PieceCosmeticCategory
   let slot: PieceCosmeticSlot
+  let visualStyle: PieceCosmeticVisualStyle
   let previewGlyph: String
   let flavorText: String
   let rarityLabel: String
   let previewBackgroundColor: UIColor
   let previewAccentColor: UIColor
   let previewDetailColor: UIColor
+  let isDefaultUnlocked: Bool
 
   static func definition(id: String) -> PieceCosmeticReward? {
-    mockPool.first { $0.id == id }
+    catalog.first { $0.id == id }
   }
 
-  static let mockPool: [PieceCosmeticReward] = [
+  static var catalog: [PieceCosmeticReward] {
+    rewardPool + previewOnlyRoleCatalog
+  }
+
+  static let rewardPool: [PieceCosmeticReward] = [
     PieceCosmeticReward(
       id: "king-cowboy-hat",
       displayName: "Cowboy Hat",
       targetPiece: .king,
       category: .hats,
       slot: .headwear,
+      visualStyle: .cowboyHat,
       previewGlyph: "🤠",
       flavorText: "The king finally looks like he runs the frontier.",
       rarityLabel: "Legendary",
       previewBackgroundColor: UIColor(red: 0.36, green: 0.21, blue: 0.12, alpha: 1),
       previewAccentColor: UIColor(red: 0.91, green: 0.69, blue: 0.31, alpha: 1),
-      previewDetailColor: UIColor(red: 0.98, green: 0.94, blue: 0.82, alpha: 1)
+      previewDetailColor: UIColor(red: 0.98, green: 0.94, blue: 0.82, alpha: 1),
+      isDefaultUnlocked: false
     ),
     PieceCosmeticReward(
       id: "bishop-wizard-hat",
@@ -14358,12 +14392,14 @@ private struct PieceCosmeticReward: Identifiable {
       targetPiece: .bishop,
       category: .hats,
       slot: .headwear,
+      visualStyle: .wizardHat,
       previewGlyph: "🧙",
       flavorText: "A little mysticism goes a long way on diagonals.",
       rarityLabel: "Epic",
       previewBackgroundColor: UIColor(red: 0.18, green: 0.14, blue: 0.36, alpha: 1),
       previewAccentColor: UIColor(red: 0.55, green: 0.42, blue: 0.96, alpha: 1),
-      previewDetailColor: UIColor(red: 0.86, green: 0.82, blue: 0.98, alpha: 1)
+      previewDetailColor: UIColor(red: 0.86, green: 0.82, blue: 0.98, alpha: 1),
+      isDefaultUnlocked: false
     ),
     PieceCosmeticReward(
       id: "knight-golden-armor",
@@ -14371,12 +14407,14 @@ private struct PieceCosmeticReward: Identifiable {
       targetPiece: .knight,
       category: .armor,
       slot: .bodywear,
+      visualStyle: .goldenArmor,
       previewGlyph: "🛡",
       flavorText: "Polished enough to blind anything it forks.",
       rarityLabel: "Rare",
       previewBackgroundColor: UIColor(red: 0.30, green: 0.24, blue: 0.10, alpha: 1),
       previewAccentColor: UIColor(red: 0.94, green: 0.80, blue: 0.28, alpha: 1),
-      previewDetailColor: UIColor(red: 0.99, green: 0.95, blue: 0.79, alpha: 1)
+      previewDetailColor: UIColor(red: 0.99, green: 0.95, blue: 0.79, alpha: 1),
+      isDefaultUnlocked: false
     ),
     PieceCosmeticReward(
       id: "rook-bandit-mask",
@@ -14384,12 +14422,14 @@ private struct PieceCosmeticReward: Identifiable {
       targetPiece: .rook,
       category: .face,
       slot: .facewear,
+      visualStyle: .banditMask,
       previewGlyph: "🥷",
       flavorText: "For silent file pressure and very loud captures.",
       rarityLabel: "Rare",
       previewBackgroundColor: UIColor(red: 0.12, green: 0.14, blue: 0.18, alpha: 1),
       previewAccentColor: UIColor(red: 0.82, green: 0.24, blue: 0.22, alpha: 1),
-      previewDetailColor: UIColor(red: 0.92, green: 0.92, blue: 0.94, alpha: 1)
+      previewDetailColor: UIColor(red: 0.92, green: 0.92, blue: 0.94, alpha: 1),
+      isDefaultUnlocked: false
     ),
     PieceCosmeticReward(
       id: "queen-tiny-cape",
@@ -14397,12 +14437,14 @@ private struct PieceCosmeticReward: Identifiable {
       targetPiece: .queen,
       category: .back,
       slot: .backwear,
+      visualStyle: .tinyCape,
       previewGlyph: "🦸",
       flavorText: "Dramatic enough for the most overpowered piece on the board.",
       rarityLabel: "Epic",
       previewBackgroundColor: UIColor(red: 0.34, green: 0.10, blue: 0.18, alpha: 1),
       previewAccentColor: UIColor(red: 0.96, green: 0.34, blue: 0.54, alpha: 1),
-      previewDetailColor: UIColor(red: 0.99, green: 0.89, blue: 0.93, alpha: 1)
+      previewDetailColor: UIColor(red: 0.99, green: 0.89, blue: 0.93, alpha: 1),
+      isDefaultUnlocked: false
     ),
     PieceCosmeticReward(
       id: "pawn-miner-helmet",
@@ -14410,14 +14452,68 @@ private struct PieceCosmeticReward: Identifiable {
       targetPiece: .pawn,
       category: .hats,
       slot: .headwear,
+      visualStyle: .minerHelmet,
       previewGlyph: "⛏",
       flavorText: "Built for the pawns that keep grinding through the dirt.",
       rarityLabel: "Uncommon",
       previewBackgroundColor: UIColor(red: 0.22, green: 0.20, blue: 0.16, alpha: 1),
       previewAccentColor: UIColor(red: 0.98, green: 0.78, blue: 0.26, alpha: 1),
-      previewDetailColor: UIColor(red: 0.98, green: 0.95, blue: 0.82, alpha: 1)
+      previewDetailColor: UIColor(red: 0.98, green: 0.95, blue: 0.82, alpha: 1),
+      isDefaultUnlocked: false
     ),
   ]
+
+  static var previewOnlyRoleCatalog: [PieceCosmeticReward] {
+    ChessPieceKind.creatorSelectionOrder.flatMap { kind in
+      [
+        PieceCosmeticReward(
+          id: "preview-traitor-\(kind.storageKey)",
+          displayName: "Traitor",
+          targetPiece: kind,
+          category: .roles,
+          slot: .roleAccessory,
+          visualStyle: .traitorHorns,
+          previewGlyph: "😈",
+          flavorText: "Preview-only horns for a piece that might switch sides in spirit.",
+          rarityLabel: "Preview",
+          previewBackgroundColor: UIColor(red: 0.30, green: 0.07, blue: 0.09, alpha: 1),
+          previewAccentColor: UIColor(red: 0.82, green: 0.14, blue: 0.16, alpha: 1),
+          previewDetailColor: UIColor(red: 0.98, green: 0.78, blue: 0.78, alpha: 1),
+          isDefaultUnlocked: true
+        ),
+        PieceCosmeticReward(
+          id: "preview-worker-\(kind.storageKey)",
+          displayName: "Worker",
+          targetPiece: kind,
+          category: .roles,
+          slot: .roleAccessory,
+          visualStyle: .workerBriefcase,
+          previewGlyph: "💼",
+          flavorText: "Preview-only worker gear for seeing how the full role kit reads in 3D.",
+          rarityLabel: "Preview",
+          previewBackgroundColor: UIColor(red: 0.23, green: 0.16, blue: 0.10, alpha: 1),
+          previewAccentColor: UIColor(red: 0.62, green: 0.42, blue: 0.22, alpha: 1),
+          previewDetailColor: UIColor(red: 0.92, green: 0.85, blue: 0.72, alpha: 1),
+          isDefaultUnlocked: true
+        ),
+        PieceCosmeticReward(
+          id: "preview-lazy-\(kind.storageKey)",
+          displayName: "Lazy",
+          targetPiece: kind,
+          category: .roles,
+          slot: .roleAccessory,
+          visualStyle: .lazyChips,
+          previewGlyph: "😴",
+          flavorText: "Preview-only lazy gear so the snack-bag look can be inspected up close.",
+          rarityLabel: "Preview",
+          previewBackgroundColor: UIColor(red: 0.27, green: 0.18, blue: 0.04, alpha: 1),
+          previewAccentColor: UIColor(red: 0.93, green: 0.74, blue: 0.22, alpha: 1),
+          previewDetailColor: UIColor(red: 0.99, green: 0.91, blue: 0.68, alpha: 1),
+          isDefaultUnlocked: true
+        ),
+      ]
+    }
+  }
 }
 
 private enum DailyCosmeticRewardClaimOutcome {
@@ -14467,10 +14563,10 @@ private final class DailyCosmeticRewardStore: ObservableObject {
       return .unavailable(message)
     }
 
-    let availableRewards = PieceCosmeticReward.mockPool.filter { reward in
+    let availableRewards = PieceCosmeticReward.rewardPool.filter { reward in
       !cosmetics.isUnlocked(reward)
     }
-    let rewardPool = availableRewards.isEmpty ? PieceCosmeticReward.mockPool : availableRewards
+    let rewardPool = availableRewards.isEmpty ? PieceCosmeticReward.rewardPool : availableRewards
     guard let reward = rewardPool.randomElement() else {
       let message = "The machine could not find a cosmetic to dispense."
       showStatusMessage(message)
@@ -14796,28 +14892,28 @@ private enum ChessPieceVisualFactory {
     let anchor = Entity()
     switch cosmetic.id {
     case "king-cowboy-hat":
-      anchor.position = profile.headPosition
-      anchor.scale = SIMD3<Float>(repeating: profile.headScale)
+      anchor.position = profile.headPosition + SIMD3<Float>(0, -0.0045, 0)
+      anchor.scale = SIMD3<Float>(repeating: profile.headScale * 1.05)
       anchor.addChild(makeCowboyHatEntity(baseColor: baseColor, accentColor: accentColor, detailColor: detailColor))
     case "bishop-wizard-hat":
-      anchor.position = profile.headPosition + SIMD3<Float>(0, 0.003, 0)
-      anchor.scale = SIMD3<Float>(repeating: profile.headScale * 1.04)
+      anchor.position = profile.headPosition + SIMD3<Float>(0, -0.0095, 0)
+      anchor.scale = SIMD3<Float>(repeating: profile.headScale * 1.10)
       anchor.addChild(makeWizardHatEntity(baseColor: baseColor, accentColor: accentColor, detailColor: detailColor))
     case "knight-golden-armor":
       anchor.position = profile.bodyPosition
       anchor.scale = SIMD3<Float>(repeating: profile.bodyScale)
       anchor.addChild(makeGoldenArmorEntity(accentColor: accentColor, detailColor: detailColor))
     case "rook-bandit-mask":
-      anchor.position = profile.facePosition
-      anchor.scale = SIMD3<Float>(repeating: profile.faceScale)
+      anchor.position = profile.headPosition + SIMD3<Float>(0, -0.010, 0)
+      anchor.scale = SIMD3<Float>(repeating: profile.headScale * 1.06)
       anchor.addChild(makeBanditMaskEntity(baseColor: baseColor, detailColor: detailColor, pieceColor: color))
     case "queen-tiny-cape":
       anchor.position = profile.backPosition
       anchor.scale = SIMD3<Float>(repeating: profile.backScale)
       anchor.addChild(makeCapeEntity(accentColor: accentColor, detailColor: detailColor))
     case "pawn-miner-helmet":
-      anchor.position = profile.headPosition + SIMD3<Float>(0, 0.001, 0)
-      anchor.scale = SIMD3<Float>(repeating: profile.headScale)
+      anchor.position = profile.headPosition + SIMD3<Float>(0, -0.0040, 0)
+      anchor.scale = SIMD3<Float>(repeating: profile.headScale * 1.04)
       anchor.addChild(makeMinerHelmetEntity(accentColor: accentColor, detailColor: detailColor))
     default:
       return nil
@@ -15024,28 +15120,62 @@ private enum ChessPieceVisualFactory {
     pieceColor: ChessColor
   ) -> Entity {
     let mask = Entity()
-    let maskBase = accessoryMaterial(
+    let clothMaterial = accessoryMaterial(
       color: pieceColor == .white
         ? baseColor
         : UIColor(red: 0.09, green: 0.09, blue: 0.10, alpha: 1),
       metallic: false
     )
-    let slitMaterial = accessoryMaterial(color: detailColor, metallic: false)
-
-    let band = ModelEntity(
-      mesh: .generateBox(size: SIMD3<Float>(0.028, 0.010, 0.003)),
-      materials: [maskBase]
+    let topWrap = ModelEntity(
+      mesh: .generateBox(size: SIMD3<Float>(0.030, 0.006, 0.026)),
+      materials: [clothMaterial]
     )
-    mask.addChild(band)
+    topWrap.position = SIMD3<Float>(0, 0.012, 0)
+    mask.addChild(topWrap)
+
+    let backWrap = ModelEntity(
+      mesh: .generateBox(size: SIMD3<Float>(0.026, 0.020, 0.004)),
+      materials: [clothMaterial]
+    )
+    backWrap.position = SIMD3<Float>(0, 0.002, 0.011)
+    mask.addChild(backWrap)
 
     for side in [Float(-1), Float(1)] {
-      let slit = ModelEntity(
-        mesh: .generateBox(size: SIMD3<Float>(0.006, 0.002, 0.0018)),
-        materials: [slitMaterial]
+      let sideWrap = ModelEntity(
+        mesh: .generateBox(size: SIMD3<Float>(0.0045, 0.020, 0.024)),
+        materials: [clothMaterial]
       )
-      slit.position = SIMD3<Float>(0.006 * side, 0.001, 0.002)
-      mask.addChild(slit)
+      sideWrap.position = SIMD3<Float>(0.013 * side, 0.002, 0)
+      mask.addChild(sideWrap)
+
+      let frontEdge = ModelEntity(
+        mesh: .generateBox(size: SIMD3<Float>(0.003, 0.016, 0.004)),
+        materials: [clothMaterial]
+      )
+      frontEdge.position = SIMD3<Float>(0.0105 * side, -0.001, -0.011)
+      mask.addChild(frontEdge)
     }
+
+    let browCloth = ModelEntity(
+      mesh: .generateBox(size: SIMD3<Float>(0.022, 0.006, 0.004)),
+      materials: [clothMaterial]
+    )
+    browCloth.position = SIMD3<Float>(0, 0.0055, -0.011)
+    mask.addChild(browCloth)
+
+    let lowerFaceCloth = ModelEntity(
+      mesh: .generateBox(size: SIMD3<Float>(0.022, 0.010, 0.004)),
+      materials: [clothMaterial]
+    )
+    lowerFaceCloth.position = SIMD3<Float>(0, -0.007, -0.011)
+    mask.addChild(lowerFaceCloth)
+
+    let neckCloth = ModelEntity(
+      mesh: .generateBox(size: SIMD3<Float>(0.018, 0.006, 0.006)),
+      materials: [clothMaterial]
+    )
+    neckCloth.position = SIMD3<Float>(0, -0.015, -0.008)
+    mask.addChild(neckCloth)
 
     return mask
   }
@@ -15228,12 +15358,12 @@ private enum ChessPieceVisualFactory {
       addSunglasses(to: root, height: 0.031, width: 0.007)
 
       let knife = ModelEntity(
-        mesh: .generateBox(size: SIMD3<Float>(0.003, 0.020, 0.002)),
+        mesh: .generateBox(size: SIMD3<Float>(0.0028, 0.0024, 0.024)),
         materials: [weaponMaterial]
       )
       knife.name = "pawn_knife"
-      knife.position = SIMD3<Float>(0.016, 0.022, 0.010)
-      knife.orientation = simd_quatf(angle: -.pi / 4.8, axis: SIMD3<Float>(1, 0, 0))
+      knife.position = SIMD3<Float>(0.017, 0.025, -0.010)
+      knife.orientation = simd_quatf(angle: .pi / 7.5, axis: SIMD3<Float>(1, 0, 0))
       root.addChild(knife)
 
     case .rook:
@@ -26930,12 +27060,12 @@ private struct NativeARView: UIViewRepresentable {
         addSunglasses(to: root, height: 0.031, width: 0.007)
 
         let knife = ModelEntity(
-          mesh: .generateBox(size: SIMD3<Float>(0.003, 0.020, 0.002)),
+          mesh: .generateBox(size: SIMD3<Float>(0.0028, 0.0024, 0.024)),
           materials: [weaponMaterial]
         )
         knife.name = "pawn_knife"
-        knife.position = SIMD3<Float>(0.016, 0.022, 0.010)
-        knife.orientation = simd_quatf(angle: -.pi / 4.8, axis: SIMD3<Float>(1, 0, 0))
+        knife.position = SIMD3<Float>(0.017, 0.025, -0.010)
+        knife.orientation = simd_quatf(angle: .pi / 7.5, axis: SIMD3<Float>(1, 0, 0))
         root.addChild(knife)
 
       case .rook:
