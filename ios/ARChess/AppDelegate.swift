@@ -17615,6 +17615,19 @@ private struct NativeARView: UIViewRepresentable {
       let averageDownwardPitch: Float
     }
 
+    private struct FishingRigPoseResponse {
+      let baselinePitch: Float?
+      let currentPitch: Float?
+      let signedPitchDelta: Float
+      let appliedPitchDelta: Float
+      let finalPitchAngle: Float
+      let handYOffset: Float
+      let hitLowerPitchClamp: Bool
+      let hitUpperPitchClamp: Bool
+      let hitLowerHandClamp: Bool
+      let hitUpperHandClamp: Bool
+    }
+
     private static let boardTemplateSize: Float = 0.40
     private static let boardSquareSize: Float = boardTemplateSize / 8.0
     private static let fishingPondVerticalOffset: Float = -0.068
@@ -17626,11 +17639,17 @@ private struct NativeARView: UIViewRepresentable {
     private static let fishingRigBasePitch: Float = -0.18
     private static let fishingRigBaseYaw: Float = 0
     private static let fishingRigBaseRoll: Float = 0
-    private static let fishingRigRelativePitchDeltaMin: Float = 0
-    private static let fishingRigRelativePitchDeltaMax: Float = 0.18
+    private static let fishingRigPitchResponseMultiplier: Float = 1.35
+    private static let fishingRigVerticalResponseMultiplier: Float = 0.09
+    private static let fishingRigFinalPitchAngleMin: Float = -0.42
+    private static let fishingRigFinalPitchAngleMax: Float = 0.18
+    private static let fishingRigFinalYOffsetMin: Float = -0.016
+    private static let fishingRigFinalYOffsetMax: Float = 0.016
     private static let fishingTerrainPlaneLocalY: Float = -0.041
     private static let fishingRigGroundClearance: Float = 0.012
     private static let fishingRigMinimumCameraUpComponent: Float = 0.22
+    private static let fishingRigLiveDebugLoggingEnabled = true
+    private static let fishingRigLiveDebugLogInterval: CFTimeInterval = 0.20
     private static let neutralHoldCalibrationDuration: CFTimeInterval = 2.5
     private static let neutralHoldCalibrationMinimumSamples = 45
     private static let virtualWorldSpawnBaseForwardDistance: Float = 0.60
@@ -17759,8 +17778,8 @@ private struct NativeARView: UIViewRepresentable {
     private weak var fishingLeftHandEntity: Entity?
     private weak var fishingRightHandEntity: Entity?
     private weak var fishingRodTipEntity: Entity?
-    private var baselineFishingOrientation: simd_float4x4?
-    private var baselineFishingDownwardPitch: Float?
+    private var baselineFishingSignedPitch: Float?
+    private var lastFishingRigPoseDebugLogTime: CFTimeInterval = 0
     private var fishingCastLineAnchor: AnchorEntity?
     private weak var fishingCastLineEntity: ModelEntity?
     private var fishingBobberAnchor: AnchorEntity?
@@ -21280,13 +21299,13 @@ private struct NativeARView: UIViewRepresentable {
         mesh: .generateBox(size: SIMD3<Float>(0.034, 0.34, 0.034)),
         materials: [Self.scenicMaterial(trunkColor.withAlphaComponent(0.98), roughness: 1.0)]
       )
-      mountingBeam.position = (posterFacing * 0.065) + SIMD3<Float>(0, 0.64, 0)
+      mountingBeam.position = (posterFacing * 0.102) + SIMD3<Float>(0, 0.64, 0)
       mountingBeam.orientation = simd_quatf(angle: posterYaw, axis: SIMD3<Float>(0, 1, 0))
       treeRoot.addChild(mountingBeam)
 
       let posterRoot = Entity()
       posterRoot.name = "wanted_poster_3d"
-      posterRoot.position = (posterFacing * 0.122) + SIMD3<Float>(0, 0.70, 0)
+      posterRoot.position = (posterFacing * 0.188) + SIMD3<Float>(0, 0.70, 0)
       posterRoot.orientation = simd_normalize(
         simd_quatf(angle: posterYaw, axis: SIMD3<Float>(0, 1, 0)) *
           simd_quatf(angle: -.pi / 24, axis: SIMD3<Float>(1, 0, 0)) *
@@ -21329,165 +21348,333 @@ private struct NativeARView: UIViewRepresentable {
       return [
         wantedAssignment.pieceId,
         String(wantedAssignment.employeeThreatScoreHalfPoints),
-        wantedPosterCrimeLabel(),
-        wantedPosterJustificationText(for: wantedAssignment),
         String(wantedPosterBountyDollars(for: wantedAssignment)),
       ].joined(separator: "|")
     }
 
     private func makeWantedPosterEntity(for assignment: PieceRoleAssignment) -> Entity {
       let poster = Entity()
+      let posterWidth: Float = 0.38
+      let posterHeight: Float = 0.60
+      let posterThickness: Float = 0.009
+      let posterFrontZ: Float = (posterThickness * 0.5) + 0.0025
+      let leftRightPadding: Float = 0.044
+      let topPadding: Float = 0.040
+      let bottomPadding: Float = 0.048
+      let supportGap: Float = 0.020
+      let largeGap: Float = 0.016
+      let smallGap: Float = 0.005
+      let centerGuideEnabled = false
 
       let parchmentMaterial = Self.scenicMaterial(UIColor(red: 0.90, green: 0.82, blue: 0.65, alpha: 1), roughness: 0.98)
       let edgeMaterial = Self.scenicMaterial(UIColor(red: 0.55, green: 0.40, blue: 0.22, alpha: 1), roughness: 1.0)
       let inkMaterial = SimpleMaterial(color: UIColor(red: 0.20, green: 0.09, blue: 0.05, alpha: 1), roughness: 0.86, isMetallic: false)
       let board = ModelEntity(
-        mesh: .generateBox(size: SIMD3<Float>(0.34, 0.56, 0.012)),
+        mesh: .generateBox(size: SIMD3<Float>(posterWidth, posterHeight, posterThickness)),
         materials: [parchmentMaterial]
       )
       board.generateCollisionShapes(recursive: false)
       poster.addChild(board)
 
-      let topEdge = ModelEntity(mesh: .generateBox(size: SIMD3<Float>(0.35, 0.010, 0.013)), materials: [edgeMaterial])
-      topEdge.position = SIMD3<Float>(0, 0.276, -0.001)
+      let topEdge = ModelEntity(
+        mesh: .generateBox(size: SIMD3<Float>(posterWidth + 0.014, 0.010, posterThickness + 0.002)),
+        materials: [edgeMaterial]
+      )
+      topEdge.position = SIMD3<Float>(0, (posterHeight * 0.5) + supportGap, -0.001)
       poster.addChild(topEdge)
 
-      let bottomEdge = ModelEntity(mesh: .generateBox(size: SIMD3<Float>(0.35, 0.010, 0.013)), materials: [edgeMaterial])
-      bottomEdge.position = SIMD3<Float>(0, -0.276, -0.001)
+      let bottomEdge = ModelEntity(
+        mesh: .generateBox(size: SIMD3<Float>(posterWidth + 0.014, 0.010, posterThickness + 0.002)),
+        materials: [edgeMaterial]
+      )
+      bottomEdge.position = SIMD3<Float>(0, -((posterHeight * 0.5) + supportGap), -0.001)
       poster.addChild(bottomEdge)
 
-      for nailOffset in [
-        SIMD3<Float>(-0.14, 0.23, 0.007),
-        SIMD3<Float>(0.14, 0.23, 0.007),
-        SIMD3<Float>(-0.14, -0.23, 0.007),
-        SIMD3<Float>(0.14, -0.23, 0.007),
-      ] {
-        let nail = ModelEntity(
-          mesh: .generateSphere(radius: 0.008),
-          materials: [SimpleMaterial(color: UIColor(red: 0.40, green: 0.28, blue: 0.16, alpha: 1), roughness: 0.30, isMetallic: true)]
+      let posterBounds = board.visualBounds(relativeTo: poster)
+      let posterCenterX = posterBounds.center.x
+      let posterCenterY = posterBounds.center.y
+      let posterLeftX = posterCenterX - (posterBounds.extents.x * 0.5)
+      let posterRightX = posterCenterX + (posterBounds.extents.x * 0.5)
+      let posterTopY = posterCenterY + (posterBounds.extents.y * 0.5)
+      let posterBottomY = posterCenterY - (posterBounds.extents.y * 0.5)
+      let contentLeftX = posterLeftX + leftRightPadding
+      let contentRightX = posterRightX - leftRightPadding
+      let contentTopY = posterTopY - topPadding
+      let contentBottomY = posterBottomY + bottomPadding
+      let safeContentWidth = contentRightX - contentLeftX
+
+      let posterContent = Entity()
+      posterContent.name = "PosterContent"
+      posterContent.position = SIMD3<Float>(posterCenterX, posterCenterY, posterFrontZ)
+      poster.addChild(posterContent)
+
+      if centerGuideEnabled {
+        posterContent.addChild(
+          makeWantedPosterCenterGuideEntity(
+            height: contentTopY - contentBottomY
+          )
         )
-        nail.position = nailOffset
-        nail.scale = SIMD3<Float>(1.0, 0.34, 1.0)
-        poster.addChild(nail)
       }
 
-      let wantedHeader = makeWantedPosterTextEntity(
-        text: "WANTED",
-        font: .systemFont(ofSize: 168, weight: .black),
-        maxWidth: 0.26,
-        maxHeight: 0.070,
-        material: inkMaterial
-      )
-      wantedHeader.position = SIMD3<Float>(0, 0.212, 0.010)
-      poster.addChild(wantedHeader)
+      let threatScoreValue = wantedPosterThreatScoreText(for: assignment)
+      let imageFrame = makeWantedPosterPortraitEntity(for: assignment, borderMaterial: edgeMaterial)
 
-      let aliveText = makeWantedPosterTextEntity(
-        text: "DEAD OR ALIVE",
-        font: .systemFont(ofSize: 84, weight: .heavy),
-        maxWidth: 0.22,
-        maxHeight: 0.034,
-        material: inkMaterial
-      )
-      aliveText.position = SIMD3<Float>(0, 0.166, 0.010)
-      poster.addChild(aliveText)
+      let layoutItems: [WantedPosterLayoutItem] = [
+        makeWantedPosterLayoutItem(
+          entity: makeWantedPosterTextEntity(
+            text: "WANTED",
+            font: .systemFont(ofSize: 146, weight: .black),
+            maxWidth: safeContentWidth,
+            maxHeight: 0.036,
+            material: inkMaterial
+          ),
+          gapAfter: largeGap,
+          isText: true
+        ),
+        makeWantedPosterLayoutItem(
+          entity: makeWantedPosterTextEntity(
+            text: "DEAD OR ALIVE",
+            font: .systemFont(ofSize: 60, weight: .heavy),
+            maxWidth: safeContentWidth,
+            maxHeight: 0.010,
+            material: inkMaterial
+          ),
+          gapAfter: smallGap,
+          isText: true
+        ),
+        makeWantedPosterLayoutItem(
+          entity: makeWantedPosterTextEntity(
+            text: assignment.piece.kind.displayName.uppercased(),
+            font: .systemFont(ofSize: 88, weight: .black),
+            maxWidth: safeContentWidth,
+            maxHeight: 0.020,
+            material: inkMaterial
+          ),
+          gapAfter: largeGap,
+          isText: true
+        ),
+        makeWantedPosterLayoutItem(
+          entity: imageFrame.entity,
+          sizeOverride: imageFrame.size,
+          gapAfter: largeGap,
+          isText: false
+        ),
+        makeWantedPosterLayoutItem(
+          entity: makeWantedPosterTextEntity(
+            text: "CRIME",
+            font: .systemFont(ofSize: 42, weight: .black),
+            maxWidth: safeContentWidth,
+            maxHeight: 0.010,
+            material: inkMaterial
+          ),
+          gapAfter: smallGap,
+          isText: true
+        ),
+        makeWantedPosterLayoutItem(
+          entity: makeWantedPosterTextEntity(
+            text: "EVALUATION",
+            font: .systemFont(ofSize: 38, weight: .heavy),
+            maxWidth: safeContentWidth,
+            maxHeight: 0.010,
+            material: inkMaterial
+          ),
+          gapAfter: smallGap,
+          isText: true
+        ),
+        makeWantedPosterLayoutItem(
+          entity: makeWantedPosterTextEntity(
+            text: "DAMAGE",
+            font: .systemFont(ofSize: 38, weight: .heavy),
+            maxWidth: safeContentWidth,
+            maxHeight: 0.010,
+            material: inkMaterial
+          ),
+          gapAfter: largeGap,
+          isText: true
+        ),
+        makeWantedPosterLayoutItem(
+          entity: makeWantedPosterTextEntity(
+            text: "JUSTIFICATION",
+            font: .systemFont(ofSize: 38, weight: .black),
+            maxWidth: safeContentWidth,
+            maxHeight: 0.010,
+            material: inkMaterial
+          ),
+          gapAfter: smallGap,
+          isText: true
+        ),
+        makeWantedPosterLayoutItem(
+          entity: makeWantedPosterTextEntity(
+            text: "THREAT SCORE",
+            font: .systemFont(ofSize: 34, weight: .heavy),
+            maxWidth: safeContentWidth,
+            maxHeight: 0.010,
+            material: inkMaterial
+          ),
+          gapAfter: smallGap,
+          isText: true
+        ),
+        makeWantedPosterLayoutItem(
+          entity: makeWantedPosterTextEntity(
+            text: threatScoreValue,
+            font: .monospacedSystemFont(ofSize: 62, weight: .heavy),
+            maxWidth: safeContentWidth,
+            maxHeight: 0.020,
+            material: inkMaterial
+          ),
+          gapAfter: largeGap,
+          isText: true
+        ),
+        makeWantedPosterLayoutItem(
+          entity: makeWantedPosterTextEntity(
+            text: "BOUNTY",
+            font: .systemFont(ofSize: 42, weight: .black),
+            maxWidth: safeContentWidth,
+            maxHeight: 0.012,
+            material: inkMaterial
+          ),
+          gapAfter: smallGap,
+          isText: true
+        ),
+        makeWantedPosterLayoutItem(
+          entity: makeWantedPosterTextEntity(
+            text: "$\(formattedDollarAmount(wantedPosterBountyDollars(for: assignment)))",
+            font: .monospacedSystemFont(ofSize: 74, weight: .heavy),
+            maxWidth: safeContentWidth,
+            maxHeight: 0.025,
+            material: inkMaterial
+          ),
+          gapAfter: 0,
+          isText: true
+        ),
+      ]
 
-      let targetName = makeWantedPosterTextEntity(
-        text: assignment.piece.kind.displayName.uppercased(),
-        font: .systemFont(ofSize: 92, weight: .black),
-        maxWidth: 0.22,
-        maxHeight: 0.034,
-        material: inkMaterial
+      layoutWantedPosterContent(
+        layoutItems,
+        in: posterContent,
+        posterCenterX: posterCenterX,
+        contentTopY: contentTopY,
+        contentLeftX: contentLeftX,
+        contentRightX: contentRightX,
+        contentBottomY: contentBottomY
       )
-      targetName.position = SIMD3<Float>(0, 0.126, 0.010)
-      poster.addChild(targetName)
 
+      return poster
+    }
+
+    private struct WantedPosterLayoutItem {
+      let entity: Entity
+      let size: SIMD2<Float>
+      let gapAfter: Float
+      let isText: Bool
+    }
+
+    private func makeWantedPosterLayoutItem(
+      entity: Entity,
+      sizeOverride: SIMD2<Float>? = nil,
+      gapAfter: Float,
+      isText: Bool
+    ) -> WantedPosterLayoutItem {
+      WantedPosterLayoutItem(
+        entity: entity,
+        size: sizeOverride ?? wantedPosterVisualSize(of: entity),
+        gapAfter: gapAfter,
+        isText: isText
+      )
+    }
+
+    private func layoutWantedPosterContent(
+      _ items: [WantedPosterLayoutItem],
+      in container: Entity,
+      posterCenterX: Float,
+      contentTopY: Float,
+      contentLeftX: Float,
+      contentRightX: Float,
+      contentBottomY: Float
+    ) {
+      guard !items.isEmpty else {
+        return
+      }
+
+      let localCenterX = posterCenterX - container.position.x
+      let localContentLeftX = contentLeftX - container.position.x
+      let localContentRightX = contentRightX - container.position.x
+      var currentTopY = contentTopY
+
+      for item in items {
+        let localCenterY = (currentTopY - (item.size.y * 0.5)) - container.position.y
+        item.entity.position = SIMD3<Float>(localCenterX, localCenterY, 0)
+        container.addChild(item.entity)
+        if item.isText {
+          enforceWantedPosterTextBounds(
+            item.entity,
+            in: container,
+            centerX: localCenterX,
+            minX: localContentLeftX,
+            maxX: localContentRightX
+          )
+        }
+        currentTopY -= item.size.y + item.gapAfter
+      }
+
+      let bottomMostY = currentTopY + items.last!.gapAfter
+      if bottomMostY < contentBottomY {
+        let verticalAdjustment = contentBottomY - bottomMostY
+        Array(container.children).forEach { child in
+          child.position.y += verticalAdjustment
+        }
+      }
+    }
+
+    private func makeWantedPosterPortraitEntity(
+      for assignment: PieceRoleAssignment,
+      borderMaterial: SimpleMaterial
+    ) -> (entity: Entity, size: SIMD2<Float>) {
       let portraitFrame = Entity()
-      portraitFrame.position = SIMD3<Float>(0, 0.018, 0.010)
-      poster.addChild(portraitFrame)
+      let frameWidth: Float = 0.154
+      let frameHeight: Float = 0.154
+      let portraitInsetScale: Float = 0.88
 
       let portraitBacking = ModelEntity(
-        mesh: .generateBox(size: SIMD3<Float>(0.18, 0.19, 0.010)),
+        mesh: .generateBox(size: SIMD3<Float>(0.140, 0.140, 0.006)),
         materials: [Self.scenicMaterial(UIColor(red: 0.82, green: 0.76, blue: 0.64, alpha: 1), roughness: 0.92)]
       )
       portraitFrame.addChild(portraitBacking)
 
       let portraitBorder = ModelEntity(
-        mesh: .generateBox(size: SIMD3<Float>(0.196, 0.206, 0.006)),
-        materials: [edgeMaterial]
+        mesh: .generateBox(size: SIMD3<Float>(frameWidth, frameHeight, 0.004)),
+        materials: [borderMaterial]
       )
-      portraitBorder.position = SIMD3<Float>(0, 0, -0.004)
+      portraitBorder.position = SIMD3<Float>(0, 0, -0.003)
       portraitFrame.addChild(portraitBorder)
 
-      let mugshot = piecePrototype(for: assignment.piece.kind, color: assignment.piece.color).clone(recursive: true)
-      mugshot.position = SIMD3<Float>(0, -0.060, 0.010)
-      mugshot.scale = SIMD3<Float>(repeating: 1.70)
-      mugshot.orientation = simd_normalize(
+      let innerFrameBounds = portraitBacking.visualBounds(relativeTo: portraitFrame)
+      let innerFrameCenter = innerFrameBounds.center
+      let innerFrameWidth = innerFrameBounds.extents.x * portraitInsetScale
+      let innerFrameHeight = innerFrameBounds.extents.y * portraitInsetScale
+
+      let portraitSubject = piecePrototype(for: assignment.piece.kind, color: assignment.piece.color).clone(recursive: true)
+      portraitSubject.orientation = simd_normalize(
         simd_quatf(angle: .pi, axis: SIMD3<Float>(0, 1, 0)) *
           simd_quatf(angle: -.pi / 18, axis: SIMD3<Float>(1, 0, 0))
       )
-      portraitFrame.addChild(mugshot)
-
-      let crimeLabel = makeWantedPosterTextEntity(
-        text: "CRIME",
-        font: .systemFont(ofSize: 58, weight: .black),
-        maxWidth: 0.12,
-        maxHeight: 0.020,
-        material: inkMaterial
+      centerEntityVisualOrigin(portraitSubject)
+      fitVisualBounds(
+        of: portraitSubject,
+        maxWidth: innerFrameWidth,
+        maxHeight: innerFrameHeight
       )
-      crimeLabel.position = SIMD3<Float>(-0.10, -0.122, 0.010)
-      poster.addChild(crimeLabel)
+      portraitFrame.addChild(portraitSubject)
+      let portraitSubjectBounds = portraitSubject.visualBounds(relativeTo: portraitFrame)
+      portraitSubject.position += innerFrameCenter - portraitSubjectBounds.center
+      portraitSubject.position.z = 0.012
 
-      let crimeValue = makeWantedPosterTextEntity(
-        text: wantedPosterCrimeLabel(),
-        font: .systemFont(ofSize: 58, weight: .black),
-        maxWidth: 0.18,
-        maxHeight: 0.026,
-        material: inkMaterial
-      )
-      crimeValue.position = SIMD3<Float>(0.02, -0.152, 0.010)
-      poster.addChild(crimeValue)
+      return (portraitFrame, SIMD2<Float>(frameWidth, frameHeight))
+    }
 
-      let justificationLabel = makeWantedPosterTextEntity(
-        text: "JUSTIFICATION",
-        font: .systemFont(ofSize: 46, weight: .black),
-        maxWidth: 0.18,
-        maxHeight: 0.018,
-        material: inkMaterial
-      )
-      justificationLabel.position = SIMD3<Float>(0, -0.194, 0.010)
-      poster.addChild(justificationLabel)
-
-      let justificationValue = makeWantedPosterTextEntity(
-        text: wantedPosterJustificationText(for: assignment),
-        font: .monospacedSystemFont(ofSize: 44, weight: .bold),
-        maxWidth: 0.24,
-        maxHeight: 0.024,
-        material: inkMaterial
-      )
-      justificationValue.position = SIMD3<Float>(0, -0.228, 0.010)
-      poster.addChild(justificationValue)
-
-      let bountyValue = makeWantedPosterTextEntity(
-        text: "$\(formattedDollarAmount(wantedPosterBountyDollars(for: assignment)))",
-        font: .monospacedSystemFont(ofSize: 86, weight: .heavy),
-        maxWidth: 0.24,
-        maxHeight: 0.040,
-        material: inkMaterial
-      )
-      bountyValue.position = SIMD3<Float>(0, -0.286, 0.010)
-      poster.addChild(bountyValue)
-
-      let rewardText = makeWantedPosterTextEntity(
-        text: "REWARD",
-        font: .systemFont(ofSize: 88, weight: .black),
-        maxWidth: 0.22,
-        maxHeight: 0.036,
-        material: inkMaterial
-      )
-      rewardText.position = SIMD3<Float>(0, -0.334, 0.010)
-      poster.addChild(rewardText)
-
-      return poster
+    private func wantedPosterVisualSize(of entity: Entity) -> SIMD2<Float> {
+      let bounds = entity.visualBounds(relativeTo: nil).extents
+      return SIMD2<Float>(max(bounds.x, 0.0001), max(bounds.y, 0.0001))
     }
 
     private func makeWantedPosterTextEntity(
@@ -21496,7 +21683,7 @@ private struct NativeARView: UIViewRepresentable {
       maxWidth: Float,
       maxHeight: Float,
       material: SimpleMaterial
-    ) -> ModelEntity {
+    ) -> Entity {
       let textMesh = MeshResource.generateText(
         text,
         extrusionDepth: 0.0022,
@@ -21505,15 +21692,18 @@ private struct NativeARView: UIViewRepresentable {
         alignment: CTTextAlignment.center,
         lineBreakMode: .byClipping
       )
-      let textEntity = ModelEntity(mesh: textMesh, materials: [material])
-      centerEntityVisualOrigin(textEntity)
-      fitVisualBounds(of: textEntity, maxWidth: maxWidth, maxHeight: maxHeight)
-      return textEntity
+      let textModel = ModelEntity(mesh: textMesh, materials: [material])
+      centerEntityVisualOrigin(textModel)
+
+      let textWrapper = Entity()
+      textWrapper.addChild(textModel)
+      fitVisualBounds(of: textWrapper, maxWidth: maxWidth, maxHeight: maxHeight)
+      return textWrapper
     }
 
     private func centerEntityVisualOrigin(_ entity: Entity) {
       let bounds = entity.visualBounds(relativeTo: nil)
-      entity.position -= bounds.center
+      entity.position = -bounds.center
     }
 
     private func fitVisualBounds(of entity: Entity, maxWidth: Float, maxHeight: Float) {
@@ -21524,27 +21714,39 @@ private struct NativeARView: UIViewRepresentable {
       entity.scale = SIMD3<Float>(repeating: scale)
     }
 
-    private func wantedPosterCrimeLabel() -> String {
-      let assessment = commentary.latestAssessment.uppercased()
-      if let colonIndex = assessment.firstIndex(of: ":") {
-        let label = String(assessment[..<colonIndex]).trimmingCharacters(in: .whitespacesAndNewlines)
-        if !label.isEmpty,
-           !label.contains("STOCKFISH"),
-           !label.contains("BOARD READY"),
-           !label.contains("WAITING") {
-          return label
-        }
+    private func enforceWantedPosterTextBounds(
+      _ entity: Entity,
+      in container: Entity,
+      centerX: Float,
+      minX: Float,
+      maxX: Float
+    ) {
+      let maxAllowedWidth = max(maxX - minX, 0.0001)
+      var bounds = entity.visualBounds(relativeTo: container)
+      let renderedWidth = max(bounds.extents.x, 0.0001)
+      if renderedWidth > maxAllowedWidth {
+        let shrinkScale = maxAllowedWidth / renderedWidth
+        entity.scale = entity.scale * SIMD3<Float>(repeating: shrinkScale)
+        bounds = entity.visualBounds(relativeTo: container)
       }
 
-      return "EVALUATION DAMAGE"
+      let fittedWidth = max(bounds.extents.x, 0.0001)
+      if fittedWidth > maxAllowedWidth {
+        let finalScale = maxAllowedWidth / fittedWidth
+        entity.scale = entity.scale * SIMD3<Float>(repeating: finalScale)
+      }
+      entity.position.x = centerX
     }
 
-    private func wantedPosterJustificationText(for assignment: PieceRoleAssignment) -> String {
-      if let evaluationSwingCp = wantedPosterEvaluationSwingCp() {
-        return String(format: "%.1f EVALUATION LOSS", abs(Double(evaluationSwingCp)) / 100.0)
-      }
+    private func makeWantedPosterCenterGuideEntity(height: Float) -> ModelEntity {
+      ModelEntity(
+        mesh: .generateBox(size: SIMD3<Float>(0.002, height, 0.0015)),
+        materials: [SimpleMaterial(color: UIColor.red.withAlphaComponent(0.75), roughness: 1.0, isMetallic: false)]
+      )
+    }
 
-      return String(format: "%.1f THREAT SCORE", Double(assignment.employeeThreatScoreHalfPoints) / 2.0)
+    private func wantedPosterThreatScoreText(for assignment: PieceRoleAssignment) -> String {
+      String(format: "%.1f", Double(assignment.employeeThreatScoreHalfPoints) / 2.0)
     }
 
     private func wantedPosterEvaluationSwingCp() -> Int? {
@@ -22010,8 +22212,8 @@ private struct NativeARView: UIViewRepresentable {
       fishingFishEntity = nil
       fishingFishFloatStartedAt = nil
       fishingBobberCastCompletedAt = nil
-      baselineFishingOrientation = nil
-      baselineFishingDownwardPitch = nil
+      baselineFishingSignedPitch = nil
+      lastFishingRigPoseDebugLogTime = 0
     }
 
     @MainActor
@@ -22221,8 +22423,8 @@ private struct NativeARView: UIViewRepresentable {
       fishingLeftHandEntity = nil
       fishingRightHandEntity = nil
       fishingRodTipEntity = nil
-      baselineFishingOrientation = nil
-      baselineFishingDownwardPitch = nil
+      baselineFishingSignedPitch = nil
+      lastFishingRigPoseDebugLogTime = 0
     }
 
     private func makeFishingRodEntity() -> Entity {
@@ -22647,11 +22849,11 @@ private struct NativeARView: UIViewRepresentable {
       pondTarget: SIMD3<Float>? = nil
     ) -> Transform {
       _ = pondTarget
-      return fishingFirstPersonTransform(
+      return fishingFinalVisibleTransform(
         cameraMatrix: cameraMatrix,
-        translation: Self.fishingRigBasePosition,
+        baseTranslation: Self.fishingRigBasePosition,
         scale: 1.0,
-        pitchAngle: Self.fishingRigBasePitch,
+        basePitchAngle: Self.fishingRigBasePitch,
         yawAngle: Self.fishingRigBaseYaw,
         rollAngle: Self.fishingRigBaseRoll
       )
@@ -22662,11 +22864,11 @@ private struct NativeARView: UIViewRepresentable {
       pondTarget: SIMD3<Float>? = nil
     ) -> Transform {
       _ = pondTarget
-      return fishingFirstPersonTransform(
+      return fishingFinalVisibleTransform(
         cameraMatrix: cameraMatrix,
-        translation: Self.fishingRigBasePosition + SIMD3<Float>(0.00, 0.02, 0.03),
+        baseTranslation: Self.fishingRigBasePosition + SIMD3<Float>(0.00, 0.02, 0.03),
         scale: 1.0,
-        pitchAngle: -0.10,
+        basePitchAngle: -0.10,
         yawAngle: 0,
         rollAngle: -.pi / 96
       )
@@ -22677,11 +22879,11 @@ private struct NativeARView: UIViewRepresentable {
       pondTarget: SIMD3<Float>? = nil
     ) -> Transform {
       _ = pondTarget
-      return fishingFirstPersonTransform(
+      return fishingFinalVisibleTransform(
         cameraMatrix: cameraMatrix,
-        translation: Self.fishingRigBasePosition + SIMD3<Float>(0.00, 0.005, 0.00),
+        baseTranslation: Self.fishingRigBasePosition + SIMD3<Float>(0.00, 0.005, 0.00),
         scale: 1.0,
-        pitchAngle: Self.fishingRigBasePitch,
+        basePitchAngle: Self.fishingRigBasePitch,
         yawAngle: 0,
         rollAngle: -.pi / 120
       )
@@ -22692,11 +22894,11 @@ private struct NativeARView: UIViewRepresentable {
       pondTarget: SIMD3<Float>? = nil
     ) -> Transform {
       _ = pondTarget
-      return fishingFirstPersonTransform(
+      return fishingFinalVisibleTransform(
         cameraMatrix: cameraMatrix,
-        translation: Self.fishingRigBasePosition + SIMD3<Float>(0.00, 0.03, 0.03),
+        baseTranslation: Self.fishingRigBasePosition + SIMD3<Float>(0.00, 0.03, 0.03),
         scale: 1.0,
-        pitchAngle: -0.06,
+        basePitchAngle: -0.06,
         yawAngle: 0,
         rollAngle: .pi / 96
       )
@@ -22707,11 +22909,11 @@ private struct NativeARView: UIViewRepresentable {
       pondTarget: SIMD3<Float>? = nil
     ) -> Transform {
       _ = pondTarget
-      return fishingFirstPersonTransform(
+      return fishingFinalVisibleTransform(
         cameraMatrix: cameraMatrix,
-        translation: Self.fishingRigBasePosition + SIMD3<Float>(0.00, 0.07, 0.07),
+        baseTranslation: Self.fishingRigBasePosition + SIMD3<Float>(0.00, 0.07, 0.07),
         scale: 1.0,
-        pitchAngle: 0,
+        basePitchAngle: 0,
         yawAngle: 0,
         rollAngle: -.pi / 84
       )
@@ -22738,21 +22940,25 @@ private struct NativeARView: UIViewRepresentable {
       )
     }
 
-    private func fishingFirstPersonTransform(
+    private func fishingFinalVisibleTransform(
       cameraMatrix: simd_float4x4? = nil,
-      translation: SIMD3<Float>,
+      baseTranslation: SIMD3<Float>,
       scale: Float,
-      pitchAngle: Float,
+      basePitchAngle: Float,
       yawAngle: Float,
       rollAngle: Float
     ) -> Transform {
-      let relativePitchDelta = fishingRigRelativePitchDeltaFromBaseline(cameraMatrix: cameraMatrix)
-      let finalPitch = pitchAngle + relativePitchDelta
-      let pitch = simd_quatf(angle: finalPitch, axis: SIMD3<Float>(1, 0, 0))
+      let poseResponse = fishingRigPoseResponse(
+        cameraMatrix: cameraMatrix,
+        basePitchAngle: basePitchAngle
+      )
+      let pitch = simd_quatf(angle: poseResponse.finalPitchAngle, axis: SIMD3<Float>(1, 0, 0))
       let yaw = simd_quatf(angle: yawAngle, axis: SIMD3<Float>(0, 1, 0))
       let roll = simd_quatf(angle: rollAngle, axis: SIMD3<Float>(0, 0, 1))
       let rotation = simd_normalize(yaw * roll * pitch)
-      var adjustedTranslation = translation
+      var adjustedTranslation = baseTranslation
+      adjustedTranslation.y += poseResponse.handYOffset
+      var groundLift: Float = 0
 
       if let cameraMatrix,
          let groundPlaneHeight = fishingGroundPlaneHeight() {
@@ -22767,8 +22973,15 @@ private struct NativeARView: UIViewRepresentable {
           let worldLiftNeeded = minimumAllowedY - lowestWorldY
           let localLift = worldLiftNeeded / max(cameraUp.y, Self.fishingRigMinimumCameraUpComponent)
           adjustedTranslation.y += localLift
+          groundLift = localLift
         }
       }
+
+      logFishingRigPoseIfNeeded(
+        poseResponse,
+        finalHandYOffset: adjustedTranslation.y - baseTranslation.y,
+        groundLift: groundLift
+      )
 
       return Transform(
         scale: SIMD3<Float>(repeating: scale),
@@ -22777,14 +22990,71 @@ private struct NativeARView: UIViewRepresentable {
       )
     }
 
+    private func fishingRigPoseResponse(
+      cameraMatrix: simd_float4x4?,
+      basePitchAngle: Float
+    ) -> FishingRigPoseResponse {
+      let baselinePitch = baselineFishingSignedPitch
+      let currentPitch: Float?
+      if let cameraMatrix {
+        currentPitch = fishingSignedPitch(for: cameraMatrix)
+      } else {
+        currentPitch = nil
+      }
+      let signedPitchDelta: Float
+      if let baselinePitch, let currentPitch {
+        signedPitchDelta = currentPitch - baselinePitch
+      } else {
+        signedPitchDelta = 0
+      }
+
+      let unclampedFinalPitchAngle = basePitchAngle + (signedPitchDelta * Self.fishingRigPitchResponseMultiplier)
+      let finalPitchAngle = clamp(
+        unclampedFinalPitchAngle,
+        min: Self.fishingRigFinalPitchAngleMin,
+        max: Self.fishingRigFinalPitchAngleMax
+      )
+      let appliedPitchDelta = finalPitchAngle - basePitchAngle
+      let hitLowerPitchClamp = unclampedFinalPitchAngle < Self.fishingRigFinalPitchAngleMin
+      let hitUpperPitchClamp = unclampedFinalPitchAngle > Self.fishingRigFinalPitchAngleMax
+
+      let effectiveSignedPitchDelta: Float
+      if abs(Self.fishingRigPitchResponseMultiplier) > 0.0001 {
+        effectiveSignedPitchDelta = appliedPitchDelta / Self.fishingRigPitchResponseMultiplier
+      } else {
+        effectiveSignedPitchDelta = 0
+      }
+
+      let unclampedHandYOffset = effectiveSignedPitchDelta * Self.fishingRigVerticalResponseMultiplier
+      let handYOffset = clamp(
+        unclampedHandYOffset,
+        min: Self.fishingRigFinalYOffsetMin,
+        max: Self.fishingRigFinalYOffsetMax
+      )
+
+      return FishingRigPoseResponse(
+        baselinePitch: baselinePitch,
+        currentPitch: currentPitch,
+        signedPitchDelta: signedPitchDelta,
+        appliedPitchDelta: appliedPitchDelta,
+        finalPitchAngle: finalPitchAngle,
+        handYOffset: handYOffset,
+        hitLowerPitchClamp: hitLowerPitchClamp,
+        hitUpperPitchClamp: hitUpperPitchClamp,
+        hitLowerHandClamp: unclampedHandYOffset < Self.fishingRigFinalYOffsetMin,
+        hitUpperHandClamp: unclampedHandYOffset > Self.fishingRigFinalYOffsetMax
+      )
+    }
+
     private func captureFishingBaselineIfNeeded(cameraMatrix: simd_float4x4?) {
-      guard baselineFishingOrientation == nil,
+      guard baselineFishingSignedPitch == nil,
             let cameraMatrix else {
         return
       }
 
-      baselineFishingOrientation = cameraMatrix
-      baselineFishingDownwardPitch = fishingDownwardPitch(for: cameraMatrix)
+      baselineFishingSignedPitch = calibratedNeutralHoldPose.map { neutralPose in
+        fishingSignedPitch(forward: neutralPose.averageForward)
+      } ?? fishingSignedPitch(for: cameraMatrix)
     }
 
     private func fishingGroundPlaneHeight() -> Float? {
@@ -22840,19 +23110,28 @@ private struct NativeARView: UIViewRepresentable {
       return matrix
     }
 
-    private func fishingRigRelativePitchDeltaFromBaseline(cameraMatrix: simd_float4x4?) -> Float {
+    private func fishingRigSignedPitchDeltaFromBaseline(cameraMatrix: simd_float4x4?) -> Float {
       guard let cameraMatrix,
-            let baselineDownwardPitch = baselineFishingDownwardPitch else {
-        return Self.fishingRigRelativePitchDeltaMin
+            let baselineSignedPitch = baselineFishingSignedPitch else {
+        return 0
       }
 
-      let currentDownwardPitch = fishingDownwardPitch(for: cameraMatrix)
-      let upwardDeltaFromBaseline = baselineDownwardPitch - currentDownwardPitch
-      return clamp(
-        upwardDeltaFromBaseline,
-        min: Self.fishingRigRelativePitchDeltaMin,
-        max: Self.fishingRigRelativePitchDeltaMax
+      let currentSignedPitch = fishingSignedPitch(for: cameraMatrix)
+      return currentSignedPitch - baselineSignedPitch
+    }
+
+    private func fishingSignedPitch(for cameraMatrix: simd_float4x4) -> Float {
+      fishingSignedPitch(
+        forward: normalized3(
+          -simd_make_float3(cameraMatrix.columns.2),
+          fallback: SIMD3<Float>(0, 0, -1)
+        )
       )
+    }
+
+    private func fishingSignedPitch(forward: SIMD3<Float>) -> Float {
+      let horizontalLength = max(sqrt((forward.x * forward.x) + (forward.z * forward.z)), 0.0001)
+      return atan2(forward.y, horizontalLength)
     }
 
     private func fishingDownwardPitch(for cameraMatrix: simd_float4x4) -> Float {
@@ -22903,12 +23182,21 @@ private struct NativeARView: UIViewRepresentable {
       }
 
       let usesCameraAnchor = anchor.name == "fishing_camera_anchor"
-      let currentRelativePitchDelta = fishingRigRelativePitchDeltaFromBaseline(cameraMatrix: arView?.session.currentFrame?.camera.transform)
+      let activeCameraMatrix = arView?.session.currentFrame?.camera.transform
+      let currentSignedPitch: Float?
+      if let activeCameraMatrix {
+        currentSignedPitch = fishingSignedPitch(for: activeCameraMatrix)
+      } else {
+        currentSignedPitch = nil
+      }
+      let currentSignedPitchDelta = fishingRigSignedPitchDeltaFromBaseline(cameraMatrix: activeCameraMatrix)
       let lowestDetectedY = fishingRigLowestWorldY(rigWorldMatrix: rig.transformMatrix(relativeTo: nil))
       let groundPlaneHeight = fishingGroundPlaneHeight()
-      print("Fishing debug [\(context)] captured baseline fishing orientation: \(String(describing: baselineFishingOrientation))")
-      print("Fishing debug [\(context)] current relative pitch delta from baseline: \(currentRelativePitchDelta)")
-      print("Fishing debug [\(context)] clamp range being applied: min=\(Self.fishingRigRelativePitchDeltaMin) max=\(Self.fishingRigRelativePitchDeltaMax)")
+      print("Fishing debug [\(context)] baseline signed pitch: \(debugFloatString(baselineFishingSignedPitch))")
+      print("Fishing debug [\(context)] current signed pitch: \(debugFloatString(currentSignedPitch))")
+      print("Fishing debug [\(context)] current signed pitch delta from baseline: \(currentSignedPitchDelta)")
+      print("Fishing debug [\(context)] final pitch clamp range: min=\(Self.fishingRigFinalPitchAngleMin) max=\(Self.fishingRigFinalPitchAngleMax)")
+      print("Fishing debug [\(context)] final hand Y clamp range: min=\(Self.fishingRigFinalYOffsetMin) max=\(Self.fishingRigFinalYOffsetMax)")
       print("Fishing debug [\(context)] final local transform of the fishing rig: \(rig.transform)")
       print("Fishing debug [\(context)] rig local position: \(rig.position)")
       print("Fishing debug [\(context)] left hand local position: \(leftHand.position)")
@@ -22918,6 +23206,44 @@ private struct NativeARView: UIViewRepresentable {
       print("Fishing debug [\(context)] current fishing rig position: \(rig.position)")
       print("Fishing debug [\(context)] lowest detected Y value of the rig: \(lowestDetectedY)")
       print("Fishing debug [\(context)] ground plane height used for clamp: \(String(describing: groundPlaneHeight))")
+    }
+
+    private func logFishingRigPoseIfNeeded(
+      _ poseResponse: FishingRigPoseResponse,
+      finalHandYOffset: Float,
+      groundLift: Float
+    ) {
+      guard Self.fishingRigLiveDebugLoggingEnabled else {
+        return
+      }
+
+      let now = CACurrentMediaTime()
+      guard now - lastFishingRigPoseDebugLogTime >= Self.fishingRigLiveDebugLogInterval else {
+        return
+      }
+      lastFishingRigPoseDebugLogTime = now
+
+      let clampStatus = [
+        poseResponse.hitLowerPitchClamp ? "pitch_min" : nil,
+        poseResponse.hitUpperPitchClamp ? "pitch_max" : nil,
+        poseResponse.hitLowerHandClamp ? "hand_min" : nil,
+        poseResponse.hitUpperHandClamp ? "hand_max" : nil,
+        groundLift > 0.0001 ? "ground_lift" : nil,
+      ]
+      .compactMap { $0 }
+      .joined(separator: ",")
+
+      print(
+        "Fishing live pose state=\(fishing.state) baseline=\(debugFloatString(poseResponse.baselinePitch)) current=\(debugFloatString(poseResponse.currentPitch)) signedDelta=\(poseResponse.signedPitchDelta) appliedPitchDelta=\(poseResponse.appliedPitchDelta) finalRodPitch=\(poseResponse.finalPitchAngle) finalHandYOffset=\(finalHandYOffset) groundLift=\(groundLift) clampHit=\(clampStatus.isEmpty ? "none" : clampStatus)"
+      )
+    }
+
+    private func debugFloatString(_ value: Float?) -> String {
+      guard let value else {
+        return "nil"
+      }
+
+      return String(format: "%.4f", value)
     }
 
     private func refreshBoardPresentation() {
