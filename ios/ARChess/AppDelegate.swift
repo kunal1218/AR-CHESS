@@ -14283,7 +14283,7 @@ private final class PieceCosmeticsStore: ObservableObject {
     loadout(for: pieceKind, color: color)
       .equippedIDsBySlot
       .values
-      .compactMap { cosmeticDefinition(id: $0) }
+      .compactMap { PieceCosmeticReward.definition(id: $0) }
   }
 
   func equip(_ cosmetic: PieceCosmeticReward, for pieceKind: ChessPieceKind, color: ChessColor) {
@@ -14333,6 +14333,10 @@ private struct PieceCosmeticReward: Identifiable {
   let previewBackgroundColor: UIColor
   let previewAccentColor: UIColor
   let previewDetailColor: UIColor
+
+  static func definition(id: String) -> PieceCosmeticReward? {
+    mockPool.first { $0.id == id }
+  }
 
   static let mockPool: [PieceCosmeticReward] = [
     PieceCosmeticReward(
@@ -14523,14 +14527,18 @@ private final class CosmeticsCreatorRoomStore: ObservableObject {
   @Published var selectedCategory: PieceCosmeticCategory
   @Published var previewYaw: Float
   @Published var previewPitch: Float
+  @Published var previewCameraDistance: Float
   @Published private(set) var statusText: String?
 
   private let cosmetics: PieceCosmeticsStore
   private let defaultYaw: Float = -.pi / 6
   private let defaultPitch: Float = -.pi / 18
+  private let defaultCameraDistance: Float = 0.25
   private var dragStartYaw: Float = 0
   private var dragStartPitch: Float = 0
+  private var zoomStartDistance: Float = 0.25
   private var isDragging = false
+  private var isZooming = false
   private var statusTask: Task<Void, Never>?
 
   init(cosmetics: PieceCosmeticsStore) {
@@ -14543,6 +14551,7 @@ private final class CosmeticsCreatorRoomStore: ObservableObject {
     selectedCategory = categories.first ?? .hats
     previewYaw = defaultYaw
     previewPitch = defaultPitch
+    previewCameraDistance = defaultCameraDistance
   }
 
   deinit {
@@ -14645,9 +14654,32 @@ private final class CosmeticsCreatorRoomStore: ObservableObject {
     isDragging = false
   }
 
+  func beginZoomGestureIfNeeded() {
+    guard !isZooming else {
+      return
+    }
+
+    isZooming = true
+    zoomStartDistance = previewCameraDistance
+  }
+
+  func updateZoom(magnification: CGFloat) {
+    beginZoomGestureIfNeeded()
+    previewCameraDistance = clamp(
+      zoomStartDistance / Float(magnification),
+      min: 0.15,
+      max: 0.34
+    )
+  }
+
+  func endZoomGesture() {
+    isZooming = false
+  }
+
   func resetView() {
     previewYaw = defaultYaw
     previewPitch = defaultPitch
+    previewCameraDistance = defaultCameraDistance
   }
 
   private func ensureSelectedCategoryIsValid() {
@@ -14716,11 +14748,10 @@ private enum ChessPieceVisualFactory {
   static func makeEquippedPieceEntity(
     kind: ChessPieceKind,
     color: ChessColor,
-    loadout: PieceCosmeticLoadout,
-    cosmetics: PieceCosmeticsStore = .shared
+    loadout: PieceCosmeticLoadout
   ) -> Entity {
     let piece = piecePrototype(for: kind, color: color).clone(recursive: true)
-    applyCosmetics(loadout, to: piece, pieceKind: kind, color: color, cosmetics: cosmetics)
+    applyCosmetics(loadout, to: piece, pieceKind: kind, color: color)
     return piece
   }
 
@@ -14728,8 +14759,7 @@ private enum ChessPieceVisualFactory {
     _ loadout: PieceCosmeticLoadout,
     to pieceEntity: Entity,
     pieceKind: ChessPieceKind,
-    color: ChessColor,
-    cosmetics: PieceCosmeticsStore = .shared
+    color: ChessColor
   ) {
     pieceEntity.findEntity(named: "piece_cosmetic_container")?.removeFromParent()
 
@@ -14744,7 +14774,7 @@ private enum ChessPieceVisualFactory {
     let orderedSlots = PieceCosmeticSlot.allCases
     for slot in orderedSlots {
       guard let cosmeticID = loadout.equippedIDsBySlot[slot],
-            let cosmetic = cosmetics.cosmeticDefinition(id: cosmeticID),
+            let cosmetic = PieceCosmeticReward.definition(id: cosmeticID),
             let cosmeticEntity = cosmeticEntity(for: cosmetic, pieceKind: pieceKind, color: color) else {
         continue
       }
@@ -15345,6 +15375,7 @@ private struct CosmeticsPiecePreviewView: UIViewRepresentable {
   let loadout: PieceCosmeticLoadout
   let yaw: Float
   let pitch: Float
+  let cameraDistance: Float
 
   func makeCoordinator() -> Coordinator {
     Coordinator()
@@ -15364,7 +15395,8 @@ private struct CosmeticsPiecePreviewView: UIViewRepresentable {
       color: color,
       loadout: loadout,
       yaw: yaw,
-      pitch: pitch
+      pitch: pitch,
+      cameraDistance: cameraDistance
     )
   }
 
@@ -15372,6 +15404,7 @@ private struct CosmeticsPiecePreviewView: UIViewRepresentable {
     private let anchor = AnchorEntity(world: .zero)
     private let pedestalRoot = Entity()
     private let rotationRoot = Entity()
+    private let camera = PerspectiveCamera()
     private var currentSignature = ""
     private weak var previewPiece: Entity?
 
@@ -15399,7 +15432,6 @@ private struct CosmeticsPiecePreviewView: UIViewRepresentable {
       fillLight.position = SIMD3<Float>(-0.14, 0.14, 0.24)
       anchor.addChild(fillLight)
 
-      let camera = PerspectiveCamera()
       let cameraPosition = SIMD3<Float>(0, 0.085, 0.25)
       camera.look(
         at: SIMD3<Float>(0, 0.050, 0),
@@ -15415,7 +15447,8 @@ private struct CosmeticsPiecePreviewView: UIViewRepresentable {
       color: ChessColor,
       loadout: PieceCosmeticLoadout,
       yaw: Float,
-      pitch: Float
+      pitch: Float,
+      cameraDistance: Float
     ) {
       let signature = "\(pieceKind.storageKey)|\(color.storageKey)|\(loadout.signature)"
       if signature != currentSignature {
@@ -15434,6 +15467,14 @@ private struct CosmeticsPiecePreviewView: UIViewRepresentable {
       let yawRotation = simd_quatf(angle: yaw, axis: SIMD3<Float>(0, 1, 0))
       let pitchRotation = simd_quatf(angle: pitch, axis: SIMD3<Float>(1, 0, 0))
       rotationRoot.orientation = simd_normalize(yawRotation * pitchRotation)
+
+      let cameraPosition = SIMD3<Float>(0, 0.085, cameraDistance)
+      camera.look(
+        at: SIMD3<Float>(0, 0.050, 0),
+        from: cameraPosition,
+        upVector: SIMD3<Float>(0, 1, 0),
+        relativeTo: nil
+      )
     }
 
     private func makePedestalEntity() -> Entity {
@@ -15510,9 +15551,8 @@ private struct CosmeticsCreatorView: View {
       ScrollView(showsIndicators: false) {
         VStack(spacing: 18) {
           creatorHeader
-          pieceTypeSelector
-          colorSelector
           previewPanel
+          pieceTypeSelector
           cosmeticsBrowserPanel
         }
         .padding(.horizontal, 18)
@@ -15522,7 +15562,7 @@ private struct CosmeticsCreatorView: View {
   }
 
   private var creatorHeader: some View {
-    HStack(alignment: .top, spacing: 12) {
+    HStack(alignment: .center, spacing: 12) {
       Button(action: goBack) {
         HStack(spacing: 8) {
           Image(systemName: "chevron.left")
@@ -15539,17 +15579,6 @@ private struct CosmeticsCreatorView: View {
         )
       }
       .buttonStyle(.plain)
-
-      VStack(alignment: .leading, spacing: 6) {
-        Text("Cosmetics Creator")
-          .font(.system(size: 31, weight: .heavy, design: .rounded))
-          .foregroundStyle(.white)
-
-        Text("Build saved loadouts for each piece and preview them live before they appear in real gameplay.")
-          .font(.system(size: 14, weight: .medium, design: .rounded))
-          .foregroundStyle(Color.white.opacity(0.78))
-          .lineSpacing(3)
-      }
 
       Spacer(minLength: 8)
 
@@ -15571,7 +15600,7 @@ private struct CosmeticsCreatorView: View {
             .foregroundStyle(Color.white.opacity(0.66))
         }
       }
-      .frame(width: 120, alignment: .trailing)
+      .frame(width: 132, alignment: .trailing)
     }
   }
 
@@ -15582,7 +15611,7 @@ private struct CosmeticsCreatorView: View {
 
         ScrollView(.horizontal, showsIndicators: false) {
           HStack(spacing: 10) {
-            ForEach(ChessPieceKind.creatorSelectionOrder, id: \.storageKey) { kind in
+            ForEach(ChessPieceKind.creatorSelectionOrder, id: \.self) { kind in
               creatorChoicePill(
                 title: kind.displayName,
                 isSelected: roomStore.selectedPieceKind == kind
@@ -15592,25 +15621,6 @@ private struct CosmeticsCreatorView: View {
             }
           }
           .padding(.vertical, 2)
-        }
-      }
-    }
-  }
-
-  private var colorSelector: some View {
-    creatorCard {
-      VStack(alignment: .leading, spacing: 12) {
-        creatorSectionTitle("Side")
-
-        HStack(spacing: 10) {
-          ForEach(ChessColor.allCases, id: \.storageKey) { color in
-            creatorChoicePill(
-              title: color.displayName,
-              isSelected: roomStore.selectedColor == color
-            ) {
-              roomStore.setColor(color)
-            }
-          }
         }
       }
     }
@@ -15644,7 +15654,7 @@ private struct CosmeticsCreatorView: View {
           .buttonStyle(.plain)
         }
 
-        ZStack(alignment: .bottomLeading) {
+        ZStack {
           RoundedRectangle(cornerRadius: 28, style: .continuous)
             .fill(
               LinearGradient(
@@ -15666,7 +15676,8 @@ private struct CosmeticsCreatorView: View {
             color: roomStore.selectedColor,
             loadout: roomStore.currentLoadout,
             yaw: roomStore.previewYaw,
-            pitch: roomStore.previewPitch
+            pitch: roomStore.previewPitch,
+            cameraDistance: roomStore.previewCameraDistance
           )
           .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
           .contentShape(Rectangle())
@@ -15679,17 +15690,60 @@ private struct CosmeticsCreatorView: View {
                 roomStore.endRotationGesture()
               }
           )
+          .simultaneousGesture(
+            MagnificationGesture()
+              .onChanged { value in
+                roomStore.updateZoom(magnification: value)
+              }
+              .onEnded { _ in
+                roomStore.endZoomGesture()
+              }
+          )
 
-          Text("Drag to rotate 360")
-            .font(.system(size: 12, weight: .bold, design: .rounded))
-            .foregroundStyle(Color.white.opacity(0.72))
-            .padding(.horizontal, 14)
-            .padding(.vertical, 10)
-            .background(
-              Capsule(style: .continuous)
-                .fill(Color.black.opacity(0.28))
-            )
+          VStack {
+            Spacer()
+
+            HStack(alignment: .bottom) {
+              Text("Drag to rotate 360")
+                .font(.system(size: 12, weight: .bold, design: .rounded))
+                .foregroundStyle(Color.white.opacity(0.72))
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+                .background(
+                  Capsule(style: .continuous)
+                    .fill(Color.black.opacity(0.28))
+                )
+
+              Text("Pinch to zoom")
+                .font(.system(size: 12, weight: .bold, design: .rounded))
+                .foregroundStyle(Color.white.opacity(0.72))
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+                .background(
+                  Capsule(style: .continuous)
+                    .fill(Color.black.opacity(0.28))
+                )
+
+              Spacer(minLength: 12)
+
+              HStack(spacing: 10) {
+                previewArrowButton(
+                  systemImage: "arrow.left",
+                  isSelected: roomStore.selectedColor == .white
+                ) {
+                  roomStore.setColor(.white)
+                }
+
+                previewArrowButton(
+                  systemImage: "arrow.right",
+                  isSelected: roomStore.selectedColor == .black
+                ) {
+                  roomStore.setColor(.black)
+                }
+              }
+            }
             .padding(14)
+          }
         }
         .frame(height: 340)
       }
@@ -15827,6 +15881,36 @@ private struct CosmeticsCreatorView: View {
             )
             .overlay(
               Capsule(style: .continuous)
+                .stroke(Color.white.opacity(isSelected ? 0.0 : 0.10), lineWidth: 1)
+            )
+        )
+    }
+    .buttonStyle(.plain)
+  }
+
+  private func previewArrowButton(
+    systemImage: String,
+    isSelected: Bool,
+    action: @escaping () -> Void
+  ) -> some View {
+    Button(action: action) {
+      Image(systemName: systemImage)
+        .font(.system(size: 16, weight: .black))
+        .foregroundStyle(
+          isSelected
+            ? Color(red: 0.08, green: 0.11, blue: 0.15)
+            : Color.white.opacity(0.88)
+        )
+        .frame(width: 44, height: 44)
+        .background(
+          Circle()
+            .fill(
+              isSelected
+                ? Color(red: 0.95, green: 0.88, blue: 0.73)
+                : Color.black.opacity(0.28)
+            )
+            .overlay(
+              Circle()
                 .stroke(Color.white.opacity(isSelected ? 0.0 : 0.10), lineWidth: 1)
             )
         )
@@ -16246,9 +16330,6 @@ private final class UpwardFlickDetector {
     }
   }
 
-  static var creatorSelectionOrder: [ChessPieceKind] {
-    [.pawn, .knight, .bishop, .rook, .queen, .king]
-  }
 }
 
 private struct NativeARExperienceView: View {
@@ -18793,6 +18874,10 @@ private enum ChessPieceKind: CaseIterable {
   case bishop
   case queen
   case king
+
+  static var creatorSelectionOrder: [ChessPieceKind] {
+    [.pawn, .knight, .bishop, .rook, .queen, .king]
+  }
 
   var strategicRoleTradeValue: Int {
     switch self {

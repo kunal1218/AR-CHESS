@@ -12,15 +12,23 @@ Backend owned by Person 1.
 
 1. Create a virtual environment.
 2. Install `requirements.txt`.
-3. Run `python3 main.py`.
+3. Set either `DATABASE_URL` or all of `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, and `PGPASSWORD`.
+4. Run `python3 main.py --ensure-schema`.
+5. Run `python3 main.py`.
 
 ## Environment
 
 - Copy `.env.example` to `.env` for local development if needed.
 - Use `.env.railway.example` as the Railway deployment template.
-- Prefer `DATABASE_URL` on Railway private networking.
-- `DATABASE_PRIVATE_URL` and `DATABASE_PUBLIC_URL` are also accepted if that is how your service variables are wired.
-- The app also supports Railway `PG*` variables and finally falls back to `POSTGRES_*` variables.
+- The backend reads Postgres configuration from:
+  - `DATABASE_URL`
+  - or `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, and `PGPASSWORD`
+- On startup, the backend connects to Postgres and idempotently ensures:
+  - `games`
+  - `game_moves`
+  - `matches`
+  - `tickets`
+- `python3 main.py --ensure-schema` runs the same schema sync as a one-shot command.
 - Gemini Live uses backend-only secrets:
   - `GEMINI_API_KEY` (required)
   - `GEMINI_LIVE_MODEL` (optional, default `models/gemini-2.5-flash-native-audio-preview-12-2025`)
@@ -140,8 +148,9 @@ Matchmaking uses Postgres transactions and `FOR UPDATE SKIP LOCKED` so two queue
 
 ## Verify locally
 
-1. Start the server: `python3 main.py`
-2. Check Gemini Live status:
+1. Ensure the schema exists: `python3 main.py --ensure-schema`
+2. Start the server: `python3 main.py`
+3. Check Gemini Live status:
    - `curl http://localhost:8080/v1/gemini/status`
-3. Send a sample hint turn:
+4. Send a sample hint turn:
    - `curl -X POST http://localhost:8080/v1/gemini/hint -H 'content-type: application/json' -d '{\"fen\":\"rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1\",\"recent_history\":\"13. Re1 b5 14. Bb3 Nf6 15. O-O\",\"best_move\":\"e2e4\",\"side_to_move\":\"white\",\"moving_piece\":\"pawn\",\"is_capture\":false,\"gives_check\":false,\"themes\":[\"fight for the center\"]}'`

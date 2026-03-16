@@ -1,3 +1,4 @@
+import argparse
 import asyncio
 import json
 import logging
@@ -12,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Lock, Thread
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import psycopg
 import httpx
@@ -67,6 +68,91 @@ else:
     logger.info("No .env file found via explicit backend search; using process environment only.")
 
 DEFAULT_POSTGRES_PORT = 5432
+POSTGRES_REQUIRED_TABLES = ("games", "game_moves", "matches", "tickets")
+POSTGRES_SCHEMA_STATEMENTS: tuple[tuple[str, str, str], ...] = (
+    (
+        "table",
+        "games",
+        """
+        CREATE TABLE IF NOT EXISTS games (
+            id UUID PRIMARY KEY,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+    ),
+    (
+        "table",
+        "game_moves",
+        """
+        CREATE TABLE IF NOT EXISTS game_moves (
+            id BIGSERIAL PRIMARY KEY,
+            game_id UUID NOT NULL REFERENCES games(id) ON DELETE CASCADE,
+            ply BIGINT NOT NULL,
+            move_uci TEXT NOT NULL,
+            player_id UUID NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (game_id, ply)
+        )
+        """,
+    ),
+    (
+        "table",
+        "matches",
+        """
+        CREATE TABLE IF NOT EXISTS matches (
+            id UUID PRIMARY KEY,
+            game_id UUID NOT NULL UNIQUE REFERENCES games(id) ON DELETE CASCADE,
+            white_player_id UUID NOT NULL,
+            black_player_id UUID NOT NULL,
+            status TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            CHECK (white_player_id <> black_player_id)
+        )
+        """,
+    ),
+    (
+        "table",
+        "tickets",
+        """
+        CREATE TABLE IF NOT EXISTS tickets (
+            id UUID PRIMARY KEY,
+            player_id UUID NOT NULL,
+            status TEXT NOT NULL,
+            heartbeat_at TIMESTAMPTZ NOT NULL,
+            expires_at TIMESTAMPTZ NOT NULL,
+            match_id UUID NULL REFERENCES matches(id) ON DELETE SET NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+    ),
+    (
+        "index",
+        "tickets_one_active_per_player_idx",
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS tickets_one_active_per_player_idx
+        ON tickets (player_id)
+        WHERE status IN ('queued', 'matched')
+        """,
+    ),
+    (
+        "index",
+        "tickets_status_expires_idx",
+        """
+        CREATE INDEX IF NOT EXISTS tickets_status_expires_idx
+        ON tickets (status, expires_at, created_at)
+        """,
+    ),
+    (
+        "index",
+        "game_moves_game_ply_idx",
+        """
+        CREATE INDEX IF NOT EXISTS game_moves_game_ply_idx
+        ON game_moves (game_id, ply)
+        """,
+    ),
+)
 TICKET_TTL_SECONDS = int(os.getenv("MATCH_TICKET_TTL_SECONDS", "30"))
 UCI_MOVE_PATTERN = re.compile(r"^[a-h][1-8][a-h][1-8][qrbn]?$", re.IGNORECASE)
 ACTIVE_TICKET_STATUSES = ("queued", "matched")
@@ -2246,7 +2332,8 @@ def utcnow() -> datetime:
 def is_placeholder_value(value: str | None) -> bool:
     if not value:
         return False
-    return "your-railway" in value or "example" in value
+    normalized = value.lower()
+    return "your-" in normalized or "example" in normalized or "<" in normalized
 
 
 def normalize_postgres_dsn(value: str) -> str:
@@ -2255,15 +2342,25 @@ def normalize_postgres_dsn(value: str) -> str:
     return value
 
 
-def get_postgres_dsn() -> str:
-    direct_candidates = (
-        os.getenv("DATABASE_PRIVATE_URL"),
-        os.getenv("DATABASE_URL"),
-        os.getenv("DATABASE_PUBLIC_URL"),
+def has_postgres_configuration() -> bool:
+    database_url = os.getenv("DATABASE_URL")
+    if database_url and not is_placeholder_value(database_url):
+        return True
+
+    pg_host = os.getenv("PGHOST")
+    pg_database = os.getenv("PGDATABASE")
+    pg_user = os.getenv("PGUSER")
+    pg_password = os.getenv("PGPASSWORD")
+    return all(
+        value and not is_placeholder_value(value)
+        for value in (pg_host, pg_database, pg_user, pg_password)
     )
-    for candidate in direct_candidates:
-        if candidate and not is_placeholder_value(candidate):
-            return normalize_postgres_dsn(candidate)
+
+
+def get_postgres_dsn() -> str:
+    database_url = os.getenv("DATABASE_URL")
+    if database_url and not is_placeholder_value(database_url):
+        return normalize_postgres_dsn(database_url)
 
     pg_host = os.getenv("PGHOST")
     pg_port = os.getenv("PGPORT", str(DEFAULT_POSTGRES_PORT))
@@ -2271,18 +2368,18 @@ def get_postgres_dsn() -> str:
     pg_user = os.getenv("PGUSER")
     pg_password = os.getenv("PGPASSWORD")
 
-    if all((pg_host, pg_database, pg_user, pg_password)) and not is_placeholder_value(pg_host):
+    if all((pg_host, pg_database, pg_user, pg_password)) and not any(
+        is_placeholder_value(value) for value in (pg_host, pg_database, pg_user, pg_password)
+    ):
         return normalize_postgres_dsn(
-            f"postgresql://{pg_user}:{pg_password}@{pg_host}:{pg_port}/{pg_database}"
+            "postgresql://"
+            f"{quote(pg_user, safe='')}:{quote(pg_password, safe='')}"
+            f"@{pg_host}:{pg_port}/{quote(pg_database, safe='')}"
         )
 
-    legacy_host = os.getenv("POSTGRES_HOST", "127.0.0.1")
-    legacy_port = os.getenv("POSTGRES_PORT", str(DEFAULT_POSTGRES_PORT))
-    legacy_database = os.getenv("POSTGRES_DB", "postgres")
-    legacy_user = os.getenv("POSTGRES_USER", "postgres")
-    legacy_password = os.getenv("POSTGRES_PASSWORD", "postgres")
-    return normalize_postgres_dsn(
-        f"postgresql://{legacy_user}:{legacy_password}@{legacy_host}:{legacy_port}/{legacy_database}"
+    raise RuntimeError(
+        "Postgres configuration missing. Set DATABASE_URL or all of "
+        "PGHOST, PGPORT, PGDATABASE, PGUSER, and PGPASSWORD."
     )
 
 
@@ -2294,9 +2391,21 @@ def redact_postgres_host(dsn: str) -> str:
     return "unparsed-host"
 
 
+def redact_postgres_database(dsn: str) -> str:
+    with suppress(Exception):
+        parsed = urlparse(dsn)
+        if parsed.path:
+            return parsed.path.removeprefix("/") or "unknown-db"
+    return "unknown-db"
+
+
 def connect_postgres() -> psycopg.Connection:
     dsn = get_postgres_dsn()
-    logger.info("Connecting to Postgres using DSN source host=%s", redact_postgres_host(dsn))
+    logger.debug(
+        "Connecting to Postgres host=%s db=%s",
+        redact_postgres_host(dsn),
+        redact_postgres_database(dsn),
+    )
     return psycopg.connect(dsn, connect_timeout=5)
 
 
@@ -2312,81 +2421,57 @@ def ping_postgres() -> tuple[bool, str]:
         return False, f"Postgres ping failed: {exc}"
 
 
-def ensure_schema_ready(connection: psycopg.Connection | None = None) -> None:
+def ensure_schema_ready(
+    connection: psycopg.Connection | None = None,
+    *,
+    log_details: bool = False,
+) -> list[str]:
     if connection is None:
-        with connect_postgres() as owned_connection:
-            ensure_schema_ready(owned_connection)
-        return
+        with connect_postgres() as owned_connection, owned_connection.transaction():
+            return ensure_schema_ready(owned_connection, log_details=log_details)
 
+    ensured_objects: list[str] = []
     with connection.cursor() as cursor:
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS games (
-                id UUID PRIMARY KEY,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )
-            """
+        for object_type, object_name, statement in POSTGRES_SCHEMA_STATEMENTS:
+            cursor.execute(statement)
+            ensured_objects.append(object_name)
+            if log_details:
+                logger.info("Ensured Postgres %s %s", object_type, object_name)
+    return ensured_objects
+
+
+def ensure_postgres_startup_ready(*, require_configuration: bool = False) -> list[str]:
+    if not has_postgres_configuration():
+        message = (
+            "Postgres startup sync skipped because DATABASE_URL or PG* variables are not configured."
         )
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS game_moves (
-                id BIGSERIAL PRIMARY KEY,
-                game_id UUID NOT NULL REFERENCES games(id) ON DELETE CASCADE,
-                ply BIGINT NOT NULL,
-                move_uci TEXT NOT NULL,
-                player_id UUID NULL,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                UNIQUE (game_id, ply)
-            )
-            """
+        if require_configuration:
+            raise RuntimeError(message)
+        logger.warning(message)
+        return []
+
+    dsn = get_postgres_dsn()
+    host = redact_postgres_host(dsn)
+    database = redact_postgres_database(dsn)
+    logger.info("Postgres startup connection beginning host=%s db=%s", host, database)
+
+    with connect_postgres() as connection, connection.transaction():
+        with connection.cursor(row_factory=psycopg.rows.dict_row) as cursor:
+            cursor.execute("SELECT current_database() AS database_name")
+            row = cursor.fetchone() or {}
+        logger.info(
+            "Postgres connection succeeded host=%s db=%s",
+            host,
+            row.get("database_name", database),
         )
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS matches (
-                id UUID PRIMARY KEY,
-                game_id UUID NOT NULL UNIQUE REFERENCES games(id) ON DELETE CASCADE,
-                white_player_id UUID NOT NULL,
-                black_player_id UUID NOT NULL,
-                status TEXT NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                CHECK (white_player_id <> black_player_id)
-            )
-            """
-        )
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS tickets (
-                id UUID PRIMARY KEY,
-                player_id UUID NOT NULL,
-                status TEXT NOT NULL,
-                heartbeat_at TIMESTAMPTZ NOT NULL,
-                expires_at TIMESTAMPTZ NOT NULL,
-                match_id UUID NULL REFERENCES matches(id) ON DELETE SET NULL,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )
-            """
-        )
-        cursor.execute(
-            """
-            CREATE UNIQUE INDEX IF NOT EXISTS tickets_one_active_per_player_idx
-            ON tickets (player_id)
-            WHERE status IN ('queued', 'matched')
-            """
-        )
-        cursor.execute(
-            """
-            CREATE INDEX IF NOT EXISTS tickets_status_expires_idx
-            ON tickets (status, expires_at, created_at)
-            """
-        )
-        cursor.execute(
-            """
-            CREATE INDEX IF NOT EXISTS game_moves_game_ply_idx
-            ON game_moves (game_id, ply)
-            """
-        )
+        ensured_objects = ensure_schema_ready(connection, log_details=True)
+
+    logger.info(
+        "Postgres schema sync succeeded tables=%s objects=%s",
+        ", ".join(POSTGRES_REQUIRED_TABLES),
+        ", ".join(ensured_objects),
+    )
+    return ensured_objects
 
 
 def create_game_record(connection: psycopg.Connection | None = None) -> uuid.UUID:
@@ -2899,6 +2984,7 @@ def get_queue_match_moves(
 
 @app.on_event("startup")
 async def startup_gemini_live() -> None:
+    ensure_postgres_startup_ready()
     GEMINI_LIVE_CLIENT.ensure_connection_background()
     GEMINI_PASSIVE_COMMENTARY_CLIENT.ensure_connection_background()
     Thread(
@@ -3406,6 +3492,18 @@ def get_match_moves(
 
 if __name__ == "__main__":
     import uvicorn
+
+    parser = argparse.ArgumentParser(description="AR Chess backend server")
+    parser.add_argument(
+        "--ensure-schema",
+        action="store_true",
+        help="Connect to Postgres, ensure the required schema exists, then exit.",
+    )
+    args = parser.parse_args()
+
+    if args.ensure_schema:
+        ensure_postgres_startup_ready(require_configuration=True)
+        raise SystemExit(0)
 
     uvicorn.run(
         "main:app",

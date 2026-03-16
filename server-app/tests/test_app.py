@@ -2132,24 +2132,21 @@ def test_create_gemini_piece_voice_line_repairs_fragment_response(monkeypatch) -
     assert "finished in-character sentence" in prompts[2]
 
 
-def test_get_postgres_dsn_prefers_railway_private_url(monkeypatch) -> None:
-    monkeypatch.setenv("DATABASE_PRIVATE_URL", "postgres://user:pass@private-host:5432/railway")
-    monkeypatch.setenv("DATABASE_URL", "postgresql://user:pass@public-host:5432/railway")
+def test_get_postgres_dsn_prefers_database_url(monkeypatch) -> None:
+    monkeypatch.setenv("DATABASE_URL", "postgres://user:pass@cloudsql-host:5432/archess")
 
-    assert get_postgres_dsn() == "postgresql://user:pass@private-host:5432/railway"
+    assert get_postgres_dsn() == "postgresql://user:pass@cloudsql-host:5432/archess"
 
 
 def test_get_postgres_dsn_supports_pg_fallback_vars(monkeypatch) -> None:
-    monkeypatch.delenv("DATABASE_PRIVATE_URL", raising=False)
     monkeypatch.delenv("DATABASE_URL", raising=False)
-    monkeypatch.delenv("DATABASE_PUBLIC_URL", raising=False)
-    monkeypatch.setenv("PGHOST", "railway.internal")
+    monkeypatch.setenv("PGHOST", "cloudsql.internal")
     monkeypatch.setenv("PGPORT", "5432")
-    monkeypatch.setenv("PGDATABASE", "railway")
+    monkeypatch.setenv("PGDATABASE", "archess")
     monkeypatch.setenv("PGUSER", "postgres")
     monkeypatch.setenv("PGPASSWORD", "secret")
 
-    assert get_postgres_dsn() == "postgresql://postgres:secret@railway.internal:5432/railway"
+    assert get_postgres_dsn() == "postgresql://postgres:secret@cloudsql.internal:5432/archess"
 
 
 def test_normalize_postgres_dsn_rewrites_postgres_scheme() -> None:
@@ -2159,21 +2156,31 @@ def test_normalize_postgres_dsn_rewrites_postgres_scheme() -> None:
 
 
 def test_get_postgres_dsn_skips_placeholder_database_url(monkeypatch) -> None:
-    monkeypatch.delenv("DATABASE_PRIVATE_URL", raising=False)
-    monkeypatch.delenv("DATABASE_PUBLIC_URL", raising=False)
     monkeypatch.setenv(
         "DATABASE_URL",
-        "postgresql://postgres:password@your-railway-postgres-host:5432/railway",
+        "postgresql://postgres:password@your-cloudsql-postgres-host:5432/archess",
     )
-    monkeypatch.setenv("PGHOST", "railway.internal")
+    monkeypatch.setenv("PGHOST", "cloudsql.internal")
     monkeypatch.setenv("PGPORT", "5432")
-    monkeypatch.setenv("PGDATABASE", "railway")
+    monkeypatch.setenv("PGDATABASE", "archess")
     monkeypatch.setenv("PGUSER", "postgres")
     monkeypatch.setenv("PGPASSWORD", "secret")
 
-    assert get_postgres_dsn() == "postgresql://postgres:secret@railway.internal:5432/railway"
+    assert get_postgres_dsn() == "postgresql://postgres:secret@cloudsql.internal:5432/archess"
+
+
+def test_get_postgres_dsn_raises_without_database_env(monkeypatch) -> None:
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.delenv("PGHOST", raising=False)
+    monkeypatch.delenv("PGPORT", raising=False)
+    monkeypatch.delenv("PGDATABASE", raising=False)
+    monkeypatch.delenv("PGUSER", raising=False)
+    monkeypatch.delenv("PGPASSWORD", raising=False)
+
+    with pytest.raises(RuntimeError, match="Postgres configuration missing"):
+        get_postgres_dsn()
 
 
 def test_is_placeholder_value_detects_template_markers() -> None:
-    assert is_placeholder_value("postgresql://x:y@your-railway-postgres-host:5432/railway")
-    assert is_placeholder_value("https://your-railway-service.up.railway.app")
+    assert is_placeholder_value("postgresql://x:y@your-cloudsql-postgres-host:5432/archess")
+    assert is_placeholder_value("https://example-service.internal")
