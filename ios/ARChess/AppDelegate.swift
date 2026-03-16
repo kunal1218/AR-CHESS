@@ -8077,10 +8077,11 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       ]
     }
 
-    let pages = candidates.compactMap { candidate -> FishingRewardPage? in
+    var pages: [FishingRewardPage] = []
+    for candidate in candidates {
       guard let moveUCI = candidate.move,
             let move = state.move(forUCI: moveUCI) else {
-        return nil
+        continue
       }
 
       let nextState = state.applying(move)
@@ -8092,18 +8093,24 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       let footerText = continuation.isEmpty
         ? "Eval \(candidate.formattedScore)  •  depth \(candidate.depth)"
         : "Eval \(candidate.formattedScore)  •  Then \(continuation)"
+      let interpretationText = await fishingRewardMoveInterpretation(
+        for: move,
+        before: state,
+        after: nextState
+      )
 
-      return FishingRewardPage(
+      pages.append(FishingRewardPage(
         id: "fishing-reward-\(candidate.rank)-\(move.uciString)-\(state.fenString)",
         title: candidate.rank == 1 ? "Best move" : "Line \(candidate.rank)",
         summary: fishingRewardMoveSummary(move),
         detailText: "Board after \(state.turn.displayName.lowercased()) plays \(fishingReadableMove(move.uciString)).",
+        interpretationText: interpretationText,
         footerText: footerText,
         boardState: nextState,
         fromSquare: move.from,
         toSquare: move.to,
         perspective: state.turn
-      )
+      ))
     }
 
     if !pages.isEmpty {
@@ -8200,12 +8207,77 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       title: title,
       summary: summary,
       detailText: detailText,
+      interpretationText: detailText,
       footerText: nil,
       boardState: nil,
       fromSquare: nil,
       toSquare: nil,
       perspective: .white
     )
+  }
+
+  private func fishingRewardMoveInterpretation(
+    for move: ChessMove,
+    before state: ChessGameState,
+    after nextState: ChessGameState
+  ) async -> String {
+    let context = GeminiHintContext(
+      fen: state.fenString,
+      recentHistory: recentHistoryProvider?(),
+      bestMove: move.uciString,
+      sideToMove: state.turn,
+      narrator: narrator,
+      movingPiece: move.piece.kind,
+      isCapture: move.captured != nil || move.isEnPassant,
+      givesCheck: nextState.isInCheck(for: nextState.turn),
+      themes: hintThemes(for: move, before: state, after: nextState)
+    )
+    let fallback = fishingRewardInterpretationFallback(for: context)
+
+    guard hintService.isConfigured else {
+      return fallback
+    }
+
+    do {
+      let rawInterpretation = try await hintService.fetchHint(for: context)
+      let capped = cappedNarrationText(
+        rawInterpretation,
+        maxSentences: 2,
+        maxCharacters: 220
+      ).text
+      return capped.isEmpty ? fallback : capped
+    } catch {
+      appendGeminiDebug("Fishing note explanation fell back to local text: \(error.localizedDescription)")
+      return fallback
+    }
+  }
+
+  private func fishingRewardInterpretationFallback(for context: GeminiHintContext) -> String {
+    if context.givesCheck {
+      return "It puts the enemy king under immediate pressure. That forces a response and can make the next move easier to find."
+    }
+
+    if context.isCapture {
+      return "It wins material or makes a favorable trade. That usually leaves the position cleaner and easier to play."
+    }
+
+    if context.themes.contains("improve king safety") {
+      return "It makes the king safer and steadies the whole position. Safe kings give the rest of the pieces more freedom."
+    }
+
+    if context.themes.contains("fight for the center") || context.themes.contains("gain space") {
+      return "It grabs space in an important part of the board. Controlling more central ground gives your pieces better routes."
+    }
+
+    if context.themes.contains("develop a new piece") {
+      return "It brings a useful piece into the game. Better activity means your position can improve without taking risks."
+    }
+
+    if context.themes.contains("pressure the enemy king") {
+      return "It points more force toward the enemy king. Even without a direct tactic yet, the pressure can create problems."
+    }
+
+    return "It places the piece on a more useful square. Small improvements like this often make the whole position easier to handle."
   }
 
   private func engineReplyMove(
@@ -12302,6 +12374,7 @@ private struct PiecePortraitView: View {
 
 private struct ARChessRootView: View {
   @AppStorage("archess.dailyCosmetic.devModeEnabled") private var isDailyCosmeticDevModeEnabled = false
+  @AppStorage("archess.scene.showVRChessLabel") private var isVRChessLabelEnabled = false
   @State private var screen: NativeScreen = .modeSelection
   @StateObject private var queueMatch = QueueMatchStore()
   @StateObject private var cosmeticRewards = DailyCosmeticRewardStore()
@@ -12315,6 +12388,7 @@ private struct ARChessRootView: View {
         ModeSelectionView(
           selectedNarrator: $selectedNarrator,
           isDailyCosmeticDevModeEnabled: $isDailyCosmeticDevModeEnabled,
+          isVRChessLabelEnabled: $isVRChessLabelEnabled,
           openCosmeticsCreator: {
             withAnimation(.spring(response: 0.42, dampingFraction: 0.88)) {
               screen = .cosmeticsCreator
@@ -12597,6 +12671,7 @@ private struct ModeSelectionView: View {
   @AppStorage("archess.ui.hideDeveloperButtons") private var hidesDeveloperButtons = false
   @Binding var selectedNarrator: NarratorType
   @Binding var isDailyCosmeticDevModeEnabled: Bool
+  @Binding var isVRChessLabelEnabled: Bool
   let openCosmeticsCreator: () -> Void
   let onSelect: (PlayModeChoice) -> Void
   @State private var isPiperAuditionPresented = false
@@ -12740,6 +12815,7 @@ private struct ModeSelectionView: View {
   private var settingsTabContent: some View {
     VStack(spacing: 16) {
       NarratorSelectionCard(selectedNarrator: $selectedNarrator)
+      VRChessLabelToggleCard(isEnabled: $isVRChessLabelEnabled)
       DailyCosmeticDevToggleCard(isEnabled: $isDailyCosmeticDevModeEnabled)
       ARDeveloperButtonsToggleCard(isEnabled: $hidesDeveloperButtons)
 
@@ -12905,6 +12981,56 @@ private struct DailyCosmeticDevToggleCard: View {
       .foregroundStyle(
         isEnabled
           ? Color(red: 0.82, green: 0.92, blue: 0.74)
+          : Color.white.opacity(0.64)
+      )
+      .lineSpacing(2)
+    }
+    .padding(.horizontal, 18)
+    .padding(.vertical, 16)
+    .background(
+      RoundedRectangle(cornerRadius: 24, style: .continuous)
+        .fill(Color.white.opacity(0.06))
+        .overlay(
+          RoundedRectangle(cornerRadius: 24, style: .continuous)
+            .stroke(Color.white.opacity(0.14), lineWidth: 1)
+        )
+    )
+  }
+}
+
+private struct VRChessLabelToggleCard: View {
+  @Binding var isEnabled: Bool
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 12) {
+      HStack(alignment: .top, spacing: 14) {
+        VStack(alignment: .leading, spacing: 6) {
+          Text("VR Chess Label")
+            .font(.system(size: 14, weight: .black, design: .rounded))
+            .foregroundStyle(.white)
+
+          Text("Shows a floating cinematic VR CHESS title above the board and plays a one-pass bird flyby when it appears.")
+            .font(.system(size: 12, weight: .semibold, design: .rounded))
+            .foregroundStyle(Color.white.opacity(0.72))
+            .lineSpacing(2)
+        }
+
+        Spacer(minLength: 12)
+
+        Toggle("", isOn: $isEnabled)
+          .labelsHidden()
+          .tint(Color(red: 0.95, green: 0.88, blue: 0.73))
+      }
+
+      Text(
+        isEnabled
+          ? "The world title is enabled and will reappear with its flyby when the AR scene is rebuilt."
+          : "The AR scene stays clear of the floating title card."
+      )
+      .font(.system(size: 11, weight: .bold, design: .rounded))
+      .foregroundStyle(
+        isEnabled
+          ? Color(red: 0.95, green: 0.84, blue: 0.58)
           : Color.white.opacity(0.64)
       )
       .lineSpacing(2)
@@ -14636,8 +14762,8 @@ private final class CosmeticsCreatorRoomStore: ObservableObject {
   @Published private(set) var statusText: String?
 
   private let cosmetics: PieceCosmeticsStore
-  private let defaultYaw: Float = -.pi / 6
-  private let defaultPitch: Float = -.pi / 18
+  private let defaultYaw: Float = .pi
+  private let defaultPitch: Float = 0
   private let defaultCameraDistance: Float = 0.25
   private var zoomStartDistance: Float = 0.25
   private var isZooming = false
@@ -14694,6 +14820,9 @@ private final class CosmeticsCreatorRoomStore: ObservableObject {
     }
 
     selectedPieceKind = pieceKind
+    previewYaw = 0
+    previewPitch = 0
+    previewSpinRevision += 1
     cosmetics.setLastViewed(pieceKind: pieceKind)
     ensureSelectedCategoryIsValid()
   }
@@ -14939,7 +15068,9 @@ private enum ChessPieceVisualFactory {
 
   private static func pieceRoleCarryHand(for kind: ChessPieceKind) -> PieceCosmeticCarryHandSide {
     switch kind {
-    case .pawn, .rook, .bishop:
+    case .pawn:
+      return .right
+    case .rook, .bishop:
       return .left
     case .knight, .queen, .king:
       return .right
@@ -15263,33 +15394,77 @@ private enum ChessPieceVisualFactory {
     _ = kind
     chips.position = SIMD3<Float>(0.0065 * handSign, -0.003, 0.011)
     chips.orientation = simd_normalize(
-      simd_quatf(angle: handSign * (.pi / 7), axis: SIMD3<Float>(0, 1, 0)) *
+      simd_quatf(angle: .pi, axis: SIMD3<Float>(0, 1, 0)) *
+        simd_quatf(angle: handSign * (.pi / 7), axis: SIMD3<Float>(0, 1, 0)) *
         simd_quatf(angle: handSign * (.pi / 11), axis: SIMD3<Float>(0, 0, 1))
     )
 
-    let bagMaterial = accessoryMaterial(color: UIColor(red: 0.93, green: 0.74, blue: 0.22, alpha: 1), metallic: false)
-    let stripeMaterial = accessoryMaterial(color: UIColor(red: 0.81, green: 0.16, blue: 0.13, alpha: 1), metallic: false)
-    let chipMaterial = accessoryMaterial(color: UIColor(red: 0.98, green: 0.90, blue: 0.64, alpha: 1), metallic: false)
+    let bagMaterial = accessoryMaterial(color: UIColor(red: 0.78, green: 0.11, blue: 0.08, alpha: 1), metallic: false)
+    let foldMaterial = accessoryMaterial(color: UIColor(red: 0.54, green: 0.05, blue: 0.05, alpha: 1), metallic: false)
+    let chipMaterial = accessoryMaterial(color: UIColor(red: 0.95, green: 0.63, blue: 0.14, alpha: 1), metallic: false)
+
+    let bagShadow = ModelEntity(
+      mesh: .generateBox(size: SIMD3<Float>(0.0148, 0.0210, 0.0056)),
+      materials: [foldMaterial]
+    )
+    bagShadow.position = SIMD3<Float>(0, 0, -0.0009)
+    chips.addChild(bagShadow)
 
     let bag = ModelEntity(
-      mesh: .generateBox(size: SIMD3<Float>(0.012, 0.016, 0.005)),
+      mesh: .generateBox(size: SIMD3<Float>(0.0138, 0.0194, 0.0050)),
       materials: [bagMaterial]
     )
     chips.addChild(bag)
 
-    let stripe = ModelEntity(
-      mesh: .generateBox(size: SIMD3<Float>(0.004, 0.0165, 0.0056)),
-      materials: [stripeMaterial]
+    let topFold = ModelEntity(
+      mesh: .generateBox(size: SIMD3<Float>(0.0132, 0.0030, 0.0056)),
+      materials: [foldMaterial]
     )
-    stripe.position = SIMD3<Float>(0.002, 0, 0.0006)
-    chips.addChild(stripe)
+    topFold.position = SIMD3<Float>(0, 0.0092, 0.0002)
+    chips.addChild(topFold)
 
-    let chip = ModelEntity(mesh: .generateSphere(radius: 0.0024), materials: [chipMaterial])
-    chip.scale = SIMD3<Float>(1.4, 0.4, 1.0)
-    chip.position = SIMD3<Float>(-0.002, 0.010, 0.001)
-    chips.addChild(chip)
+    let bottomFold = ModelEntity(
+      mesh: .generateBox(size: SIMD3<Float>(0.0128, 0.0026, 0.0054)),
+      materials: [foldMaterial]
+    )
+    bottomFold.position = SIMD3<Float>(0, -0.0092, 0.0002)
+    chips.addChild(bottomFold)
+
+    let frontChip = makeLazyChipBadgeEntity(material: chipMaterial)
+    frontChip.position = SIMD3<Float>(0.0002, -0.0013, 0.0032)
+    chips.addChild(frontChip)
 
     return chips
+  }
+
+  private static func makeLazyChipBadgeEntity(material: SimpleMaterial) -> Entity {
+    let badge = Entity()
+    let chipMesh = MeshResource.generateText(
+      "▲",
+      extrusionDepth: 0.0006,
+      font: .systemFont(ofSize: 18, weight: .black),
+      containerFrame: .zero,
+      alignment: .center,
+      lineBreakMode: .byClipping
+    )
+    let chip = ModelEntity(mesh: chipMesh, materials: [material])
+    centerAccessoryVisualOrigin(chip)
+    badge.addChild(chip)
+    fitAccessoryVisualBounds(of: badge, maxWidth: 0.0066, maxHeight: 0.0066)
+    return badge
+  }
+
+  private static func centerAccessoryVisualOrigin(_ entity: Entity) {
+    let bounds = entity.visualBounds(relativeTo: nil)
+    entity.position = -bounds.center
+  }
+
+  private static func fitAccessoryVisualBounds(of entity: Entity, maxWidth: Float, maxHeight: Float) {
+    let bounds = entity.visualBounds(relativeTo: nil)
+    let width = max(bounds.extents.x, 0.0001)
+    let height = max(bounds.extents.y, 0.0001)
+    let scale = min(maxWidth / width, maxHeight / height)
+    entity.scale = SIMD3<Float>(repeating: scale)
   }
 
   private static func makeWorkerBriefcaseEntity(
@@ -16368,6 +16543,7 @@ private struct FishingRewardPage: Identifiable {
   let title: String
   let summary: String
   let detailText: String
+  let interpretationText: String?
   let footerText: String?
   let boardState: ChessGameState?
   let fromSquare: BoardSquare?
@@ -16842,12 +17018,6 @@ private struct NativeARExperienceView: View {
 
           Spacer()
 
-          if let caption = socraticCoach.caption ?? commentary.caption {
-            PieceSpeechBubble(caption: caption)
-            .allowsHitTesting(false)
-            .transition(.move(edge: .bottom).combined(with: .opacity))
-          }
-
           if isGeminiDebugVisible {
             geminiDebugPanel
               .transition(.move(edge: .bottom).combined(with: .opacity))
@@ -16928,6 +17098,18 @@ private struct NativeARExperienceView: View {
         }
         .padding(.horizontal, 18)
         .padding(.vertical, 24)
+      }
+
+      if gameReview.phase == .idle,
+         let caption = socraticCoach.caption ?? commentary.caption {
+        VStack {
+          Spacer()
+          PieceSpeechBubble(caption: caption)
+            .allowsHitTesting(false)
+            .transition(.move(edge: .bottom).combined(with: .opacity))
+            .padding(.horizontal, 18)
+            .padding(.bottom, 24)
+        }
       }
 
       if gameReview.phase == .idle {
@@ -18607,11 +18789,33 @@ private struct FishingRewardOverlay: View {
         .onTapGesture(perform: onDismiss)
 
       VStack(spacing: rewardPages.count > 1 ? 14 : 0) {
+        HStack(alignment: .center, spacing: 12) {
+          Text("Stockfish's Notes")
+            .font(.system(size: 22, weight: .heavy, design: .rounded))
+            .foregroundStyle(Color(red: 0.16, green: 0.12, blue: 0.10))
+
+          Spacer(minLength: 8)
+
+          Button(action: onDismiss) {
+            Image(systemName: "xmark")
+              .font(.system(size: 14, weight: .black))
+              .foregroundStyle(Color(red: 0.16, green: 0.12, blue: 0.10))
+              .frame(width: 34, height: 34)
+              .background(
+                Circle()
+                  .fill(Color.white.opacity(0.52))
+              )
+          }
+          .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 20)
+        .padding(.top, 18)
+
         TabView(selection: $selectedPage) {
           ForEach(Array(rewardPages.enumerated()), id: \.element.id) { index, page in
             FishingRewardPageCard(page: page)
               .padding(.horizontal, 20)
-              .padding(.vertical, 22)
+              .padding(.bottom, 22)
               .tag(index)
           }
         }
@@ -18688,11 +18892,19 @@ private struct FishingRewardPageCard: View {
         .aspectRatio(1, contentMode: .fit)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
 
-        Spacer(minLength: 0)
+        if let interpretationText = page.interpretationText {
+          FishingRewardGeminiAnalysisText(text: interpretationText)
+        }
+
+        Spacer(minLength: 0.001)
       } else {
         Spacer(minLength: 0)
         FishingRewardEmptyPage(summary: page.summary)
         Spacer(minLength: 0)
+
+        if let interpretationText = page.interpretationText {
+          FishingRewardGeminiAnalysisText(text: interpretationText)
+        }
 
         if let footerText = page.footerText {
           Text(footerText)
@@ -18704,6 +18916,26 @@ private struct FishingRewardPageCard: View {
       }
     }
     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+  }
+}
+
+private struct FishingRewardGeminiAnalysisText: View {
+  let text: String
+
+  var body: some View {
+    (
+      Text("Gemini Analysis: ")
+        .font(.system(size: 14, weight: .bold, design: .rounded))
+      +
+      Text(text)
+        .font(.system(size: 14, weight: .semibold, design: .rounded))
+    )
+    .foregroundStyle(Color(red: 0.20, green: 0.15, blue: 0.12))
+    .lineSpacing(3)
+    .multilineTextAlignment(.center)
+    .fixedSize(horizontal: false, vertical: true)
+    .frame(maxWidth: .infinity)
+    .padding(.horizontal, 12)
   }
 }
 
@@ -20877,6 +21109,7 @@ extension ChessGameState {
 }
 
 private struct NativeARView: UIViewRepresentable {
+  @AppStorage("archess.scene.showVRChessLabel") private var isVRChessLabelEnabled = false
   @ObservedObject var matchLog: MatchLogStore
   @ObservedObject var queueMatch: QueueMatchStore
   let mode: ExperienceMode
@@ -20901,6 +21134,7 @@ private struct NativeARView: UIViewRepresentable {
       fishing: fishing,
       cosmeticRewards: cosmeticRewards,
       pieceRoles: pieceRoles,
+      isVRChessLabelEnabled: isVRChessLabelEnabled,
       onReviewFinished: onReviewFinished
     )
   }
@@ -20912,7 +21146,10 @@ private struct NativeARView: UIViewRepresentable {
   }
 
   func updateUIView(_ uiView: ARView, context: Context) {
-    context.coordinator.syncRuntimeState(queueAssignedColor: queueMatch.assignedColor)
+    context.coordinator.syncRuntimeState(
+      queueAssignedColor: queueMatch.assignedColor,
+      isVRChessLabelEnabled: isVRChessLabelEnabled
+    )
   }
 
   @MainActor
@@ -20999,6 +21236,8 @@ private struct NativeARView: UIViewRepresentable {
     private static let fishingRigMinimumCameraUpComponent: Float = 0.22
     private static let cosmeticVendingDispenseGlowBaseColor = UIColor(red: 0.98, green: 0.80, blue: 0.44, alpha: 0.84)
     private static let cosmeticVendingDispenseDurationNanoseconds: UInt64 = 620_000_000
+    private static let vrChessBirdFlyDuration: TimeInterval = 4.1
+    private static let vrChessBirdLaunchDelayNanoseconds: UInt64 = 5_000_000_000
     private static let fishingRigLiveDebugLoggingEnabled = true
     private static let fishingRigLiveDebugLogInterval: CFTimeInterval = 0.20
     private static let neutralHoldCalibrationDuration: CFTimeInterval = 2.5
@@ -21064,6 +21303,7 @@ private struct NativeARView: UIViewRepresentable {
     private let cosmeticRewards: DailyCosmeticRewardStore
     private let pieceRoles: PieceRoleStore
     private let onReviewFinished: () -> Void
+    private var isVRChessLabelEnabled: Bool
     private weak var arView: ARView?
     private var boardAnchor: AnchorEntity?
     private var boardWorldTransform: simd_float4x4?
@@ -21128,6 +21368,10 @@ private struct NativeARView: UIViewRepresentable {
     private weak var cosmeticVendingMachineGlowEntity: ModelEntity?
     private weak var cosmeticVendingMachineTrayEntity: Entity?
     private var cosmeticVendingDispenseTask: Task<Void, Never>?
+    private weak var vrChessLabelEntity: Entity?
+    private weak var vrChessBirdEntity: Entity?
+    private var vrChessBirdLaunchTask: Task<Void, Never>?
+    private var vrChessBirdCleanupTask: Task<Void, Never>?
     private var fishingRodAnchor: AnchorEntity?
     private weak var fishingRigEntity: Entity?
     private weak var fishingRodEntity: Entity?
@@ -21146,6 +21390,7 @@ private struct NativeARView: UIViewRepresentable {
     private var fishingBiteTask: Task<Void, Never>?
     private var fishingCatchWindowTask: Task<Void, Never>?
     private var fishingRevealTask: Task<Void, Never>?
+    private var fishingRewardPrefetchTask: Task<[FishingRewardPage], Never>?
     private var fishingResetTask: Task<Void, Never>?
     private var fishingBobberCastCompletedAt: CFTimeInterval?
     private var fishingSequenceID = 0
@@ -21174,6 +21419,7 @@ private struct NativeARView: UIViewRepresentable {
       fishing: FishingInteractionStore,
       cosmeticRewards: DailyCosmeticRewardStore,
       pieceRoles: PieceRoleStore,
+      isVRChessLabelEnabled: Bool,
       onReviewFinished: @escaping () -> Void
     ) {
       self.matchLog = matchLog
@@ -21186,6 +21432,7 @@ private struct NativeARView: UIViewRepresentable {
       self.fishing = fishing
       self.cosmeticRewards = cosmeticRewards
       self.pieceRoles = pieceRoles
+      self.isVRChessLabelEnabled = isVRChessLabelEnabled
       self.onReviewFinished = onReviewFinished
 
       switch mode {
@@ -21216,12 +21463,17 @@ private struct NativeARView: UIViewRepresentable {
       fishingBiteTask?.cancel()
       fishingCatchWindowTask?.cancel()
       fishingRevealTask?.cancel()
+      fishingRewardPrefetchTask?.cancel()
       fishingResetTask?.cancel()
       cosmeticVendingDispenseTask?.cancel()
+      vrChessBirdLaunchTask?.cancel()
+      vrChessBirdCleanupTask?.cancel()
       fishingRodAnchor?.removeFromParent()
       fishingCastLineAnchor?.removeFromParent()
       fishingBobberAnchor?.removeFromParent()
       fishingFishAnchor?.removeFromParent()
+      vrChessLabelEntity?.removeFromParent()
+      vrChessBirdEntity?.removeFromParent()
       upwardFlickDetector.stop()
       threatOverlayDisplayLink?.invalidate()
       threatOverlayHideWorkItem?.cancel()
@@ -21363,9 +21615,6 @@ private struct NativeARView: UIViewRepresentable {
           self.commentary.bindPassiveCommentarySuppressionProvider { [weak self] in
             self?.socraticCoach.blocksPassiveCommentary ?? false
           }
-          if self.mode.supportsPassiveAutomaticCommentary {
-            self.commentary.maybeStartOpeningNarration(for: self.gameState)
-          }
         }
       }
 
@@ -21411,8 +21660,9 @@ private struct NativeARView: UIViewRepresentable {
       }
     }
 
-    func syncRuntimeState(queueAssignedColor: ChessColor?) {
+    func syncRuntimeState(queueAssignedColor: ChessColor?, isVRChessLabelEnabled: Bool) {
       self.queueAssignedColor = queueAssignedColor
+      self.isVRChessLabelEnabled = isVRChessLabelEnabled
       syncLessonStateIfNeeded()
       syncLessonRevealPresentationIfNeeded()
       syncBoardPerspectiveIfNeeded()
@@ -21420,6 +21670,7 @@ private struct NativeARView: UIViewRepresentable {
       syncReviewStateIfNeeded()
       syncAutomatedOpponentTurnIfNeeded()
       syncSocraticCoachContext()
+      syncVRChessTitlePresentation(playBirdFlybyOnCreate: true)
       if boardAnchor == nil {
         prepareBoardSceneIfNeeded()
       }
@@ -21806,6 +22057,7 @@ private struct NativeARView: UIViewRepresentable {
       boardRoot.scale = SIMD3<Float>(repeating: boardScale)
       updateFishingPondPlacement()
       updateCosmeticVendingMachinePlacement()
+      updateVRChessTitlePlacement()
     }
 
     private func desiredBoardViewerColor() -> ChessColor {
@@ -23988,35 +24240,67 @@ private struct NativeARView: UIViewRepresentable {
     private func makeLazyChipsEntity(for kind: ChessPieceKind, handSide: PieceAccessoryHandSide) -> Entity {
       let chips = Entity()
       let handSign: Float = handSide == .left ? -1 : 1
+      _ = kind
       chips.position = SIMD3<Float>(0.0065 * handSign, -0.003, 0.011)
       chips.orientation = simd_normalize(
-        simd_quatf(angle: handSign * (.pi / 7), axis: SIMD3<Float>(0, 1, 0)) *
+        simd_quatf(angle: .pi, axis: SIMD3<Float>(0, 1, 0)) *
+          simd_quatf(angle: handSign * (.pi / 7), axis: SIMD3<Float>(0, 1, 0)) *
           simd_quatf(angle: handSign * (.pi / 11), axis: SIMD3<Float>(0, 0, 1))
       )
 
-      let bagMaterial = accessoryMaterial(color: UIColor(red: 0.93, green: 0.74, blue: 0.22, alpha: 1), metallic: false)
-      let stripeMaterial = accessoryMaterial(color: UIColor(red: 0.81, green: 0.16, blue: 0.13, alpha: 1), metallic: false)
-      let chipMaterial = accessoryMaterial(color: UIColor(red: 0.98, green: 0.90, blue: 0.64, alpha: 1), metallic: false)
+      let bagMaterial = accessoryMaterial(color: UIColor(red: 0.78, green: 0.11, blue: 0.08, alpha: 1), metallic: false)
+      let foldMaterial = accessoryMaterial(color: UIColor(red: 0.54, green: 0.05, blue: 0.05, alpha: 1), metallic: false)
+      let chipMaterial = accessoryMaterial(color: UIColor(red: 0.95, green: 0.63, blue: 0.14, alpha: 1), metallic: false)
+
+      let bagShadow = ModelEntity(
+        mesh: .generateBox(size: SIMD3<Float>(0.0148, 0.0210, 0.0056)),
+        materials: [foldMaterial]
+      )
+      bagShadow.position = SIMD3<Float>(0, 0, -0.0009)
+      chips.addChild(bagShadow)
 
       let bag = ModelEntity(
-        mesh: .generateBox(size: SIMD3<Float>(0.012, 0.016, 0.005)),
+        mesh: .generateBox(size: SIMD3<Float>(0.0138, 0.0194, 0.0050)),
         materials: [bagMaterial]
       )
       chips.addChild(bag)
 
-      let stripe = ModelEntity(
-        mesh: .generateBox(size: SIMD3<Float>(0.004, 0.0165, 0.0056)),
-        materials: [stripeMaterial]
+      let topFold = ModelEntity(
+        mesh: .generateBox(size: SIMD3<Float>(0.0132, 0.0030, 0.0056)),
+        materials: [foldMaterial]
       )
-      stripe.position = SIMD3<Float>(0.002, 0, 0.0006)
-      chips.addChild(stripe)
+      topFold.position = SIMD3<Float>(0, 0.0092, 0.0002)
+      chips.addChild(topFold)
 
-      let chip = ModelEntity(mesh: .generateSphere(radius: 0.0024), materials: [chipMaterial])
-      chip.scale = SIMD3<Float>(1.4, 0.4, 1.0)
-      chip.position = SIMD3<Float>(-0.002, 0.010, 0.001)
-      chips.addChild(chip)
+      let bottomFold = ModelEntity(
+        mesh: .generateBox(size: SIMD3<Float>(0.0128, 0.0026, 0.0054)),
+        materials: [foldMaterial]
+      )
+      bottomFold.position = SIMD3<Float>(0, -0.0092, 0.0002)
+      chips.addChild(bottomFold)
+
+      let frontChip = makeLazyChipBadgeEntity(material: chipMaterial)
+      frontChip.position = SIMD3<Float>(0.0002, -0.0013, 0.0032)
+      chips.addChild(frontChip)
 
       return chips
+    }
+
+    private func makeLazyChipBadgeEntity(material: SimpleMaterial) -> Entity {
+      let badge = Entity()
+      let chipMesh = MeshResource.generateText(
+        "▲",
+        extrusionDepth: 0.0006,
+        font: .systemFont(ofSize: 18, weight: .black),
+        containerFrame: .zero,
+        alignment: .center,
+        lineBreakMode: .byClipping
+      )
+      let chip = ModelEntity(mesh: chipMesh, materials: [material])
+      centerEntityVisualOrigin(chip)
+      badge.addChild(chip)
+      fitVisualBounds(of: badge, maxWidth: 0.0066, maxHeight: 0.0066)
+      return badge
     }
 
     private func makeWorkerBriefcaseEntity(for kind: ChessPieceKind, handSide: PieceAccessoryHandSide) -> Entity {
@@ -24056,7 +24340,9 @@ private struct NativeARView: UIViewRepresentable {
 
     private func pieceRoleCarryHand(for kind: ChessPieceKind) -> PieceAccessoryHandSide {
       switch kind {
-      case .pawn, .rook, .bishop:
+      case .pawn:
+        return .right
+      case .rook, .bishop:
         return .left
       case .knight, .queen, .king:
         return .right
@@ -24272,6 +24558,7 @@ private struct NativeARView: UIViewRepresentable {
       arView.scene.addAnchor(worldAnchor)
       boardAnchor = worldAnchor
       boardWorldTransform = transform
+      syncVRChessTitlePresentation(playBirdFlybyOnCreate: true)
       applySceneBackground(for: arView)
       DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
         AmbientMusicController.shared.playLoopIfNeeded()
@@ -24607,6 +24894,334 @@ private struct NativeARView: UIViewRepresentable {
       }
 
       return backdrop
+    }
+
+    @MainActor
+    private func syncVRChessTitlePresentation(playBirdFlybyOnCreate: Bool) {
+      guard isVRChessLabelEnabled else {
+        removeVRChessTitlePresentation()
+        return
+      }
+
+      guard let boardAnchor else {
+        return
+      }
+
+      let createdLabel: Bool
+      if let vrChessLabelEntity {
+        createdLabel = false
+      } else {
+        let label = makeVRChessTitleEntity()
+        boardAnchor.addChild(label)
+        self.vrChessLabelEntity = label
+        createdLabel = true
+      }
+
+      updateVRChessTitlePlacement()
+
+      if createdLabel && playBirdFlybyOnCreate {
+        scheduleVRChessBirdFlyby()
+      }
+    }
+
+    @MainActor
+    private func removeVRChessTitlePresentation() {
+      vrChessBirdLaunchTask?.cancel()
+      vrChessBirdLaunchTask = nil
+      vrChessBirdCleanupTask?.cancel()
+      vrChessBirdCleanupTask = nil
+      vrChessBirdEntity?.removeFromParent()
+      vrChessBirdEntity = nil
+      vrChessLabelEntity?.removeFromParent()
+      vrChessLabelEntity = nil
+    }
+
+    @MainActor
+    private func updateVRChessTitlePlacement() {
+      guard let title = vrChessLabelEntity else {
+        return
+      }
+
+      title.position = vrChessTitlePosition()
+    }
+
+    @MainActor
+    private func scheduleVRChessBirdFlyby() {
+      vrChessBirdLaunchTask?.cancel()
+      vrChessBirdLaunchTask = Task { @MainActor [weak self] in
+        try? await Task.sleep(nanoseconds: Self.vrChessBirdLaunchDelayNanoseconds)
+        guard let self,
+              !Task.isCancelled,
+              self.isVRChessLabelEnabled,
+              self.vrChessLabelEntity != nil else {
+          return
+        }
+        self.playVRChessBirdFlyby()
+        self.vrChessBirdLaunchTask = nil
+      }
+    }
+
+    private func vrChessTitlePosition() -> SIMD3<Float> {
+      let halfBoardExtent = (boardSize * boardScale) * 0.5
+      return SIMD3<Float>(0, halfBoardExtent + 0.18, halfBoardExtent + 0.06)
+    }
+
+    private func vrChessBirdStartPosition() -> SIMD3<Float> {
+      let titlePosition = vrChessTitlePosition()
+      return SIMD3<Float>(-1.18, titlePosition.y + 0.01, titlePosition.z - 0.18)
+    }
+
+    private func vrChessBirdEndPosition() -> SIMD3<Float> {
+      let titlePosition = vrChessTitlePosition()
+      return SIMD3<Float>(1.18, titlePosition.y + 0.03, titlePosition.z - 0.14)
+    }
+
+    @MainActor
+    private func playVRChessBirdFlyby() {
+      guard let boardAnchor, isVRChessLabelEnabled else {
+        return
+      }
+
+      vrChessBirdCleanupTask?.cancel()
+      vrChessBirdCleanupTask = nil
+      vrChessBirdEntity?.removeFromParent()
+
+      let bird = makeVRChessBirdEntity()
+      let startPosition = vrChessBirdStartPosition()
+      let endPosition = vrChessBirdEndPosition()
+      let birdRotation = simd_normalize(
+        simd_quatf(angle: -.pi / 2, axis: SIMD3<Float>(0, 1, 0)) *
+          simd_quatf(angle: -.pi / 18, axis: SIMD3<Float>(0, 0, 1))
+      )
+
+      bird.transform = Transform(
+        scale: SIMD3<Float>(repeating: 1),
+        rotation: birdRotation,
+        translation: startPosition
+      )
+      boardAnchor.addChild(bird)
+      vrChessBirdEntity = bird
+      bird.move(
+        to: Transform(
+          scale: SIMD3<Float>(repeating: 1),
+          rotation: birdRotation,
+          translation: endPosition
+        ),
+        relativeTo: boardAnchor,
+        duration: Self.vrChessBirdFlyDuration,
+        timingFunction: .easeInOut
+      )
+
+      vrChessBirdCleanupTask = Task { @MainActor [weak self, weak bird] in
+        try? await Task.sleep(nanoseconds: UInt64((Self.vrChessBirdFlyDuration + 0.35) * 1_000_000_000))
+        guard let self, !Task.isCancelled else {
+          return
+        }
+        bird?.removeFromParent()
+        if let bird, self.vrChessBirdEntity === bird {
+          self.vrChessBirdEntity = nil
+        }
+        self.vrChessBirdCleanupTask = nil
+      }
+    }
+
+    private func makeVRChessTitleEntity() -> Entity {
+      let titleRoot = Entity()
+      titleRoot.name = "vr_chess_world_title"
+
+      let titleWidth: Float = max((boardSize * boardScale) * 2.25, 0.92)
+      let titleHeight: Float = max((boardSize * boardScale) * 0.38, 0.16)
+      let shadowMaterial = SimpleMaterial(
+        color: UIColor(red: 0.17, green: 0.06, blue: 0.02, alpha: 0.98),
+        roughness: 1.0,
+        isMetallic: false
+      )
+      let emberMaterial = SimpleMaterial(
+        color: UIColor(red: 0.88, green: 0.24, blue: 0.10, alpha: 0.98),
+        roughness: 0.42,
+        isMetallic: false
+      )
+      let heroMaterial = SimpleMaterial(
+        color: UIColor(red: 1.0, green: 0.84, blue: 0.34, alpha: 1.0),
+        roughness: 0.16,
+        isMetallic: false
+      )
+
+      let glowPlate = ModelEntity(
+        mesh: .generateBox(size: SIMD3<Float>(titleWidth * 0.84, titleHeight * 0.26, 0.014)),
+        materials: [
+          SimpleMaterial(
+            color: UIColor(red: 0.22, green: 0.07, blue: 0.02, alpha: 0.70),
+            roughness: 0.94,
+            isMetallic: false
+          )
+        ]
+      )
+      glowPlate.position = SIMD3<Float>(0.010, -0.016, -0.050)
+      titleRoot.addChild(glowPlate)
+
+      let shadowTitle = makeVRChessTitleTextEntity(
+        text: "VR CHESS",
+        maxWidth: titleWidth,
+        maxHeight: titleHeight,
+        material: shadowMaterial
+      )
+      shadowTitle.position = SIMD3<Float>(0.030, -0.020, -0.042)
+      shadowTitle.scale *= SIMD3<Float>(repeating: 1.05)
+      titleRoot.addChild(shadowTitle)
+
+      let emberTitle = makeVRChessTitleTextEntity(
+        text: "VR CHESS",
+        maxWidth: titleWidth,
+        maxHeight: titleHeight,
+        material: emberMaterial
+      )
+      emberTitle.position = SIMD3<Float>(0.012, -0.006, -0.014)
+      titleRoot.addChild(emberTitle)
+
+      let heroTitle = makeVRChessTitleTextEntity(
+        text: "VR CHESS",
+        maxWidth: titleWidth,
+        maxHeight: titleHeight,
+        material: heroMaterial
+      )
+      heroTitle.position = SIMD3<Float>(0, 0, 0.010)
+      titleRoot.addChild(heroTitle)
+
+      titleRoot.orientation = simd_quatf(angle: .pi, axis: SIMD3<Float>(0, 1, 0))
+      return titleRoot
+    }
+
+    private func makeVRChessTitleTextEntity(
+      text: String,
+      maxWidth: Float,
+      maxHeight: Float,
+      material: SimpleMaterial
+    ) -> Entity {
+      let wordmark = Entity()
+      let font = vrChessHeroFont(ofSize: 158)
+      let words = text.split(separator: " ").map(String.init)
+
+      if words.count >= 2 {
+        let leftWord = makeVRChessTitleWordEntity(
+          words[0],
+          font: font,
+          material: material
+        )
+        let rightWord = makeVRChessTitleWordEntity(
+          words.dropFirst().joined(separator: " "),
+          font: font,
+          material: material
+        )
+
+        let leftWidth = leftWord.visualBounds(relativeTo: nil).extents.x
+        let rightWidth = rightWord.visualBounds(relativeTo: nil).extents.x
+        let spacing = max((leftWidth + rightWidth) * 0.05, 4.5)
+
+        leftWord.position.x = -((rightWidth + spacing) * 0.5)
+        rightWord.position.x = (leftWidth + spacing) * 0.5
+
+        wordmark.addChild(leftWord)
+        wordmark.addChild(rightWord)
+      } else {
+        wordmark.addChild(
+          makeVRChessTitleWordEntity(
+            text,
+            font: font,
+            material: material
+          )
+        )
+      }
+
+      centerEntityVisualOrigin(wordmark)
+      fitVisualBounds(of: wordmark, maxWidth: maxWidth, maxHeight: maxHeight)
+      return wordmark
+    }
+
+    private func makeVRChessTitleWordEntity(
+      _ text: String,
+      font: UIFont,
+      material: SimpleMaterial
+    ) -> ModelEntity {
+      let textMesh = MeshResource.generateText(
+        text,
+        extrusionDepth: 0.042,
+        font: font,
+        containerFrame: .zero,
+        alignment: CTTextAlignment.center,
+        lineBreakMode: .byClipping
+      )
+      let textModel = ModelEntity(mesh: textMesh, materials: [material])
+      centerEntityVisualOrigin(textModel)
+      return textModel
+    }
+
+    private func vrChessHeroFont(ofSize size: CGFloat) -> UIFont {
+      let base = UIFont.systemFont(ofSize: size, weight: .black)
+      if let italicDescriptor = base.fontDescriptor.withSymbolicTraits([.traitBold, .traitItalic]) {
+        return UIFont(descriptor: italicDescriptor, size: size)
+      }
+      return base
+    }
+
+    private func makeVRChessBirdEntity() -> Entity {
+      let bird = Entity()
+      bird.name = "vr_chess_flyby_bird"
+      let bodyMaterial = Self.scenicMaterial(UIColor(red: 0.20, green: 0.14, blue: 0.10, alpha: 1.0), roughness: 0.94)
+      let wingMaterial = Self.scenicMaterial(UIColor(red: 0.29, green: 0.20, blue: 0.14, alpha: 1.0), roughness: 0.92)
+      let beakMaterial = Self.scenicMaterial(UIColor(red: 0.92, green: 0.70, blue: 0.26, alpha: 1.0), roughness: 0.84)
+      let bellyMaterial = Self.scenicMaterial(UIColor(red: 0.83, green: 0.74, blue: 0.60, alpha: 0.98), roughness: 0.88)
+
+      let body = ModelEntity(mesh: .generateSphere(radius: 0.5), materials: [bodyMaterial])
+      body.scale = SIMD3<Float>(0.20, 0.090, 0.28)
+      bird.addChild(body)
+
+      let belly = ModelEntity(
+        mesh: .generateSphere(radius: 0.5),
+        materials: [bellyMaterial]
+      )
+      belly.position = SIMD3<Float>(0, -0.008, 0.032)
+      belly.scale = SIMD3<Float>(0.12, 0.050, 0.16)
+      bird.addChild(belly)
+
+      let leftWing = ModelEntity(
+        mesh: .generateBox(size: SIMD3<Float>(0.22, 0.012, 0.080)),
+        materials: [wingMaterial]
+      )
+      leftWing.position = SIMD3<Float>(-0.125, 0.028, 0)
+      leftWing.orientation = simd_normalize(
+        simd_quatf(angle: .pi / 7, axis: SIMD3<Float>(1, 0, 0)) *
+          simd_quatf(angle: -.pi / 9, axis: SIMD3<Float>(0, 0, 1))
+      )
+      bird.addChild(leftWing)
+
+      let rightWing = ModelEntity(
+        mesh: .generateBox(size: SIMD3<Float>(0.22, 0.012, 0.080)),
+        materials: [wingMaterial]
+      )
+      rightWing.position = SIMD3<Float>(0.125, 0.028, 0)
+      rightWing.orientation = simd_normalize(
+        simd_quatf(angle: -.pi / 7, axis: SIMD3<Float>(1, 0, 0)) *
+          simd_quatf(angle: .pi / 9, axis: SIMD3<Float>(0, 0, 1))
+      )
+      bird.addChild(rightWing)
+
+      let tail = ModelEntity(
+        mesh: .generateBox(size: SIMD3<Float>(0.085, 0.022, 0.038)),
+        materials: [wingMaterial]
+      )
+      tail.position = SIMD3<Float>(0, 0.006, -0.145)
+      tail.orientation = simd_quatf(angle: .pi / 10, axis: SIMD3<Float>(1, 0, 0))
+      bird.addChild(tail)
+
+      let beak = ModelEntity(
+        mesh: .generateBox(size: SIMD3<Float>(0.022, 0.014, 0.040)),
+        materials: [beakMaterial]
+      )
+      beak.position = SIMD3<Float>(0, -0.002, 0.162)
+      bird.addChild(beak)
+
+      return bird
     }
 
     private func makeCosmeticVendingMachineEntity() -> Entity {
@@ -25684,6 +26299,7 @@ private struct NativeARView: UIViewRepresentable {
       let sequenceID = fishingSequenceID
       fishingBobberCastCompletedAt = nil
       UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+      startFishingRewardPrefetch(sequenceID: sequenceID)
 
       createFishingRodAnchor(cameraMatrix: frame.camera.transform)
       animateFishingRod(
@@ -25810,8 +26426,34 @@ private struct NativeARView: UIViewRepresentable {
       fishingCatchWindowTask = nil
       fishingRevealTask?.cancel()
       fishingRevealTask = nil
+      fishingRewardPrefetchTask?.cancel()
+      fishingRewardPrefetchTask = nil
       fishingResetTask?.cancel()
       fishingResetTask = nil
+    }
+
+    @MainActor
+    private func startFishingRewardPrefetch(sequenceID _: Int) {
+      fishingRewardPrefetchTask?.cancel()
+      fishingRewardPrefetchTask = Task { [weak self] in
+        guard let self else {
+          return []
+        }
+        return await self.commentary.fishingRewardPages(limit: 5)
+      }
+    }
+
+    @MainActor
+    private func resolvedFishingRewardPages(sequenceID: Int) async -> [FishingRewardPage] {
+      if fishingRewardPrefetchTask == nil {
+        startFishingRewardPrefetch(sequenceID: sequenceID)
+      }
+
+      let pages = await fishingRewardPrefetchTask?.value ?? []
+      if fishingSequenceID == sequenceID {
+        fishingRewardPrefetchTask = nil
+      }
+      return pages
     }
 
     @MainActor
@@ -26298,7 +26940,7 @@ private struct NativeARView: UIViewRepresentable {
         guard let self else {
           return
         }
-        let rewardPages = await self.commentary.fishingRewardPages(limit: 5)
+        let rewardPages = await self.resolvedFishingRewardPages(sequenceID: sequenceID)
         try? await Task.sleep(nanoseconds: 860_000_000)
         guard self.fishingSequenceID == sequenceID,
               self.fishing.state == .caught else {
@@ -26311,6 +26953,7 @@ private struct NativeARView: UIViewRepresentable {
                 title: "No line yet",
                 summary: "Stockfish has not finished a diagram for this catch.",
                 detailText: "Trigger a fresh position analysis and cast again.",
+                interpretationText: "Gemini could not explain a move yet because Stockfish has not finished a usable line for this position.",
                 footerText: nil,
                 boardState: nil,
                 fromSquare: nil,
