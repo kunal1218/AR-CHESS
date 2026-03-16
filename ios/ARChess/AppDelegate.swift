@@ -1,5 +1,6 @@
 import AVFoundation
 import ARKit
+import CoreText
 import CoreMotion
 import CryptoKit
 import Foundation
@@ -14309,20 +14310,6 @@ private struct NativeARExperienceView: View {
           .padding(.horizontal, 18)
           .padding(.top, 24)
 
-          if let employeePosterTitle = pieceRoles.employeePosterTitle,
-             let employeePosterSubtitle = pieceRoles.employeePosterSubtitle {
-            HStack {
-              wantedPosterButton(
-                title: employeePosterTitle,
-                subtitle: employeePosterSubtitle
-              )
-
-              Spacer(minLength: 0)
-            }
-            .padding(.horizontal, 18)
-            .padding(.top, 12)
-          }
-
           Spacer()
         }
       }
@@ -17622,6 +17609,12 @@ private struct NativeARView: UIViewRepresentable {
       case right
     }
 
+    private struct NeutralHoldPose {
+      let averagePosition: SIMD3<Float>
+      let averageForward: SIMD3<Float>
+      let averageDownwardPitch: Float
+    }
+
     private static let boardTemplateSize: Float = 0.40
     private static let boardSquareSize: Float = boardTemplateSize / 8.0
     private static let fishingPondVerticalOffset: Float = -0.068
@@ -17630,7 +17623,7 @@ private struct NativeARView: UIViewRepresentable {
     private static let fishingBiteDelayRangeSeconds: ClosedRange<Double> = 5.0...10.0
     private static let fishingCatchWindowSeconds: TimeInterval = 1.85
     private static let fishingRigBasePosition = SIMD3<Float>(0.0, -0.25, -0.60)
-    private static let fishingRigBasePitch: Float = 0
+    private static let fishingRigBasePitch: Float = -0.18
     private static let fishingRigBaseYaw: Float = 0
     private static let fishingRigBaseRoll: Float = 0
     private static let fishingRigRelativePitchDeltaMin: Float = 0
@@ -17638,6 +17631,14 @@ private struct NativeARView: UIViewRepresentable {
     private static let fishingTerrainPlaneLocalY: Float = -0.041
     private static let fishingRigGroundClearance: Float = 0.012
     private static let fishingRigMinimumCameraUpComponent: Float = 0.22
+    private static let neutralHoldCalibrationDuration: CFTimeInterval = 2.5
+    private static let neutralHoldCalibrationMinimumSamples = 45
+    private static let virtualWorldSpawnBaseForwardDistance: Float = 0.60
+    private static let virtualWorldSpawnMinimumForwardDistance: Float = 0.54
+    private static let virtualWorldSpawnMaximumForwardDistance: Float = 0.66
+    private static let virtualWorldSpawnCenterDownwardBias: Float = 0.025
+    private static let virtualWorldSpawnLateralOffset: Float = 0
+    private static let defaultVirtualBoardScale: Float = 1.0
     private static let boardBaseMesh = MeshResource.generateBox(
       size: SIMD3<Float>(boardTemplateSize + 0.03, 0.012, boardTemplateSize + 0.03)
     )
@@ -17711,7 +17712,9 @@ private struct NativeARView: UIViewRepresentable {
     private var activeThreatEntities: [ModelEntity] = []
     private var threatOverlayDisplayLink: CADisplayLink?
     private var threatOverlayHideWorkItem: DispatchWorkItem?
-    private var trackedPlaneID: UUID?
+    private weak var wantedPosterTreeEntity: Entity?
+    private weak var wantedPosterDisplayEntity: Entity?
+    private var wantedPosterRenderedKey: String?
     private var gameState = ChessGameState.initial() {
       didSet {
         recalculatePieceRoles()
@@ -17728,6 +17731,12 @@ private struct NativeARView: UIViewRepresentable {
     private var hasScheduledInitialAnalysis = false
     private var initialAnalysisTask: Task<Void, Never>?
     private var lastWarmupStatusMessage: String?
+    private var neutralHoldCalibrationStartedAt: CFTimeInterval?
+    private var neutralHoldPositionAccumulator = SIMD3<Float>(repeating: 0)
+    private var neutralHoldForwardAccumulator = SIMD3<Float>(repeating: 0)
+    private var neutralHoldPitchAccumulator: Float = 0
+    private var neutralHoldSampleCount = 0
+    private var calibratedNeutralHoldPose: NeutralHoldPose?
     private var pendingAnimatedMoves: [AnimatedMoveContext] = []
     private var moveAnimationTask: Task<Void, Never>?
     private var narrativeHistory: [NarrativeMove] = []
@@ -17887,8 +17896,8 @@ private struct NativeARView: UIViewRepresentable {
       captureSoundEffects.prewarmIfNeeded()
       noteWarmupStatus(
         mode.warmsStockfishAnalysis
-          ? "Scanning for board placement. Local Stockfish is warming in the background..."
-          : "Waiting for board placement to start the lesson..."
+          ? "Hold your phone naturally for a few seconds. The board will calibrate to your posture while Local Stockfish warms up."
+          : "Hold your phone naturally for a few seconds."
       )
       if case .playVsStockfish(let configuration) = mode {
         commentary.noteExternalStatus(configuration.statusSummary)
@@ -17912,7 +17921,7 @@ private struct NativeARView: UIViewRepresentable {
       }
 
       let configuration = ARWorldTrackingConfiguration()
-      configuration.planeDetection = [.horizontal]
+      configuration.planeDetection = []
       configuration.environmentTexturing = .none
       configuration.sceneReconstruction = []
       arView.environment.sceneUnderstanding.options = []
@@ -18002,20 +18011,6 @@ private struct NativeARView: UIViewRepresentable {
         }
       }
 
-      let coachingOverlay = ARCoachingOverlayView()
-      coachingOverlay.session = arView.session
-      coachingOverlay.goal = .horizontalPlane
-      coachingOverlay.activatesAutomatically = true
-      coachingOverlay.translatesAutoresizingMaskIntoConstraints = false
-      arView.addSubview(coachingOverlay)
-
-      NSLayoutConstraint.activate([
-        coachingOverlay.topAnchor.constraint(equalTo: arView.topAnchor),
-        coachingOverlay.leadingAnchor.constraint(equalTo: arView.leadingAnchor),
-        coachingOverlay.trailingAnchor.constraint(equalTo: arView.trailingAnchor),
-        coachingOverlay.bottomAnchor.constraint(equalTo: arView.bottomAnchor),
-      ])
-
       syncSocraticCoachContext(force: true)
       recalculatePieceRoles()
     }
@@ -18052,23 +18047,12 @@ private struct NativeARView: UIViewRepresentable {
       }
     }
 
-    nonisolated func session(_ session: ARSession, didAdd anchors: [ARAnchor]) {
-      Task { @MainActor [weak self] in
-        self?.updateBoardPlacement(session: session, anchors: anchors)
-      }
-    }
-
-    nonisolated func session(_ session: ARSession, didUpdate anchors: [ARAnchor]) {
-      Task { @MainActor [weak self] in
-        self?.updateBoardPlacement(session: session, anchors: anchors)
-      }
-    }
-
     nonisolated func session(_ session: ARSession, didUpdate frame: ARFrame) {
       Task { @MainActor [weak self] in
         self?.updateTrackingReadiness(frame)
         self?.updateKnightCameraSplatIfNeeded(frame)
         self?.updateFishingInteraction(frame)
+        self?.syncWantedPosterDisplayIfNeeded()
       }
     }
 
@@ -18090,6 +18074,12 @@ private struct NativeARView: UIViewRepresentable {
 
       if let entity = arView.entity(at: location) {
         if handleFishingEntityTap(entity) {
+          return
+        }
+
+        if wantedPosterRoot(for: entity) != nil {
+          UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+          highlightEmployeeOfTheMonth()
           return
         }
 
@@ -18246,18 +18236,103 @@ private struct NativeARView: UIViewRepresentable {
         return nil
       }
 
-      let hitResults = arView.raycast(from: location, allowing: .existingPlaneInfinite, alignment: .horizontal)
-      guard let hit = hitResults.first else {
+      guard let ray = worldRay(through: location, in: arView),
+            let worldPoint = intersectionOfRay(
+              origin: ray.origin,
+              direction: ray.direction,
+              planePoint: simd_make_float3(boardWorldTransform.columns.3),
+              planeNormal: normalized3(simd_make_float3(boardWorldTransform.columns.1), fallback: SIMD3<Float>(0, 1, 0))
+            ) else {
         return nil
       }
 
-      let worldPoint = SIMD3<Float>(
-        hit.worldTransform.columns.3.x,
-        hit.worldTransform.columns.3.y,
-        hit.worldTransform.columns.3.z
-      )
       let localPoint4 = boardWorldTransform.inverse * SIMD4<Float>(worldPoint.x, worldPoint.y, worldPoint.z, 1)
       return SIMD2<Float>(localPoint4.x / boardScale, localPoint4.z / boardScale)
+    }
+
+    private func worldRay(
+      through location: CGPoint,
+      in arView: ARView
+    ) -> (origin: SIMD3<Float>, direction: SIMD3<Float>)? {
+      guard let frame = arView.session.currentFrame else {
+        return nil
+      }
+
+      let viewportSize = arView.bounds.size
+      guard viewportSize.width > 0, viewportSize.height > 0 else {
+        return nil
+      }
+
+      let orientation = interfaceOrientation(for: arView)
+      let projectionMatrix = frame.camera.projectionMatrix(
+        for: orientation,
+        viewportSize: viewportSize,
+        zNear: 0.001,
+        zFar: 100
+      )
+      let viewMatrix = frame.camera.viewMatrix(for: orientation)
+      let inverseViewProjection = simd_inverse(projectionMatrix * viewMatrix)
+      let ndcX = Float((location.x / viewportSize.width) * 2 - 1)
+      let ndcY = Float(((viewportSize.height - location.y) / viewportSize.height) * 2 - 1)
+      let nearClip = SIMD4<Float>(ndcX, ndcY, 0, 1)
+      let farClip = SIMD4<Float>(ndcX, ndcY, 1, 1)
+      let nearWorld4 = inverseViewProjection * nearClip
+      let farWorld4 = inverseViewProjection * farClip
+
+      guard abs(nearWorld4.w) > 0.0001, abs(farWorld4.w) > 0.0001 else {
+        return nil
+      }
+
+      let nearWorld = SIMD3<Float>(
+        nearWorld4.x / nearWorld4.w,
+        nearWorld4.y / nearWorld4.w,
+        nearWorld4.z / nearWorld4.w
+      )
+      let farWorld = SIMD3<Float>(
+        farWorld4.x / farWorld4.w,
+        farWorld4.y / farWorld4.w,
+        farWorld4.z / farWorld4.w
+      )
+      return (
+        origin: nearWorld,
+        direction: normalized3(
+          farWorld - nearWorld,
+          fallback: normalized3(-simd_make_float3(frame.camera.transform.columns.2), fallback: SIMD3<Float>(0, 0, -1))
+        )
+      )
+    }
+
+    private func interfaceOrientation(for arView: ARView) -> UIInterfaceOrientation {
+      let sceneOrientation = arView.window?.windowScene?.interfaceOrientation
+      switch sceneOrientation {
+      case .landscapeLeft?:
+        return .landscapeLeft
+      case .landscapeRight?:
+        return .landscapeRight
+      case .portraitUpsideDown?:
+        return .portraitUpsideDown
+      default:
+        return .portrait
+      }
+    }
+
+    private func intersectionOfRay(
+      origin: SIMD3<Float>,
+      direction: SIMD3<Float>,
+      planePoint: SIMD3<Float>,
+      planeNormal: SIMD3<Float>
+    ) -> SIMD3<Float>? {
+      let denominator = simd_dot(direction, planeNormal)
+      guard abs(denominator) > 0.0001 else {
+        return nil
+      }
+
+      let distance = simd_dot(planePoint - origin, planeNormal) / denominator
+      guard distance >= 0 else {
+        return nil
+      }
+
+      return origin + (direction * distance)
     }
 
     private func boardSquare(forBoardLocalPoint localPoint: SIMD2<Float>) -> BoardSquare? {
@@ -18415,6 +18490,7 @@ private struct NativeARView: UIViewRepresentable {
       pieceRoleSnapshot = gameState.evaluatePieceRolesRelativeToCurrentPlayer()
       wantedPosterHighlightSquare = nil
       pieceRoles.update(snapshot: pieceRoleSnapshot)
+      syncWantedPosterDisplayIfNeeded(force: true)
     }
 
     private func highlightEmployeeOfTheMonth() {
@@ -20780,43 +20856,112 @@ private struct NativeARView: UIViewRepresentable {
       return piecesContainer.children.first(where: { $0.name == pieceName(kingSquare) })
     }
 
-    private func updateBoardPlacement(session: ARSession, anchors: [ARAnchor]) {
-      guard let frame = session.currentFrame else {
+    private func spawnWorldRelativeToCamera() {
+      guard boardAnchor == nil,
+            let arView,
+            let neutralHoldPose = calibratedNeutralHoldPose else {
         return
       }
 
-      guard boardAnchor == nil else {
-        return
-      }
-
-      let planes = anchors.compactMap { $0 as? ARPlaneAnchor }
-      guard let selectedPlane = selectBestPlane(from: planes, frame: frame) else {
-        return
-      }
-
-      boardScale = preferredInitialBoardScale(for: selectedPlane)
-      let transform = boardTransform(for: selectedPlane, frame: frame)
+      boardScale = Self.defaultVirtualBoardScale
+      let transform = virtualWorldTransform(from: neutralHoldPose)
       prepareBoardSceneIfNeeded(force: !hasPreparedBoardScene)
-
-      if let arView {
-        let boardAnchor = AnchorEntity(world: transform)
-        applyBoardScale()
-        boardAnchor.addChild(makeScenicBackdropEntity())
-        boardAnchor.addChild(boardRoot)
-        arView.scene.addAnchor(boardAnchor)
-        self.boardAnchor = boardAnchor
-        boardWorldTransform = transform
-        applySceneBackground(for: arView)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
-          AmbientMusicController.shared.playLoopIfNeeded()
-        }
+      let worldAnchor = AnchorEntity(world: transform)
+      worldAnchor.name = "virtual_world_anchor"
+      applyBoardScale()
+      worldAnchor.addChild(makeScenicBackdropEntity())
+      worldAnchor.addChild(boardRoot)
+      arView.scene.addAnchor(worldAnchor)
+      boardAnchor = worldAnchor
+      boardWorldTransform = transform
+      applySceneBackground(for: arView)
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+        AmbientMusicController.shared.playLoopIfNeeded()
       }
-
-      trackedPlaneID = selectedPlane.identifier
       maybeRequestLessonIntroIfNeeded()
       maybeScheduleInitialAnalysis()
       syncLessonAutoplayIfNeeded()
       syncAutomatedOpponentTurnIfNeeded()
+    }
+
+    private func updateNeutralHoldCalibration(with frame: ARFrame) {
+      guard boardAnchor == nil,
+            calibratedNeutralHoldPose == nil else {
+        return
+      }
+
+      let trackingIsStable: Bool
+      switch frame.camera.trackingState {
+      case .normal:
+        trackingIsStable = true
+      default:
+        trackingIsStable = false
+      }
+
+      guard trackingIsStable else {
+        noteWarmupStatus(
+          mode.warmsStockfishAnalysis
+            ? "Hold your phone naturally for a few seconds while AR tracking settles. Local Stockfish is warming in the background..."
+            : "Hold your phone naturally for a few seconds while AR tracking settles."
+        )
+        return
+      }
+
+      if neutralHoldCalibrationStartedAt == nil {
+        neutralHoldCalibrationStartedAt = frame.timestamp
+        neutralHoldPositionAccumulator = SIMD3<Float>(repeating: 0)
+        neutralHoldForwardAccumulator = SIMD3<Float>(repeating: 0)
+        neutralHoldPitchAccumulator = 0
+        neutralHoldSampleCount = 0
+      }
+
+      let cameraMatrix = frame.camera.transform
+      neutralHoldPositionAccumulator += simd_make_float3(cameraMatrix.columns.3)
+      neutralHoldForwardAccumulator += normalized3(
+        -simd_make_float3(cameraMatrix.columns.2),
+        fallback: SIMD3<Float>(0, 0, -1)
+      )
+      neutralHoldPitchAccumulator += fishingDownwardPitch(for: cameraMatrix)
+      neutralHoldSampleCount += 1
+
+      guard let startedAt = neutralHoldCalibrationStartedAt else {
+        return
+      }
+
+      let elapsed = frame.timestamp - startedAt
+      if elapsed < Self.neutralHoldCalibrationDuration || neutralHoldSampleCount < Self.neutralHoldCalibrationMinimumSamples {
+        noteWarmupStatus(
+          mode.warmsStockfishAnalysis
+            ? "Hold your phone naturally for a few seconds. Calibrating a comfortable board position while Local Stockfish warms up..."
+            : "Hold your phone naturally for a few seconds. Calibrating a comfortable board position..."
+        )
+        return
+      }
+
+      guard let calibratedPose = calibratedNeutralPose() else {
+        return
+      }
+
+      calibratedNeutralHoldPose = calibratedPose
+      neutralHoldCalibrationStartedAt = nil
+      noteWarmupStatus("Neutral hold captured. Placing the board.")
+      spawnWorldRelativeToCamera()
+    }
+
+    private func calibratedNeutralPose() -> NeutralHoldPose? {
+      guard neutralHoldSampleCount > 0 else {
+        return nil
+      }
+
+      let sampleCount = Float(neutralHoldSampleCount)
+      return NeutralHoldPose(
+        averagePosition: neutralHoldPositionAccumulator / sampleCount,
+        averageForward: normalized3(
+          neutralHoldForwardAccumulator / sampleCount,
+          fallback: SIMD3<Float>(0, 0, -1)
+        ),
+        averageDownwardPitch: neutralHoldPitchAccumulator / sampleCount
+      )
     }
 
     private func updateTrackingReadiness(_ frame: ARFrame) {
@@ -20835,15 +20980,12 @@ private struct NativeARView: UIViewRepresentable {
       }
 
       if boardAnchor == nil {
-        noteWarmupStatus(
-          mode.warmsStockfishAnalysis
-            ? "Scanning for board placement. Local Stockfish is warming in the background..."
-            : "Waiting for board placement to start the lesson..."
-        )
+        updateNeutralHoldCalibration(with: frame)
+        return
       } else if stableTrackingFrames < 60 {
         noteWarmupStatus(
           mode.warmsStockfishAnalysis
-            ? "Board placed. Waiting for AR tracking to stabilize..."
+            ? "Virtual board placed. Waiting for AR tracking to stabilize..."
             : "Waiting for AR tracking to stabilize before starting the lesson..."
         )
       } else {
@@ -20895,118 +21037,34 @@ private struct NativeARView: UIViewRepresentable {
       }
     }
 
-    private func selectBestPlane(from planes: [ARPlaneAnchor], frame: ARFrame) -> ARPlaneAnchor? {
-      let candidates = planes.filter { isSuitableTablePlane($0, frame: frame) }
-      guard !candidates.isEmpty else {
-        return nil
-      }
-
-      if let trackedPlaneID,
-         let tracked = candidates.first(where: { $0.identifier == trackedPlaneID }) {
-        return tracked
-      }
-
-      return candidates.max(by: { planeScore($0, frame: frame) < planeScore($1, frame: frame) })
-    }
-
-    private func isSuitableTablePlane(_ plane: ARPlaneAnchor, frame: ARFrame) -> Bool {
-      guard plane.alignment == .horizontal else {
-        return false
-      }
-
-      let minExtent = (boardSize * minimumBoardScale) + (boardInset * 2)
-      guard plane.extent.x >= minExtent, plane.extent.z >= minExtent else {
-        return false
-      }
-
-      let cameraY = frame.camera.transform.columns.3.y
-      let planeY = plane.transform.columns.3.y
-      let verticalDrop = cameraY - planeY
-
-      // Beds and rough cloth-covered tables often classify as unknown or floor
-      // even when they are usable flat placement surfaces.
-      return verticalDrop > 0.05 && verticalDrop < 1.50 && !isCeilingClassification(plane.classification)
-    }
-
-    private func planeScore(_ plane: ARPlaneAnchor, frame: ARFrame) -> Float {
-      let area = plane.extent.x * plane.extent.z
-      let cameraPosition = simd_make_float3(frame.camera.transform.columns.3)
-      let planePosition = simd_make_float3(plane.transform.columns.3)
-      let distance = simd_distance(cameraPosition, planePosition)
-      let classificationBonus: Float = isTableClassification(plane.classification) ? 2.0 : 0.0
-      return classificationBonus + area - (distance * 0.35)
-    }
-
-    private func isTableClassification(_ classification: ARPlaneAnchor.Classification) -> Bool {
-      switch classification {
-      case ARPlaneAnchor.Classification.table:
-        return true
-      default:
-        return false
-      }
-    }
-
-    private func isCeilingClassification(_ classification: ARPlaneAnchor.Classification) -> Bool {
-      switch classification {
-      case ARPlaneAnchor.Classification.ceiling:
-        return true
-      default:
-        return false
-      }
-    }
-
-    private func boardTransform(for plane: ARPlaneAnchor, frame: ARFrame) -> simd_float4x4 {
-      let planeTransform = plane.transform
-      let cameraWorld = simd_make_float3(frame.camera.transform.columns.3)
-      let cameraForward = simd_normalize(-simd_make_float3(frame.camera.transform.columns.2))
-      let inversePlane = planeTransform.inverse
-      let planeHeight = planeTransform.columns.3.y
-      let scaledBoardSize = boardSize * boardScale
-
-      let availableX = max(0, (plane.extent.x * 0.5) - (scaledBoardSize * 0.5) - boardInset)
-      let availableZ = max(0, (plane.extent.z * 0.5) - (scaledBoardSize * 0.5) - boardInset)
-
+    private func virtualWorldTransform(from neutralHoldPose: NeutralHoldPose) -> simd_float4x4 {
+      let cameraPosition = neutralHoldPose.averagePosition
+      let cameraForward = neutralHoldPose.averageForward
       let horizontalForward = normalized(
         SIMD2<Float>(cameraForward.x, cameraForward.z),
         fallback: SIMD2<Float>(0, -1)
       )
-      let cameraHeightAbovePlane = max(0.18, cameraWorld.y - planeHeight)
-      let preferredViewAngleRadians: Float = 30.0 * .pi / 180.0
-      let preferredDistance = cameraHeightAbovePlane / tan(preferredViewAngleRadians)
-      let stableFrontDistance = clamp(preferredDistance + 0.12, min: 0.58, max: 0.82)
-      let targetWorld = SIMD3<Float>(
-        cameraWorld.x + (horizontalForward.x * stableFrontDistance),
-        planeHeight,
-        cameraWorld.z + (horizontalForward.y * stableFrontDistance)
+      let cameraRight = normalized3(
+        SIMD3<Float>(horizontalForward.y, 0, -horizontalForward.x),
+        fallback: SIMD3<Float>(1, 0, 0)
       )
-
-      let targetLocal4 = inversePlane * SIMD4<Float>(targetWorld.x, targetWorld.y, targetWorld.z, 1)
-      let localPosition = SIMD3<Float>(
-        clamp(targetLocal4.x, min: -availableX, max: availableX),
-        0.012,
-        clamp(targetLocal4.z, min: -availableZ, max: availableZ)
+      let forwardDistance = clamp(
+        Self.virtualWorldSpawnBaseForwardDistance - (neutralHoldPose.averageDownwardPitch * 0.12),
+        min: Self.virtualWorldSpawnMinimumForwardDistance,
+        max: Self.virtualWorldSpawnMaximumForwardDistance
       )
-
-      let worldPosition4 = planeTransform * SIMD4<Float>(localPosition.x, localPosition.y, localPosition.z, 1)
-      let worldPosition = SIMD3<Float>(worldPosition4.x, worldPosition4.y, worldPosition4.z)
-
+      let worldPosition = cameraPosition
+        + (cameraForward * forwardDistance)
+        + SIMD3<Float>(0, -Self.virtualWorldSpawnCenterDownwardBias, 0)
+        + cameraRight * Self.virtualWorldSpawnLateralOffset
       let lookVector = normalized(
-        SIMD2<Float>(cameraWorld.x - worldPosition.x, cameraWorld.z - worldPosition.z),
+        SIMD2<Float>(cameraPosition.x - worldPosition.x, cameraPosition.z - worldPosition.z),
         fallback: SIMD2<Float>(-horizontalForward.x, -horizontalForward.y)
       )
       let yaw = atan2(lookVector.x, lookVector.y) + .pi
-      var result = simd_float4x4(simd_quatf(angle: yaw, axis: SIMD3<Float>(0, 1, 0)))
-      result.columns.3 = SIMD4<Float>(worldPosition.x, worldPosition.y, worldPosition.z, 1)
-      return result
-    }
-
-    private func preferredInitialBoardScale(for plane: ARPlaneAnchor) -> Float {
-      let usableWidth = max(0, plane.extent.x - (boardInset * 2))
-      let usableDepth = max(0, plane.extent.z - (boardInset * 2))
-      let widthScale = usableWidth / boardSize
-      let depthScale = usableDepth / boardSize
-      let fitScale = min(widthScale, depthScale, 1.0)
-      return clamp(fitScale, min: minimumBoardScale, max: 1.0)
+      var transform = simd_float4x4(simd_quatf(angle: yaw, axis: SIMD3<Float>(0, 1, 0)))
+      transform.columns.3 = SIMD4<Float>(worldPosition.x, worldPosition.y, worldPosition.z, 1)
+      return transform
     }
 
     private func normalized(_ value: SIMD2<Float>, fallback: SIMD2<Float>) -> SIMD2<Float> {
@@ -21080,6 +21138,9 @@ private struct NativeARView: UIViewRepresentable {
       pond.position = fishingPondOffset()
       backdrop.addChild(pond)
 
+      let wantedPosterTree = makeWantedPosterTreeEntity()
+      backdrop.addChild(wantedPosterTree)
+
       for index in 0..<12 {
         let angle = (Float(index) * 30.0) + (index.isMultiple(of: 2) ? 8.0 : -10.0)
         let radius: Float = index.isMultiple(of: 2) ? 3.15 : 3.45
@@ -21141,6 +21202,372 @@ private struct NativeARView: UIViewRepresentable {
       }
 
       return backdrop
+    }
+
+    private func makeWantedPosterTreeEntity() -> Entity {
+      let treeRoot = Entity()
+      treeRoot.name = "wanted_poster_tree"
+      treeRoot.position = wantedPosterTreeOffset()
+
+      let trunkColor = UIColor(red: 0.27, green: 0.18, blue: 0.10, alpha: 1)
+      let boardHalfExtent = (boardSize * boardScale) * 0.5
+      let playerFacingTarget = SIMD2<Float>(0, -(boardHalfExtent + 0.38))
+      let posterDirection = normalized(
+        playerFacingTarget - SIMD2<Float>(treeRoot.position.x, treeRoot.position.z),
+        fallback: SIMD2<Float>(-0.34, -0.94)
+      )
+      let posterYaw = atan2(posterDirection.x, posterDirection.y)
+      let posterFacing = SIMD3<Float>(posterDirection.x, 0, posterDirection.y)
+
+      let trunkHeight: Float = 1.30
+      let trunkWidth: Float = 0.19
+      let trunkDepth: Float = 0.17
+      let trunk = ModelEntity(
+        mesh: .generateBox(size: SIMD3<Float>(trunkWidth, trunkHeight, trunkDepth)),
+        materials: [Self.scenicMaterial(trunkColor, roughness: 1.0)]
+      )
+      trunk.position = SIMD3<Float>(0, trunkHeight * 0.5, 0)
+      treeRoot.addChild(trunk)
+
+      let baseFlare = ModelEntity(
+        mesh: .generateSphere(radius: 0.5),
+        materials: [Self.scenicMaterial(trunkColor.withAlphaComponent(0.98), roughness: 1.0)]
+      )
+      baseFlare.scale = SIMD3<Float>(0.34, 0.16, 0.30)
+      baseFlare.position = SIMD3<Float>(0, 0.10, 0)
+      treeRoot.addChild(baseFlare)
+
+      let supportRootOffsets: [SIMD3<Float>] = [
+        SIMD3<Float>(0.08, 0.13, 0.04),
+        SIMD3<Float>(-0.09, 0.12, 0.03),
+        SIMD3<Float>(0.03, 0.11, -0.08),
+      ]
+      for offset in supportRootOffsets {
+        let root = ModelEntity(
+          mesh: .generateBox(size: SIMD3<Float>(0.06, 0.16, 0.05)),
+          materials: [Self.scenicMaterial(trunkColor.withAlphaComponent(0.97), roughness: 1.0)]
+        )
+        root.position = offset
+        root.orientation = simd_quatf(angle: .pi / 10, axis: SIMD3<Float>(0, 0, 1))
+        treeRoot.addChild(root)
+      }
+
+      let lowerCanopy = ModelEntity(
+        mesh: .generateSphere(radius: 0.5),
+        materials: [Self.scenicMaterial(UIColor(red: 0.15, green: 0.34, blue: 0.16, alpha: 1), roughness: 0.97)]
+      )
+      lowerCanopy.scale = SIMD3<Float>(0.50, 0.34, 0.48)
+      lowerCanopy.position = SIMD3<Float>(-0.02, 1.28, 0.00)
+      treeRoot.addChild(lowerCanopy)
+
+      let middleCanopy = ModelEntity(
+        mesh: .generateSphere(radius: 0.5),
+        materials: [Self.scenicMaterial(UIColor(red: 0.21, green: 0.43, blue: 0.20, alpha: 1), roughness: 0.96)]
+      )
+      middleCanopy.scale = SIMD3<Float>(0.42, 0.30, 0.40)
+      middleCanopy.position = SIMD3<Float>(0.12, 1.44, -0.04)
+      treeRoot.addChild(middleCanopy)
+
+      let upperCanopy = ModelEntity(
+        mesh: .generateSphere(radius: 0.5),
+        materials: [Self.scenicMaterial(UIColor(red: 0.26, green: 0.48, blue: 0.23, alpha: 1), roughness: 0.95)]
+      )
+      upperCanopy.scale = SIMD3<Float>(0.34, 0.26, 0.32)
+      upperCanopy.position = SIMD3<Float>(-0.08, 1.58, 0.05)
+      treeRoot.addChild(upperCanopy)
+
+      let mountingBeam = ModelEntity(
+        mesh: .generateBox(size: SIMD3<Float>(0.034, 0.34, 0.034)),
+        materials: [Self.scenicMaterial(trunkColor.withAlphaComponent(0.98), roughness: 1.0)]
+      )
+      mountingBeam.position = (posterFacing * 0.065) + SIMD3<Float>(0, 0.64, 0)
+      mountingBeam.orientation = simd_quatf(angle: posterYaw, axis: SIMD3<Float>(0, 1, 0))
+      treeRoot.addChild(mountingBeam)
+
+      let posterRoot = Entity()
+      posterRoot.name = "wanted_poster_3d"
+      posterRoot.position = (posterFacing * 0.122) + SIMD3<Float>(0, 0.70, 0)
+      posterRoot.orientation = simd_normalize(
+        simd_quatf(angle: posterYaw, axis: SIMD3<Float>(0, 1, 0)) *
+          simd_quatf(angle: -.pi / 24, axis: SIMD3<Float>(1, 0, 0)) *
+          simd_quatf(angle: .pi / 80, axis: SIMD3<Float>(0, 0, 1))
+      )
+      treeRoot.addChild(posterRoot)
+
+      wantedPosterTreeEntity = treeRoot
+      wantedPosterDisplayEntity = posterRoot
+      wantedPosterRenderedKey = nil
+      syncWantedPosterDisplayIfNeeded(force: true)
+      return treeRoot
+    }
+
+    private func syncWantedPosterDisplayIfNeeded(force: Bool = false) {
+      guard let posterRoot = wantedPosterDisplayEntity else {
+        return
+      }
+
+      let nextKey = wantedPosterDisplayKey()
+      guard force || wantedPosterRenderedKey != nextKey else {
+        return
+      }
+
+      wantedPosterRenderedKey = nextKey
+      Array(posterRoot.children).forEach { $0.removeFromParent() }
+
+      guard let wantedAssignment = pieceRoleSnapshot.employeeOfTheMonth else {
+        return
+      }
+
+      posterRoot.addChild(makeWantedPosterEntity(for: wantedAssignment))
+    }
+
+    private func wantedPosterDisplayKey() -> String? {
+      guard let wantedAssignment = pieceRoleSnapshot.employeeOfTheMonth else {
+        return nil
+      }
+
+      return [
+        wantedAssignment.pieceId,
+        String(wantedAssignment.employeeThreatScoreHalfPoints),
+        wantedPosterCrimeLabel(),
+        wantedPosterJustificationText(for: wantedAssignment),
+        String(wantedPosterBountyDollars(for: wantedAssignment)),
+      ].joined(separator: "|")
+    }
+
+    private func makeWantedPosterEntity(for assignment: PieceRoleAssignment) -> Entity {
+      let poster = Entity()
+
+      let parchmentMaterial = Self.scenicMaterial(UIColor(red: 0.90, green: 0.82, blue: 0.65, alpha: 1), roughness: 0.98)
+      let edgeMaterial = Self.scenicMaterial(UIColor(red: 0.55, green: 0.40, blue: 0.22, alpha: 1), roughness: 1.0)
+      let inkMaterial = SimpleMaterial(color: UIColor(red: 0.20, green: 0.09, blue: 0.05, alpha: 1), roughness: 0.86, isMetallic: false)
+      let board = ModelEntity(
+        mesh: .generateBox(size: SIMD3<Float>(0.34, 0.56, 0.012)),
+        materials: [parchmentMaterial]
+      )
+      board.generateCollisionShapes(recursive: false)
+      poster.addChild(board)
+
+      let topEdge = ModelEntity(mesh: .generateBox(size: SIMD3<Float>(0.35, 0.010, 0.013)), materials: [edgeMaterial])
+      topEdge.position = SIMD3<Float>(0, 0.276, -0.001)
+      poster.addChild(topEdge)
+
+      let bottomEdge = ModelEntity(mesh: .generateBox(size: SIMD3<Float>(0.35, 0.010, 0.013)), materials: [edgeMaterial])
+      bottomEdge.position = SIMD3<Float>(0, -0.276, -0.001)
+      poster.addChild(bottomEdge)
+
+      for nailOffset in [
+        SIMD3<Float>(-0.14, 0.23, 0.007),
+        SIMD3<Float>(0.14, 0.23, 0.007),
+        SIMD3<Float>(-0.14, -0.23, 0.007),
+        SIMD3<Float>(0.14, -0.23, 0.007),
+      ] {
+        let nail = ModelEntity(
+          mesh: .generateSphere(radius: 0.008),
+          materials: [SimpleMaterial(color: UIColor(red: 0.40, green: 0.28, blue: 0.16, alpha: 1), roughness: 0.30, isMetallic: true)]
+        )
+        nail.position = nailOffset
+        nail.scale = SIMD3<Float>(1.0, 0.34, 1.0)
+        poster.addChild(nail)
+      }
+
+      let wantedHeader = makeWantedPosterTextEntity(
+        text: "WANTED",
+        font: .systemFont(ofSize: 168, weight: .black),
+        maxWidth: 0.26,
+        maxHeight: 0.070,
+        material: inkMaterial
+      )
+      wantedHeader.position = SIMD3<Float>(0, 0.212, 0.010)
+      poster.addChild(wantedHeader)
+
+      let aliveText = makeWantedPosterTextEntity(
+        text: "DEAD OR ALIVE",
+        font: .systemFont(ofSize: 84, weight: .heavy),
+        maxWidth: 0.22,
+        maxHeight: 0.034,
+        material: inkMaterial
+      )
+      aliveText.position = SIMD3<Float>(0, 0.166, 0.010)
+      poster.addChild(aliveText)
+
+      let targetName = makeWantedPosterTextEntity(
+        text: assignment.piece.kind.displayName.uppercased(),
+        font: .systemFont(ofSize: 92, weight: .black),
+        maxWidth: 0.22,
+        maxHeight: 0.034,
+        material: inkMaterial
+      )
+      targetName.position = SIMD3<Float>(0, 0.126, 0.010)
+      poster.addChild(targetName)
+
+      let portraitFrame = Entity()
+      portraitFrame.position = SIMD3<Float>(0, 0.018, 0.010)
+      poster.addChild(portraitFrame)
+
+      let portraitBacking = ModelEntity(
+        mesh: .generateBox(size: SIMD3<Float>(0.18, 0.19, 0.010)),
+        materials: [Self.scenicMaterial(UIColor(red: 0.82, green: 0.76, blue: 0.64, alpha: 1), roughness: 0.92)]
+      )
+      portraitFrame.addChild(portraitBacking)
+
+      let portraitBorder = ModelEntity(
+        mesh: .generateBox(size: SIMD3<Float>(0.196, 0.206, 0.006)),
+        materials: [edgeMaterial]
+      )
+      portraitBorder.position = SIMD3<Float>(0, 0, -0.004)
+      portraitFrame.addChild(portraitBorder)
+
+      let mugshot = piecePrototype(for: assignment.piece.kind, color: assignment.piece.color).clone(recursive: true)
+      mugshot.position = SIMD3<Float>(0, -0.060, 0.010)
+      mugshot.scale = SIMD3<Float>(repeating: 1.70)
+      mugshot.orientation = simd_normalize(
+        simd_quatf(angle: .pi, axis: SIMD3<Float>(0, 1, 0)) *
+          simd_quatf(angle: -.pi / 18, axis: SIMD3<Float>(1, 0, 0))
+      )
+      portraitFrame.addChild(mugshot)
+
+      let crimeLabel = makeWantedPosterTextEntity(
+        text: "CRIME",
+        font: .systemFont(ofSize: 58, weight: .black),
+        maxWidth: 0.12,
+        maxHeight: 0.020,
+        material: inkMaterial
+      )
+      crimeLabel.position = SIMD3<Float>(-0.10, -0.122, 0.010)
+      poster.addChild(crimeLabel)
+
+      let crimeValue = makeWantedPosterTextEntity(
+        text: wantedPosterCrimeLabel(),
+        font: .systemFont(ofSize: 58, weight: .black),
+        maxWidth: 0.18,
+        maxHeight: 0.026,
+        material: inkMaterial
+      )
+      crimeValue.position = SIMD3<Float>(0.02, -0.152, 0.010)
+      poster.addChild(crimeValue)
+
+      let justificationLabel = makeWantedPosterTextEntity(
+        text: "JUSTIFICATION",
+        font: .systemFont(ofSize: 46, weight: .black),
+        maxWidth: 0.18,
+        maxHeight: 0.018,
+        material: inkMaterial
+      )
+      justificationLabel.position = SIMD3<Float>(0, -0.194, 0.010)
+      poster.addChild(justificationLabel)
+
+      let justificationValue = makeWantedPosterTextEntity(
+        text: wantedPosterJustificationText(for: assignment),
+        font: .monospacedSystemFont(ofSize: 44, weight: .bold),
+        maxWidth: 0.24,
+        maxHeight: 0.024,
+        material: inkMaterial
+      )
+      justificationValue.position = SIMD3<Float>(0, -0.228, 0.010)
+      poster.addChild(justificationValue)
+
+      let bountyValue = makeWantedPosterTextEntity(
+        text: "$\(formattedDollarAmount(wantedPosterBountyDollars(for: assignment)))",
+        font: .monospacedSystemFont(ofSize: 86, weight: .heavy),
+        maxWidth: 0.24,
+        maxHeight: 0.040,
+        material: inkMaterial
+      )
+      bountyValue.position = SIMD3<Float>(0, -0.286, 0.010)
+      poster.addChild(bountyValue)
+
+      let rewardText = makeWantedPosterTextEntity(
+        text: "REWARD",
+        font: .systemFont(ofSize: 88, weight: .black),
+        maxWidth: 0.22,
+        maxHeight: 0.036,
+        material: inkMaterial
+      )
+      rewardText.position = SIMD3<Float>(0, -0.334, 0.010)
+      poster.addChild(rewardText)
+
+      return poster
+    }
+
+    private func makeWantedPosterTextEntity(
+      text: String,
+      font: UIFont,
+      maxWidth: Float,
+      maxHeight: Float,
+      material: SimpleMaterial
+    ) -> ModelEntity {
+      let textMesh = MeshResource.generateText(
+        text,
+        extrusionDepth: 0.0022,
+        font: font,
+        containerFrame: .zero,
+        alignment: CTTextAlignment.center,
+        lineBreakMode: .byClipping
+      )
+      let textEntity = ModelEntity(mesh: textMesh, materials: [material])
+      centerEntityVisualOrigin(textEntity)
+      fitVisualBounds(of: textEntity, maxWidth: maxWidth, maxHeight: maxHeight)
+      return textEntity
+    }
+
+    private func centerEntityVisualOrigin(_ entity: Entity) {
+      let bounds = entity.visualBounds(relativeTo: nil)
+      entity.position -= bounds.center
+    }
+
+    private func fitVisualBounds(of entity: Entity, maxWidth: Float, maxHeight: Float) {
+      let bounds = entity.visualBounds(relativeTo: nil)
+      let width = max(bounds.extents.x, 0.0001)
+      let height = max(bounds.extents.y, 0.0001)
+      let scale = min(maxWidth / width, maxHeight / height)
+      entity.scale = SIMD3<Float>(repeating: scale)
+    }
+
+    private func wantedPosterCrimeLabel() -> String {
+      let assessment = commentary.latestAssessment.uppercased()
+      if let colonIndex = assessment.firstIndex(of: ":") {
+        let label = String(assessment[..<colonIndex]).trimmingCharacters(in: .whitespacesAndNewlines)
+        if !label.isEmpty,
+           !label.contains("STOCKFISH"),
+           !label.contains("BOARD READY"),
+           !label.contains("WAITING") {
+          return label
+        }
+      }
+
+      return "EVALUATION DAMAGE"
+    }
+
+    private func wantedPosterJustificationText(for assignment: PieceRoleAssignment) -> String {
+      if let evaluationSwingCp = wantedPosterEvaluationSwingCp() {
+        return String(format: "%.1f EVALUATION LOSS", abs(Double(evaluationSwingCp)) / 100.0)
+      }
+
+      return String(format: "%.1f THREAT SCORE", Double(assignment.employeeThreatScoreHalfPoints) / 2.0)
+    }
+
+    private func wantedPosterEvaluationSwingCp() -> Int? {
+      let assessment = commentary.latestAssessment
+      guard let swingRange = assessment.range(of: #"[+-]?\d+(?= cp swing)"#, options: .regularExpression) else {
+        return nil
+      }
+      return Int(assessment[swingRange])
+    }
+
+    private func wantedPosterBountyDollars(for assignment: PieceRoleAssignment) -> Int {
+      if let evaluationSwingCp = wantedPosterEvaluationSwingCp() {
+        return max(1800, 1500 + (abs(evaluationSwingCp) * 13))
+      }
+
+      return 1800
+        + (assignment.employeeThreatScoreHalfPoints * 320)
+        + (assignment.attackedFriendlyPieceCount * 380)
+        + (assignment.attacksKingZone ? 700 : 0)
+    }
+
+    private func formattedDollarAmount(_ dollars: Int) -> String {
+      NumberFormatter.localizedString(from: NSNumber(value: dollars), number: .decimal)
     }
 
     private func makeMountainEntity(
@@ -21294,6 +21721,13 @@ private struct NativeARView: UIViewRepresentable {
       let halfBoardWidth = (boardSize * boardScale) * 0.5
       let lateralDistance = max(halfBoardWidth + 0.70, 0.92)
       return SIMD3<Float>(-lateralDistance, Self.fishingPondVerticalOffset, 0.04)
+    }
+
+    private func wantedPosterTreeOffset() -> SIMD3<Float> {
+      let halfBoardExtent = (boardSize * boardScale) * 0.5
+      let leftDistance = max(halfBoardExtent + 0.22, 0.42)
+      let behindDistance = max(halfBoardExtent + 0.34, 0.54)
+      return SIMD3<Float>(leftDistance, Self.fishingPondVerticalOffset, behindDistance)
     }
 
     @MainActor
@@ -22232,7 +22666,7 @@ private struct NativeARView: UIViewRepresentable {
         cameraMatrix: cameraMatrix,
         translation: Self.fishingRigBasePosition + SIMD3<Float>(0.00, 0.02, 0.03),
         scale: 1.0,
-        pitchAngle: -.pi / 64,
+        pitchAngle: -0.10,
         yawAngle: 0,
         rollAngle: -.pi / 96
       )
@@ -22247,7 +22681,7 @@ private struct NativeARView: UIViewRepresentable {
         cameraMatrix: cameraMatrix,
         translation: Self.fishingRigBasePosition + SIMD3<Float>(0.00, 0.005, 0.00),
         scale: 1.0,
-        pitchAngle: 0,
+        pitchAngle: Self.fishingRigBasePitch,
         yawAngle: 0,
         rollAngle: -.pi / 120
       )
@@ -22262,7 +22696,7 @@ private struct NativeARView: UIViewRepresentable {
         cameraMatrix: cameraMatrix,
         translation: Self.fishingRigBasePosition + SIMD3<Float>(0.00, 0.03, 0.03),
         scale: 1.0,
-        pitchAngle: -.pi / 72,
+        pitchAngle: -0.06,
         yawAngle: 0,
         rollAngle: .pi / 96
       )
@@ -22277,7 +22711,7 @@ private struct NativeARView: UIViewRepresentable {
         cameraMatrix: cameraMatrix,
         translation: Self.fishingRigBasePosition + SIMD3<Float>(0.00, 0.07, 0.07),
         scale: 1.0,
-        pitchAngle: -.pi / 18,
+        pitchAngle: 0,
         yawAngle: 0,
         rollAngle: -.pi / 84
       )
@@ -22313,7 +22747,7 @@ private struct NativeARView: UIViewRepresentable {
       rollAngle: Float
     ) -> Transform {
       let relativePitchDelta = fishingRigRelativePitchDeltaFromBaseline(cameraMatrix: cameraMatrix)
-      let finalPitch = pitchAngle - relativePitchDelta
+      let finalPitch = pitchAngle + relativePitchDelta
       let pitch = simd_quatf(angle: finalPitch, axis: SIMD3<Float>(1, 0, 0))
       let yaw = simd_quatf(angle: yawAngle, axis: SIMD3<Float>(0, 1, 0))
       let roll = simd_quatf(angle: rollAngle, axis: SIMD3<Float>(0, 0, 1))
@@ -22711,6 +23145,19 @@ private struct NativeARView: UIViewRepresentable {
 
       while let candidate = current {
         if candidate.name == "fishing_reward_fish" {
+          return candidate
+        }
+        current = candidate.parent
+      }
+
+      return nil
+    }
+
+    private func wantedPosterRoot(for entity: Entity) -> Entity? {
+      var current: Entity? = entity
+
+      while let candidate = current {
+        if candidate.name == "wanted_poster_3d" {
           return candidate
         }
         current = candidate.parent
