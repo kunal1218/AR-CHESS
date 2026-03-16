@@ -3024,7 +3024,7 @@ private final class PiperAutomaticSpeaker: NSObject, AVAudioPlayerDelegate {
 
     do {
       let (preparedLine, player) = try await makePreparedAudioPlayer(
-        for: request,
+        request: request,
         allowsCacheRepair: true
       )
       guard !Task.isCancelled else {
@@ -8339,20 +8339,18 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     for state: ChessGameState,
     selection: EngineReplySelection
   ) async -> ChessMove? {
-    do {
-      let analysis = try await analyzer.analyze(
-        fen: state.fenString,
-        options: .realtime(
-          movetimeMs: Self.preferredMovetimeMs,
-          hardTimeoutMs: Self.preferredHardTimeoutMs,
-          multiPV: StockfishAnalysisDefaults.multiPV
-        )
-      )
-      let preferredMove = preferredEngineCandidateMove(from: analysis, selection: selection)
-      return preferredMove.flatMap { state.move(forUCI: $0) }
-    } catch {
+    let analysis: StockfishAnalysis?
+    if let cached = cachedAnalysisForState(state) {
+      analysis = cached
+    } else {
+      analysis = await analysisForCurrentTurn(state: state)
+    }
+    guard let analysis else {
       return nil
     }
+
+    let preferredMove = preferredEngineCandidateMove(from: analysis, selection: selection)
+    return preferredMove.flatMap { state.move(forUCI: $0) }
   }
 
   func setStockfishDebugVisible(_ isVisible: Bool) {
