@@ -925,10 +925,30 @@ def test_build_passive_narrator_line_query_includes_story_context() -> None:
     assert "story-like commentary" in query
     assert "same level of chess understanding as a strong coach" in query
     assert "Every line must contain at least one concrete chess idea" in query
+    assert "Never sound like a fortune cookie, prophecy, or riddle." in query
     assert "Never address the player as you or your." in query
     assert "Turns since last narrator line: 3" in query
     assert "Moving piece: black pawn" in query
     assert "Capture: yes" in query
+    assert "Recent narrator lines to avoid repeating:" in query
+
+
+def test_build_passive_narrator_line_query_opening_requires_clear_scene_setting() -> None:
+    from main import GeminiPassiveNarratorRequest, build_passive_narrator_line_query
+
+    payload = GeminiPassiveNarratorRequest(
+        fen="rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+        phase="opening",
+        turns_since_last_narrator_line=0,
+        recent_lines=["The board is whispering already."],
+    )
+
+    query = build_passive_narrator_line_query(payload)
+
+    assert "painting a clear verbal picture of the fight" in query
+    assert "Mention at least one concrete opening feature" in query
+    assert "Do not be cryptic." in query
+    assert "fortune cookie, prophecy, or riddle" in query
     assert "Recent narrator lines to avoid repeating:" in query
 
 
@@ -1013,6 +1033,22 @@ def test_is_passive_narrator_line_too_vague_rejects_generic_or_instructive_lines
     assert is_passive_narrator_line_too_vague("White must consolidate the center now.", payload) is True
     assert is_passive_narrator_line_too_vague(
         "That capture leaves the center thinner and the defenders less coordinated.",
+        payload,
+    ) is False
+
+
+def test_is_passive_narrator_line_too_vague_rejects_cryptic_opening_lines() -> None:
+    from main import GeminiPassiveNarratorRequest, is_passive_narrator_line_too_vague
+
+    payload = GeminiPassiveNarratorRequest(
+        fen="rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+        phase="opening",
+        turns_since_last_narrator_line=0,
+    )
+
+    assert is_passive_narrator_line_too_vague("The board is holding its breath.", payload) is True
+    assert is_passive_narrator_line_too_vague(
+        "Both sides are still developing, and the fight for the center is about to shape the whole game.",
         payload,
     ) is False
 
@@ -1676,7 +1712,7 @@ def test_create_gemini_passive_commentary_line_falls_back_when_model_uses_coordi
 
     assert response.status_code == 200
     assert response.json() == {
-        "line": "The board is set, and both plans are still hiding their teeth."
+        "line": "Both sides are still building, and the first fight for the center will decide who gets the easier game."
     }
 
 

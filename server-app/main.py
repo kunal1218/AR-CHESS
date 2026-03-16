@@ -933,14 +933,16 @@ Return plain text only.
 """.strip()
 GEMINI_PASSIVE_NARRATOR_SYSTEM_PROMPT = """
 You write passive automatic chess commentary for an in-game narrator.
-The voice is warm, observant, cinematic, calm, intelligent, and lightly amused.
-Sound like a polished documentary or sports-story narrator, but never imitate or mention any real person.
+The voice is warm, observant, calm, intelligent, and easy to understand.
+Sound like a polished documentary or sports-story narrator describing a real contest, but never imitate or mention any real person.
 You are not the coach and you are not a chess piece. You are the outside storyteller watching the match.
 Keep every line concise, vivid, and pleasant to listen to.
 Return plain text only.
 Use 1 to 2 short sentences.
 Avoid move notation, square names, engine jargon, and coordinate callouts.
-Comment on tension, pressure, looming threats, strategic turns, positional squeezes, momentum shifts, or the opening mood of the game.
+Paint a verbal picture of the fight using concrete chess reality: tension in the center, development races, king safety, open lines, pressure, trades, weak squares, pawn structure, or momentum shifts.
+Never write fortune-cookie lines, ominous prophecies, vague riddles, or empty mood-setting.
+If you mention tension or danger, explain what on the board is creating it.
 """.strip()
 GEMINI_HINT_MOVE_PATTERN = re.compile(r"\b[a-h][1-8][a-h][1-8][qrbn]?\b|\b[a-h][1-8]\b", re.IGNORECASE)
 GEMINI_COACH_BASE_SYSTEM_PROMPT = """
@@ -1355,9 +1357,6 @@ def is_passive_narrator_line_too_vague(text: str, payload: GeminiPassiveNarrator
     if PASSIVE_NARRATOR_INSTRUCTION_PATTERN.search(normalized):
         return True
 
-    if payload.phase == "opening":
-        return False
-
     # Keep narrator lines grounded in a real chess feature rather than generic mood-setting.
     return not bool(PASSIVE_NARRATOR_CHESS_ANCHOR_PATTERN.search(normalized))
 
@@ -1758,10 +1757,12 @@ def build_passive_narrator_line_query(payload: GeminiPassiveNarratorRequest) -> 
     if payload.phase == "opening":
         return (
             "Write one opening-of-match narrator line for an automatic chess broadcast. "
-            "Set the stakes for the coming duel in 1 or 2 concise sentences. "
-            "Use the Current FEN and Recent Sequence with strong chess understanding, but keep the line introductory. "
-            "Frame the coming fight through something concrete like the center, development, king safety, or a strategic clash. "
-            "Be calm, anticipatory, cinematic, and fun to listen to. "
+            "Set the stage by painting a clear verbal picture of the fight that is starting on the board right now. "
+            "Use 1 or 2 concise sentences. "
+            "Use the Current FEN and Recent Sequence with strong chess understanding, but keep the line introductory and easy to understand. "
+            "Mention at least one concrete opening feature such as the center, development, king safety, pawn structure, space, open lines, or which side is grabbing the initiative. "
+            "Sound like a sharp live commentator describing visible tension, not a poet, fortune cookie, prophecy, or riddle. "
+            "Do not be cryptic. Do not talk about fate, silence, secrets, storms, or something 'about to happen' unless you also name the actual chess reason. "
             "Do not speak as a coach. Do not speak as a chess piece. "
             "Never address the player as you or your. Never give advice or commands. "
             "Do not mention squares, coordinates, SAN, or engine terms. "
@@ -1815,8 +1816,9 @@ def build_passive_narrator_line_query(payload: GeminiPassiveNarratorRequest) -> 
         "but speak only as an outside narrator. "
         "First identify the real chess point of the move or position change: center control, king safety, development, "
         "piece activity, coordination, pawn structure, open lines, weak squares, tactical threats, or simplification. "
-        "Then turn that point into a picturesque observation. "
+        "Then turn that point into a clean broadcast observation that paints the fight clearly. "
         "Every line must contain at least one concrete chess idea, not just mood or vague tension. "
+        "Never sound like a fortune cookie, prophecy, or riddle. "
         f"{narrator_dialogue_instruction} "
         "Keep it concise and polished. Use 1 or 2 short sentences. "
         "Never address the player as you or your. Never give advice, commands, or imperatives. "
@@ -1856,7 +1858,8 @@ def build_passive_narrator_line_retry_query(payload: GeminiPassiveNarratorReques
         + "\n\n"
         + "Your previous answer repeated recent wording, drifted into coaching, or stayed too vague. "
         + "Return one fresh alternative right now with noticeably different phrasing. "
-        + "Keep it cinematic, concise, natural to speak aloud, and grounded in one real chess reason from the position. "
+        + "Keep it concise, natural to speak aloud, and grounded in one real chess reason from the position. "
+        + "Make it clearer and more concrete than before. Do not be cryptic, poetic, or portentous. "
         + "Do not address the player. Do not give instructions. "
         + "Do not reuse the same opening words or core phrase. "
         + "Do not return labels, quotes, or explanations. "
@@ -1866,7 +1869,7 @@ def build_passive_narrator_line_retry_query(payload: GeminiPassiveNarratorReques
 
 def gemini_fallback_passive_narrator_line(payload: GeminiPassiveNarratorRequest) -> str:
     if payload.phase == "opening":
-        return "The center is still untouched, but both kings already have a future to answer for."
+        return "Both sides are still building, and the first fight for the center will decide who gets the easier game."
 
     if payload.is_checkmate:
         return "The king has run out of shelter and out of squares."
