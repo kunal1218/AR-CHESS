@@ -159,11 +159,13 @@ ACTIVE_TICKET_STATUSES = ("queued", "matched")
 PIECE_VOICE_MIN_WORDS = 3
 PIECE_VOICE_MIN_CHARACTERS = 10
 PIECE_VOICE_MAX_WORDS = 14
+PIECE_BEHAVIOR_ROLES = frozenset({"worker", "lazy", "traitor"})
 PIECE_DIALOGUE_INTENTS = (
     "threaten",
     "mock",
     "boast",
     "warn",
+    "complain",
     "panic",
     "celebrate",
     "command",
@@ -178,6 +180,69 @@ PIECE_LINE_STYLES = (
     "taunting",
     "grim",
     "battlefield_command",
+)
+PIECE_SENTENCE_FORMS = ("statement", "complaint", "boast", "observation", "warning", "excuse")
+PIECE_TONE_AXES = ("smug", "calm", "irritated", "grim", "playful", "resigned")
+PIECE_IMAGERY_LEVELS = ("literal", "light_metaphor", "dramatic_metaphor")
+PIECE_RHYTHMS = ("clipped", "flowing", "muttered", "formal")
+PIECE_VERBOSITIES = ("very_short", "short", "medium")
+PIECE_VOICE_SEMANTIC_STOPWORDS = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "are",
+        "as",
+        "at",
+        "be",
+        "but",
+        "by",
+        "do",
+        "for",
+        "from",
+        "good",
+        "i",
+        "im",
+        "i'm",
+        "if",
+        "in",
+        "into",
+        "is",
+        "it",
+        "its",
+        "just",
+        "keep",
+        "let",
+        "lets",
+        "me",
+        "might",
+        "my",
+        "now",
+        "of",
+        "on",
+        "or",
+        "our",
+        "out",
+        "say",
+        "seem",
+        "seems",
+        "so",
+        "still",
+        "that",
+        "the",
+        "their",
+        "them",
+        "there",
+        "this",
+        "to",
+        "up",
+        "us",
+        "was",
+        "we",
+        "with",
+        "you",
+        "your",
+    }
 )
 PIECE_DIRECT_ADDRESS_LEADIN_PATTERN = re.compile(
     r"^(?:ok(?:ay)?|listen|bold words|easy there|quiet|steady|careful|hey|look|look here)\s+"
@@ -213,6 +278,33 @@ PASSIVE_NARRATOR_SCENE_ACTION_PATTERN = re.compile(
     r"cannon|noose|walls?)\b",
     re.IGNORECASE,
 )
+PIECE_VOICE_BOARD_GROUNDING_PATTERN = re.compile(
+    r"\b(?:king|queen|rook|bishop|knight|pawn|line|lines|file|files|diagonal|diagonals|"
+    r"center|space|pressure|initiative|tempo|battle|fight|war|march|advance|retreat|"
+    r"shield|cover|wall|walls|room|roads?|lane|lanes|road|trench|mud|tower|cannon|"
+    r"fork|pin|pinned|trap|trapped|hanging|loose|safe|unsafe|exposed|open|closed|"
+    r"cornered|breath|breathe|storm|thunder|square|squares|front|back rank|guard|"
+    r"watch|watched|watching|push|pushing|hold|holding|build|building|carry|carrying|"
+    r"waiting|bench|storage|dust|reserve|problem|mistake|blunder|pressure)\b",
+    re.IGNORECASE,
+)
+PIECE_VOICE_ROLE_CUE_PATTERNS: dict[str, re.Pattern[str]] = {
+    "worker": re.compile(
+        r"\b(?:pressure|push|pushing|hold|holding|line|roads?|file|build|building|carry|carrying|"
+        r"march|advance|advance|coming|spine|duty|work|working|keep it coming)\b",
+        re.IGNORECASE,
+    ),
+    "lazy": re.compile(
+        r"\b(?:waiting|wait|idle|ignored|unused|storage|bench|reserve|dust|caged|boxed|"
+        r"watching|stuck|rotting|quiet)\b",
+        re.IGNORECASE,
+    ),
+    "traitor": re.compile(
+        r"\b(?:problem|unsafe|mistake|pretend|awkward|exposed|loose|hanging|trapped|panic|"
+        r"blame|misjudged|wandered|denial|cornered|bad idea)\b",
+        re.IGNORECASE,
+    ),
+}
 
 app = FastAPI(title="AR Chess Server", version="0.3.0")
 PIPER_TTS_SERVICE = PiperTTSService()
@@ -224,6 +316,11 @@ class PieceDialoguePromptControls:
     line_style: str
     focus_target: str
     emotional_flavor: str
+    sentence_form: str
+    tone_axis: str
+    imagery_level: str
+    rhythm: str
+    verbosity: str
     avoid_direct_address: bool
     conversation_loop_detected: bool
 
@@ -231,8 +328,10 @@ class PieceDialoguePromptControls:
 @dataclass(frozen=True)
 class PieceVoiceGlobalMemoryEntry:
     fingerprint: str
+    piece_type: str
     opening_prefix: str
     coarse_pattern: str
+    semantic_signature: str
 
 
 @dataclass(frozen=True)
@@ -240,6 +339,9 @@ class PieceVoiceGlobalMemorySnapshot:
     line_counts: Counter[str]
     prefix_counts: Counter[str]
     pattern_counts: Counter[str]
+    semantic_counts: Counter[str]
+    piece_type_pattern_counts: Counter[str]
+    piece_type_semantic_counts: Counter[str]
 
 
 @dataclass(frozen=True)
@@ -556,6 +658,8 @@ class GeminiPieceVoiceRequest(BaseModel):
     fen: str = Field(..., min_length=1, max_length=256)
     piece_type: str = Field(..., min_length=1, max_length=16)
     piece_color: str = Field(..., min_length=1, max_length=16)
+    behavior_role: str | None = Field(default=None, min_length=1, max_length=16)
+    behavior_role_reason: str | None = Field(default=None, min_length=1, max_length=180)
     recent_lines: list[str] = Field(default_factory=list, max_length=6)
     dialogue_mode: str = Field(default="independent", min_length=1, max_length=32)
     piece_dialogue_history: list[GeminiDialogueUtterance] = Field(default_factory=list, max_length=4)
@@ -607,6 +711,16 @@ class GeminiPieceVoiceRequest(BaseModel):
         normalized = value.strip().lower()
         if normalized not in {"white", "black"}:
             raise ValueError("piece_color must be 'white' or 'black'.")
+        return normalized
+
+    @field_validator("behavior_role")
+    @classmethod
+    def validate_behavior_role(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip().lower()
+        if normalized not in PIECE_BEHAVIOR_ROLES:
+            raise ValueError("behavior_role must be worker, lazy, or traitor.")
         return normalized
 
     @field_validator("recent_lines")
@@ -662,6 +776,14 @@ class GeminiPieceVoiceRequest(BaseModel):
     @field_validator("underutilized_reason")
     @classmethod
     def validate_underutilized_reason(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = re.sub(r"\s+", " ", value).strip()
+        return normalized or None
+
+    @field_validator("behavior_role_reason")
+    @classmethod
+    def validate_behavior_role_reason(cls, value: str | None) -> str | None:
         if value is None:
             return None
         normalized = re.sub(r"\s+", " ", value).strip()
@@ -1103,6 +1225,9 @@ _piece_voice_global_memory_entries: deque[PieceVoiceGlobalMemoryEntry] = deque()
 _piece_voice_global_line_counts: Counter[str] = Counter()
 _piece_voice_global_prefix_counts: Counter[str] = Counter()
 _piece_voice_global_pattern_counts: Counter[str] = Counter()
+_piece_voice_global_semantic_counts: Counter[str] = Counter()
+_piece_voice_global_piece_type_pattern_counts: Counter[str] = Counter()
+_piece_voice_global_piece_type_semantic_counts: Counter[str] = Counter()
 
 
 def truncate_narration_text(text: str, *, max_sentences: int, max_characters: int) -> str:
@@ -1271,6 +1396,39 @@ def piece_voice_repetition_key(text: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9\s]", " ", text.lower())).strip()
 
 
+def piece_voice_semantic_tokens(text: str) -> tuple[str, ...]:
+    raw_tokens = re.findall(r"[A-Za-z0-9']+", text.lower())
+    normalized_tokens: list[str] = []
+    for raw_token in raw_tokens:
+        token = raw_token.strip("'")
+        if not token or token in PIECE_VOICE_SEMANTIC_STOPWORDS:
+            continue
+        if len(token) > 5 and token.endswith("ing"):
+            token = token[:-3]
+        elif len(token) > 4 and token.endswith("ed"):
+            token = token[:-2]
+        elif len(token) > 4 and token.endswith("es"):
+            token = token[:-2]
+        elif len(token) > 3 and token.endswith("s"):
+            token = token[:-1]
+        if len(token) < 3 or token in PIECE_VOICE_SEMANTIC_STOPWORDS:
+            continue
+        normalized_tokens.append(token)
+    return tuple(sorted(set(normalized_tokens)))
+
+
+def piece_voice_semantic_signature(text: str) -> str:
+    return " ".join(piece_voice_semantic_tokens(text))
+
+
+def piece_voice_semantic_overlap_ratio(left_text: str, right_text: str) -> float:
+    left_tokens = set(piece_voice_semantic_tokens(left_text))
+    right_tokens = set(piece_voice_semantic_tokens(right_text))
+    if not left_tokens or not right_tokens:
+        return 0.0
+    return len(left_tokens & right_tokens) / max(len(left_tokens), len(right_tokens))
+
+
 def piece_voice_opening_prefix(text: str, words: int = 3) -> str:
     word_list = re.findall(r"[A-Za-z0-9']+", text.lower())
     if not word_list:
@@ -1278,17 +1436,60 @@ def piece_voice_opening_prefix(text: str, words: int = 3) -> str:
     return " ".join(word_list[: min(words, len(word_list))])
 
 
+def piece_voice_sentence_form(text: str) -> str:
+    normalized = re.sub(r"\s+", " ", text).strip().lower()
+    if not normalized:
+        return "unknown"
+    if normalized.endswith("?"):
+        return "question"
+    if re.match(r"^(?:careful|watch|look|steady|enough)\b", normalized):
+        return "warning"
+    if re.search(r"\b(?:let'?s pretend|i seem|i may have|that might be|suppose)\b", normalized):
+        return "excuse"
+    if re.search(r"\b(?:finally|at last|good|yes|mine|ours|keep it coming)\b", normalized):
+        return "boast"
+    if re.search(r"\b(?:waiting|bench|ignored|storage|dust|reserve|caged|boxed)\b", normalized):
+        return "complaint"
+    if re.search(r"\b(?:i see|i watch|i can see|i hear|i notice)\b", normalized):
+        return "observation"
+    return "statement"
+
+
 def piece_voice_coarse_pattern(text: str) -> str:
     word_count = len(re.findall(r"[A-Za-z0-9']+", text))
     punctuation = text.strip()[-1:] or "."
     direct_address = "direct" if is_piece_direct_address_line(text) else "plain"
+    sentence_form = piece_voice_sentence_form(text)
     if word_count <= 4:
         length_bucket = "short"
     elif word_count <= 8:
         length_bucket = "medium"
     else:
         length_bucket = "long"
-    return f"{direct_address}:{length_bucket}:{punctuation}"
+    return f"{direct_address}:{sentence_form}:{length_bucket}:{punctuation}"
+
+
+def is_piece_voice_line_board_grounded(text: str, payload: GeminiPieceVoiceRequest) -> bool:
+    normalized = re.sub(r"\s+", " ", text).strip()
+    if not normalized:
+        return False
+
+    if PIECE_VOICE_BOARD_GROUNDING_PATTERN.search(normalized):
+        return True
+
+    behavior_role = effective_piece_behavior_role(payload)
+    role_pattern = PIECE_VOICE_ROLE_CUE_PATTERNS.get(behavior_role)
+    if role_pattern and role_pattern.search(normalized):
+        return True
+
+    if payload.is_capture and re.search(r"\b(?:cut|kill|falls?|break|take|taken)\b", normalized, re.IGNORECASE):
+        return True
+    if payload.is_check and re.search(r"\b(?:king|check|corner|shelter|cover)\b", normalized, re.IGNORECASE):
+        return True
+    if payload.is_retreat and re.search(r"\b(?:back|retreat|withdraw|step)\b", normalized, re.IGNORECASE):
+        return True
+
+    return False
 
 
 def reset_piece_voice_global_memory() -> None:
@@ -1297,6 +1498,9 @@ def reset_piece_voice_global_memory() -> None:
         _piece_voice_global_line_counts.clear()
         _piece_voice_global_prefix_counts.clear()
         _piece_voice_global_pattern_counts.clear()
+        _piece_voice_global_semantic_counts.clear()
+        _piece_voice_global_piece_type_pattern_counts.clear()
+        _piece_voice_global_piece_type_semantic_counts.clear()
 
 
 def piece_voice_global_memory_snapshot() -> PieceVoiceGlobalMemorySnapshot:
@@ -1305,18 +1509,30 @@ def piece_voice_global_memory_snapshot() -> PieceVoiceGlobalMemorySnapshot:
             line_counts=Counter(_piece_voice_global_line_counts),
             prefix_counts=Counter(_piece_voice_global_prefix_counts),
             pattern_counts=Counter(_piece_voice_global_pattern_counts),
+            semantic_counts=Counter(_piece_voice_global_semantic_counts),
+            piece_type_pattern_counts=Counter(_piece_voice_global_piece_type_pattern_counts),
+            piece_type_semantic_counts=Counter(_piece_voice_global_piece_type_semantic_counts),
         )
 
 
-def record_piece_voice_global_usage(text: str) -> None:
+def record_piece_voice_global_usage(text: str, piece_type: str | None = None) -> None:
     fingerprint = piece_voice_repetition_key(text)
     if not fingerprint:
         return
+    normalized_piece_type = (piece_type or "").strip().lower()
+    semantic_signature = piece_voice_semantic_signature(text)
+    piece_type_pattern_key = ""
+    piece_type_semantic_key = ""
+    if normalized_piece_type:
+        piece_type_pattern_key = f"{normalized_piece_type}:{piece_voice_coarse_pattern(text)}"
+        piece_type_semantic_key = f"{normalized_piece_type}:{semantic_signature}"
 
     entry = PieceVoiceGlobalMemoryEntry(
         fingerprint=fingerprint,
+        piece_type=normalized_piece_type,
         opening_prefix=piece_voice_opening_prefix(text),
         coarse_pattern=piece_voice_coarse_pattern(text),
+        semantic_signature=semantic_signature,
     )
     with _piece_voice_global_memory_lock:
         if len(_piece_voice_global_memory_entries) >= PIECE_VOICE_GLOBAL_MEMORY_LIMIT:
@@ -1331,12 +1547,32 @@ def record_piece_voice_global_usage(text: str) -> None:
             _piece_voice_global_pattern_counts[oldest.coarse_pattern] -= 1
             if _piece_voice_global_pattern_counts[oldest.coarse_pattern] <= 0:
                 _piece_voice_global_pattern_counts.pop(oldest.coarse_pattern, None)
+            if oldest.semantic_signature:
+                _piece_voice_global_semantic_counts[oldest.semantic_signature] -= 1
+                if _piece_voice_global_semantic_counts[oldest.semantic_signature] <= 0:
+                    _piece_voice_global_semantic_counts.pop(oldest.semantic_signature, None)
+            if oldest.piece_type:
+                oldest_piece_type_pattern_key = f"{oldest.piece_type}:{oldest.coarse_pattern}"
+                _piece_voice_global_piece_type_pattern_counts[oldest_piece_type_pattern_key] -= 1
+                if _piece_voice_global_piece_type_pattern_counts[oldest_piece_type_pattern_key] <= 0:
+                    _piece_voice_global_piece_type_pattern_counts.pop(oldest_piece_type_pattern_key, None)
+                if oldest.semantic_signature:
+                    oldest_piece_type_semantic_key = f"{oldest.piece_type}:{oldest.semantic_signature}"
+                    _piece_voice_global_piece_type_semantic_counts[oldest_piece_type_semantic_key] -= 1
+                    if _piece_voice_global_piece_type_semantic_counts[oldest_piece_type_semantic_key] <= 0:
+                        _piece_voice_global_piece_type_semantic_counts.pop(oldest_piece_type_semantic_key, None)
 
         _piece_voice_global_memory_entries.append(entry)
         _piece_voice_global_line_counts[entry.fingerprint] += 1
         if entry.opening_prefix:
             _piece_voice_global_prefix_counts[entry.opening_prefix] += 1
         _piece_voice_global_pattern_counts[entry.coarse_pattern] += 1
+        if entry.semantic_signature:
+            _piece_voice_global_semantic_counts[entry.semantic_signature] += 1
+        if piece_type_pattern_key:
+            _piece_voice_global_piece_type_pattern_counts[piece_type_pattern_key] += 1
+        if piece_type_semantic_key:
+            _piece_voice_global_piece_type_semantic_counts[piece_type_semantic_key] += 1
 
 
 def is_piece_voice_line_repetitive(text: str, recent_lines: list[str]) -> bool:
@@ -1349,7 +1585,19 @@ def is_piece_voice_line_repetitive(text: str, recent_lines: list[str]) -> bool:
         for line in recent_lines
         if piece_voice_repetition_key(line)
     }
-    return candidate_key in recent_keys
+    if candidate_key in recent_keys:
+        return True
+
+    candidate_signature = piece_voice_semantic_signature(text)
+    if candidate_signature:
+        recent_signatures = {
+            piece_voice_semantic_signature(line)
+            for line in recent_lines
+            if piece_voice_semantic_signature(line)
+        }
+        if candidate_signature in recent_signatures:
+            return True
+    return any(piece_voice_semantic_overlap_ratio(text, line) >= 0.8 for line in recent_lines)
 
 
 def is_passive_narrator_line_repetitive(text: str, recent_lines: list[str]) -> bool:
@@ -1403,6 +1651,145 @@ def sample_piece_emotional_flavor() -> str:
     return random.choice(PIECE_DIALOGUE_EMOTIONAL_FLAVORS)
 
 
+def effective_piece_behavior_role(payload: GeminiPieceVoiceRequest) -> str:
+    if payload.behavior_role in PIECE_BEHAVIOR_ROLES:
+        return payload.behavior_role
+    if payload.dialogue_mode == "underutilized_snark":
+        return "lazy"
+    if payload.underutilized_reason:
+        return "lazy"
+    if payload.is_hanging or payload.is_pinned:
+        return "traitor"
+    if payload.is_attacked_by_multiple and not payload.is_well_defended:
+        return "traitor"
+    if payload.eval_delta is not None and payload.eval_delta <= -90:
+        return "traitor"
+    return "worker"
+
+
+def piece_behavior_role_reason(payload: GeminiPieceVoiceRequest, behavior_role: str) -> str:
+    if payload.behavior_role_reason:
+        return payload.behavior_role_reason
+
+    if behavior_role == "lazy":
+        if payload.underutilized_reason:
+            return payload.underutilized_reason
+        if payload.piece_move_count == 0:
+            return "still waiting to be used"
+        return "not influencing enough of the real fight"
+
+    if behavior_role == "traitor":
+        if payload.is_hanging:
+            return "hanging and easy to punish"
+        if payload.is_pinned:
+            return "pinned and warping its own side's position"
+        if payload.is_attacked_by_multiple and not payload.is_well_defended:
+            return "sitting on a square that is turning dangerous fast"
+        if payload.eval_delta is not None and payload.eval_delta < 0:
+            return "helping the position slip instead of helping it stabilize"
+        return "misplaced and making life harder for its own side"
+
+    if payload.is_check:
+        return "driving direct pressure at the enemy king"
+    if payload.is_capture:
+        return "doing visible damage and keeping the pressure on"
+    if payload.is_fork_threat:
+        return "creating multiple threats at once"
+    if payload.is_aggressive_advance:
+        return "pushing the fight forward"
+    return "pulling weight in the battle"
+
+
+def infer_piece_board_intent(payload: GeminiPieceVoiceRequest, behavior_role: str) -> str:
+    if behavior_role == "lazy":
+        return "underuse, inactivity, blocked paths, and waiting to matter"
+    if behavior_role == "traitor":
+        return "danger, self-inflicted trouble, exposure, or awkward defense"
+    if payload.is_check:
+        return "direct king pressure"
+    if payload.is_capture:
+        return "material damage and momentum"
+    if payload.is_fork_threat:
+        return "multiple threats at once"
+    if payload.is_retreat:
+        return "regrouping under pressure"
+    if payload.is_aggressive_advance:
+        return "space, initiative, and forward pressure"
+    return "pressure, coordination, or positional tension"
+
+
+def sample_piece_dialogue_intent_for_role(behavior_role: str) -> str:
+    options = {
+        "worker": ("boast", "celebrate", "command", "warn"),
+        "lazy": ("mock", "dismiss", "warn", "complain"),
+        "traitor": ("panic", "warn", "mock", "dismiss"),
+    }
+    return random.choice(options.get(behavior_role, PIECE_DIALOGUE_INTENTS))
+
+
+def sample_piece_focus_target_for_role(behavior_role: str) -> str:
+    options = {
+        "worker": ("battle", "enemy", "king", "self"),
+        "lazy": ("self", "battle", "survival"),
+        "traitor": ("self", "survival", "battle"),
+    }
+    return random.choice(options.get(behavior_role, PIECE_DIALOGUE_FOCUS_TARGETS))
+
+
+def sample_piece_emotional_flavor_for_role(behavior_role: str) -> str:
+    options = {
+        "worker": ("confident", "smug", "solemn"),
+        "lazy": ("irritated", "smug", "resigned"),
+        "traitor": ("desperate", "grim", "unstable"),
+    }
+    return random.choice(options.get(behavior_role, PIECE_DIALOGUE_EMOTIONAL_FLAVORS))
+
+
+def sample_piece_sentence_form_for_role(behavior_role: str) -> str:
+    options = {
+        "worker": ("statement", "boast", "warning", "observation"),
+        "lazy": ("complaint", "observation", "statement"),
+        "traitor": ("excuse", "warning", "complaint", "observation"),
+    }
+    return random.choice(options.get(behavior_role, PIECE_SENTENCE_FORMS))
+
+
+def sample_piece_tone_axis_for_role(behavior_role: str) -> str:
+    options = {
+        "worker": ("smug", "calm", "grim", "playful"),
+        "lazy": ("irritated", "resigned", "smug", "playful"),
+        "traitor": ("grim", "irritated", "resigned"),
+    }
+    return random.choice(options.get(behavior_role, PIECE_TONE_AXES))
+
+
+def sample_piece_imagery_level_for_role(behavior_role: str) -> str:
+    options = {
+        "worker": ("literal", "light_metaphor", "dramatic_metaphor"),
+        "lazy": ("literal", "light_metaphor"),
+        "traitor": ("literal", "light_metaphor", "dramatic_metaphor"),
+    }
+    return random.choice(options.get(behavior_role, PIECE_IMAGERY_LEVELS))
+
+
+def sample_piece_rhythm_for_role(behavior_role: str) -> str:
+    options = {
+        "worker": ("clipped", "formal", "flowing"),
+        "lazy": ("muttered", "clipped", "flowing"),
+        "traitor": ("clipped", "muttered", "formal"),
+    }
+    return random.choice(options.get(behavior_role, PIECE_RHYTHMS))
+
+
+def sample_piece_verbosity_for_role(behavior_role: str) -> str:
+    options = {
+        "worker": ("very_short", "short", "medium"),
+        "lazy": ("short", "medium"),
+        "traitor": ("very_short", "short"),
+    }
+    return random.choice(options.get(behavior_role, PIECE_VERBOSITIES))
+
+
 def is_piece_direct_address_line(text: str) -> bool:
     normalized = re.sub(r"\s+", " ", text).strip()
     if not normalized:
@@ -1448,6 +1835,7 @@ def has_piece_conversation_loop(history: list[GeminiDialogueUtterance]) -> bool:
 
 def build_piece_dialogue_prompt_controls(payload: GeminiPieceVoiceRequest) -> PieceDialoguePromptControls:
     recent_piece_history = payload.piece_dialogue_history[-4:]
+    behavior_role = effective_piece_behavior_role(payload)
 
     # If recent piece chatter is repeatedly direct-addressing another piece, push the next line
     # away from "Ok pawn..." loops.
@@ -1463,10 +1851,15 @@ def build_piece_dialogue_prompt_controls(payload: GeminiPieceVoiceRequest) -> Pi
     )
 
     return PieceDialoguePromptControls(
-        dialogue_intent=sample_piece_dialogue_intent(),
+        dialogue_intent=sample_piece_dialogue_intent_for_role(behavior_role),
         line_style=sample_piece_line_style(),
-        focus_target=sample_piece_focus_target(),
-        emotional_flavor=sample_piece_emotional_flavor(),
+        focus_target=sample_piece_focus_target_for_role(behavior_role),
+        emotional_flavor=sample_piece_emotional_flavor_for_role(behavior_role),
+        sentence_form=sample_piece_sentence_form_for_role(behavior_role),
+        tone_axis=sample_piece_tone_axis_for_role(behavior_role),
+        imagery_level=sample_piece_imagery_level_for_role(behavior_role),
+        rhythm=sample_piece_rhythm_for_role(behavior_role),
+        verbosity=sample_piece_verbosity_for_role(behavior_role),
         avoid_direct_address=avoid_direct_address,
         conversation_loop_detected=conversation_loop_detected,
     )
@@ -1489,6 +1882,11 @@ def choose_piece_voice_candidate(
         for text in recent_texts
         if piece_voice_repetition_key(text)
     }
+    recent_semantic_signatures = {
+        piece_voice_semantic_signature(text)
+        for text in recent_texts
+        if piece_voice_semantic_signature(text)
+    }
     recent_prefix_counts = Counter(
         piece_voice_opening_prefix(text)
         for text in recent_texts
@@ -1508,11 +1906,17 @@ def choose_piece_voice_candidate(
 
         prefix = piece_voice_opening_prefix(line)
         pattern = piece_voice_coarse_pattern(line) if line else ""
+        semantic_signature = piece_voice_semantic_signature(line) if line else ""
+        piece_type_pattern_key = f"{payload.piece_type}:{pattern}" if pattern else ""
+        piece_type_semantic_key = f"{payload.piece_type}:{semantic_signature}" if semantic_signature else ""
+        semantic_overlap = max((piece_voice_semantic_overlap_ratio(line, text) for text in recent_texts), default=0.0)
         score = 0.0
         if not line:
             score -= 10_000
         if line and not is_complete_piece_voice_line_text(line):
             score -= 400
+        if line and not is_piece_voice_line_board_grounded(line, payload):
+            score -= 280
         if fingerprint in recent_fingerprints:
             score -= 1_000
         if prefix:
@@ -1522,6 +1926,18 @@ def choose_piece_voice_candidate(
             score -= 180 * memory.line_counts.get(fingerprint, 0)
         if pattern:
             score -= 18 * memory.pattern_counts.get(pattern, 0)
+        if piece_type_pattern_key:
+            score -= 30 * memory.piece_type_pattern_counts.get(piece_type_pattern_key, 0)
+        if semantic_signature:
+            if semantic_signature in recent_semantic_signatures:
+                score -= 420
+            score -= 90 * memory.semantic_counts.get(semantic_signature, 0)
+        if piece_type_semantic_key:
+            score -= 130 * memory.piece_type_semantic_counts.get(piece_type_semantic_key, 0)
+        if semantic_overlap >= 0.8:
+            score -= 520
+        elif semantic_overlap >= 0.6:
+            score -= 240
         if line and not is_first_person_piece_voice_line(line):
             score -= 320
         if is_piece_direct_address_line(line):
@@ -1591,6 +2007,9 @@ def build_piece_voice_line_query(
     prompt_controls: PieceDialoguePromptControls | None = None,
 ) -> str:
     controls = prompt_controls or build_piece_dialogue_prompt_controls(payload)
+    behavior_role = effective_piece_behavior_role(payload)
+    role_reason = piece_behavior_role_reason(payload, behavior_role)
+    board_intent = infer_piece_board_intent(payload, behavior_role)
     eval_before = "unknown" if payload.eval_before is None else str(payload.eval_before)
     eval_after = "unknown" if payload.eval_after is None else str(payload.eval_after)
     eval_delta = "unknown" if payload.eval_delta is None else str(payload.eval_delta)
@@ -1634,6 +2053,26 @@ def build_piece_voice_line_query(
             "Be snarky, character-accurate, concise, and lightly informative without sounding like a coach."
         )
         direct_address_instruction = "Do not directly address another piece by name or type. "
+    role_instruction = {
+        "worker": (
+            "The piece is currently classified as a WORKER. "
+            "That role is the main emotional frame. "
+            "Sound like a piece that is contributing, pushing, holding the line, doing real work, or building momentum. "
+            "Let pride, effort, teamwork, pressure, or determination drive the line."
+        ),
+        "lazy": (
+            "The piece is currently classified as LAZY. "
+            "That role is the main emotional frame. "
+            "Sound underused, bored, mildly sarcastic, restless, or stuck waiting to matter. "
+            "Let passivity, irritation, or dry observation drive the line."
+        ),
+        "traitor": (
+            "The piece is currently classified as a TRAITOR. "
+            "That role is the main emotional frame. "
+            "Sound exposed, defensive, embarrassed, panicked, or darkly self-aware about being a problem. "
+            "Let liability, denial, awkwardness, or self-preservation drive the line."
+        ),
+    }[behavior_role]
     piece_dialogue_history_text = ""
     latest_piece_line_text = ""
     if dialogue_mode == "history_reactive" and payload.piece_dialogue_history:
@@ -1692,16 +2131,22 @@ def build_piece_voice_line_query(
         "Coherence, clarity, and strong wording matter more than extreme character flavor. "
         "If a line sounds awkward, vague, forced, or unintentionally goofy, choose the cleaner and more sensible version. "
         "Pieces can hear other pieces. Pieces cannot hear or perceive the narrator. "
+        "Core priority order: board relevance first, role tone second, piece personality third, variation diversity fourth. "
+        "Board-aware intent comes first. The behavior role is the primary emotional framing. The piece personality colors the delivery. "
         "Your line must reflect: "
-        "the piece's personality, the current tactical / positional context, whether the position is winning, equal, or losing, "
-        "whether the piece is in danger, whether the piece is threatening the enemy king, "
-        "and whether the move was strong, desperate, defensive, aggressive, or poor. "
+        "the current tactical / positional context, the piece's behavior role, the piece's personality, whether the position is winning, equal, or losing, "
+        "whether the piece is in danger, whether the piece is threatening the enemy king, and whether the move was strong, desperate, defensive, aggressive, or poor. "
         f"{context_instruction} "
+        f"{role_instruction} "
         f"{dialogue_instruction} "
         f"{direct_address_instruction}"
+        "Build the line in this order: determine board intent, determine role tone, color it with piece personality, then add variation. "
+        "Use the board situation to anchor the line in something real: pressure, underuse, danger, opportunity, sacrifice, open lines, king safety, trapped pieces, or positional squeeze. "
         "Keep the line short, vivid, punchy, and freshly phrased. Preferred length: 4 to 12 words. Maximum: 14 words. "
         "Return exactly one complete sentence, not a fragment. End the sentence with a period, exclamation point, or question mark. "
         "Do not return a single word, single letter, grunt, or filler fragment. "
+        "Do not let the role disappear beneath the piece stereotype. "
+        "If the cleanest line is less flashy, prefer clean and board-grounded over clever but confusing. "
         "Prefer novel wording over signature catchphrases. "
         "Output only the line itself.\n\n"
         "Piece personality rules:\n"
@@ -1731,6 +2176,9 @@ def build_piece_voice_line_query(
         f"Focused piece personality: {piece_voice_personality_instructions(payload.piece_type)}\n"
         f"Dialogue mode: {dialogue_mode}\n"
         f"Context mode: {context_mode}\n"
+        f"Behavior role: {behavior_role}\n"
+        f"Behavior role reason: {role_reason}\n"
+        f"Board intent: {board_intent}\n"
         f"Selected piece: {payload.piece_color} {payload.piece_type}\n"
         f"{move_line}\n"
         f"Capture: {capture_text}\n"
@@ -1756,6 +2204,11 @@ def build_piece_voice_line_query(
         f"Line style: {controls.line_style}\n"
         f"Focus target: {controls.focus_target}\n"
         f"Emotional flavor: {controls.emotional_flavor}\n"
+        f"Sentence form: {controls.sentence_form}\n"
+        f"Tone axis: {controls.tone_axis}\n"
+        f"Imagery level: {controls.imagery_level}\n"
+        f"Rhythm: {controls.rhythm}\n"
+        f"Verbosity: {controls.verbosity}\n"
         f"Avoid direct address: {'yes' if controls.avoid_direct_address else 'no'}\n"
         f"Conversation loop detected: {'yes' if controls.conversation_loop_detected else 'no'}"
         f"{underutilized_text}"
@@ -1934,6 +2387,7 @@ def build_piece_voice_line_retry_query(
         + "Return exactly one fresh in-character line right now. "
         + "It must be vivid and specific, ideally 4 to 12 words and never more than 14. "
         + "It must be one complete sentence ending with punctuation. "
+        + "If the previous attempt became awkward because of too much style variation, lower the variation and choose the cleaner board-grounded line. "
         + "Do not return a single word, single letter, grunt, or generic filler. "
         + "Do not reuse the previous wording. "
         + "Do not return labels, quotes, headings, or explanations. "
@@ -1953,6 +2407,7 @@ def build_piece_voice_line_duplicate_retry_query(
         + "Your previous answer repeated recent wording. "
         + "Return a fresh alternative with noticeably different phrasing right now. "
         + "Keep it in character, complete, and punchy. "
+        + "Change the sentence form, opening words, joke shape, or rhythm so it does not feel like the same line wearing a hat. "
         + "Do not echo the same stock slogan, opening words, or core phrase. "
         + "Do not return labels, quotes, headings, or explanations. "
         + f"Repeated answer to replace: {trimmed_previous or '(empty)'}"
@@ -1974,6 +2429,24 @@ def build_piece_voice_line_repair_query(
         + "Prefer 4 to 12 words when possible, and never exceed 14. End with punctuation. "
         + "Do not output labels, quotes, headings, or explanations. "
         + f"Incomplete fragment to repair: {trimmed_previous or '(empty)'}"
+    )
+
+
+def build_piece_voice_line_grounding_retry_query(
+    payload: GeminiPieceVoiceRequest,
+    previous_response: str,
+    prompt_controls: PieceDialoguePromptControls | None = None,
+) -> str:
+    trimmed_previous = re.sub(r"\s+", " ", previous_response).strip()
+    return (
+        build_piece_voice_line_query(payload, prompt_controls=prompt_controls)
+        + "\n\n"
+        + "The last answer lost touch with the board state or the current role tone. "
+        + "Rewrite it with stronger board grounding and clearer role-driven emotion. "
+        + "It should still be vivid, but it must clearly sound tied to real pressure, danger, underuse, initiative, or exposure from the position. "
+        + "If the dramatic version feels fuzzy, simplify it. "
+        + "Do not output labels, quotes, headings, or explanations. "
+        + f"Ungrounded answer to replace: {trimmed_previous or '(empty)'}"
     )
 
 
@@ -3286,6 +3759,21 @@ async def create_gemini_piece_voice_line(payload: GeminiPieceVoiceRequest) -> di
             choice = choose_piece_voice_candidate(repair_candidates, payload, prompt_controls)
             raw_line = choice.raw_text
             line = choice.line
+
+        if is_complete_piece_voice_line_text(line) and not is_piece_voice_line_board_grounded(line, payload):
+            grounding_query = build_piece_voice_line_grounding_retry_query(
+                payload,
+                raw_line,
+                prompt_controls=prompt_controls,
+            )
+            grounding_candidates = await fetch_gemini_piece_voice_line_candidates(
+                grounding_query,
+                temperature=0.85,
+                candidate_count=PIECE_VOICE_RETRY_CANDIDATE_COUNT,
+            )
+            choice = choose_piece_voice_candidate(grounding_candidates, payload, prompt_controls)
+            raw_line = choice.raw_text
+            line = choice.line
     except GeminiLiveConfigurationError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except GeminiLiveBusyError as exc:
@@ -3298,10 +3786,12 @@ async def create_gemini_piece_voice_line(payload: GeminiPieceVoiceRequest) -> di
 
     if not is_complete_piece_voice_line_text(line):
         raise HTTPException(status_code=503, detail="Gemini piece voice returned no usable line.")
+    if not is_piece_voice_line_board_grounded(line, payload):
+        raise HTTPException(status_code=503, detail="Gemini piece voice was not grounded in the board state.")
     if is_piece_voice_line_repetitive(line, payload.recent_lines):
         raise HTTPException(status_code=503, detail="Gemini piece voice repeated a recent line.")
 
-    record_piece_voice_global_usage(line)
+    record_piece_voice_global_usage(line, payload.piece_type)
     return {"line": line}
 
 

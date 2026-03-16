@@ -561,6 +561,8 @@ private struct GeminiPieceVoiceLineRequestPayload: Encodable {
   let fen: String
   let piece_type: String
   let piece_color: String
+  let behavior_role: String
+  let behavior_role_reason: String?
   let recent_lines: [String]
   let dialogue_mode: String
   let piece_dialogue_history: [GeminiDialogueUtterancePayload]
@@ -817,6 +819,12 @@ private enum PieceDialogueMode: String {
   case underutilizedSnark = "underutilized_snark"
 }
 
+private enum PieceVoiceBehaviorRole: String {
+  case worker
+  case lazy
+  case traitor
+}
+
 private enum PassiveNarratorDialogueMode: String {
   case independent
   case pieceReactive = "piece_reactive"
@@ -834,6 +842,8 @@ private struct GeminiPieceVoiceLineContext {
   let fen: String
   let pieceType: ChessPieceKind
   let pieceColor: ChessColor
+  let behaviorRole: PieceVoiceBehaviorRole
+  let behaviorRoleReason: String?
   let recentLines: [String]
   let dialogueMode: PieceDialogueMode
   let pieceDialogueHistory: [GeminiDialogueUtterancePayload]
@@ -3627,6 +3637,8 @@ private final class GeminiHintService {
         fen: context.fen,
         piece_type: context.pieceType.displayName.lowercased(),
         piece_color: context.pieceColor.displayName.lowercased(),
+        behavior_role: context.behaviorRole.rawValue,
+        behavior_role_reason: context.behaviorRoleReason,
         recent_lines: context.recentLines,
         dialogue_mode: context.dialogueMode.rawValue,
         piece_dialogue_history: context.pieceDialogueHistory,
@@ -9854,11 +9866,33 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
     let evalBefore = beforeAnalysis?.perspectiveScore(for: moverColor) ?? fastPieceVoiceEvaluation(for: moverColor, in: beforeState)
     let evalAfter = afterAnalysis?.perspectiveScore(for: moverColor) ?? fastPieceVoiceEvaluation(for: moverColor, in: afterState)
     let evalDelta = evalAfter - evalBefore
+    let roleSnapshot = stateByReplacingTurn(in: afterState, with: moverColor).evaluatePieceRolesRelativeToCurrentPlayer()
+    let roleAssignment = roleSnapshot.assignmentsBySquare[speakingSquare]
+    let behaviorRole = pieceVoiceBehaviorRole(
+      for: roleAssignment,
+      dialogueMode: dialogueMode
+    )
+    let behaviorRoleReason = pieceVoiceBehaviorRoleReason(
+      role: behaviorRole,
+      assignment: roleAssignment,
+      contextMode: contextMode,
+      isCapture: isCapture,
+      isCheck: isCheck,
+      isHanging: isHanging,
+      isPinned: isPinned,
+      isAggressiveAdvance: isAggressiveAdvance,
+      attackerCount: attackerCount,
+      defenderCount: defenderCount,
+      pieceMoveCount: pieceMoveCount,
+      underutilizedReason: underutilizedReason
+    )
 
     return GeminiPieceVoiceLineContext(
       fen: afterState.fenString,
       pieceType: piece.kind,
       pieceColor: moverColor,
+      behaviorRole: behaviorRole,
+      behaviorRoleReason: behaviorRoleReason,
       recentLines: recentLines,
       dialogueMode: dialogueMode,
       pieceDialogueHistory: pieceDialogueHistory,
@@ -9896,6 +9930,79 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
       pieceMoveCount: pieceMoveCount,
       underutilizedReason: underutilizedReason
     )
+  }
+
+  private func pieceVoiceBehaviorRole(
+    for assignment: PieceRoleAssignment?,
+    dialogueMode: PieceDialogueMode
+  ) -> PieceVoiceBehaviorRole {
+    if dialogueMode == .underutilizedSnark {
+      return .lazy
+    }
+
+    guard let assignment else {
+      return .worker
+    }
+
+    return assignment.roleType.pieceVoiceBehaviorRole
+  }
+
+  private func pieceVoiceBehaviorRoleReason(
+    role: PieceVoiceBehaviorRole,
+    assignment: PieceRoleAssignment?,
+    contextMode: PieceVoiceContextMode,
+    isCapture: Bool,
+    isCheck: Bool,
+    isHanging: Bool,
+    isPinned: Bool,
+    isAggressiveAdvance: Bool,
+    attackerCount: Int,
+    defenderCount: Int,
+    pieceMoveCount: Int,
+    underutilizedReason: String?
+  ) -> String {
+    switch role {
+    case .worker:
+      if isCheck {
+        return "driving direct pressure at the enemy king"
+      }
+      if isCapture {
+        return "doing visible damage and keeping the pressure on"
+      }
+      if isAggressiveAdvance {
+        return "pushing the fight forward"
+      }
+      if let assignment, assignment.influenceCount > 0 {
+        return "actively influencing the fight across the board"
+      }
+      return "pulling weight in the battle"
+    case .lazy:
+      if let underutilizedReason,
+         !underutilizedReason.isEmpty {
+        return underutilizedReason
+      }
+      if pieceMoveCount == 0 {
+        return "still waiting to be used"
+      }
+      return contextMode == .ambient
+        ? "watching the fight while the real action happens elsewhere"
+        : "not influencing enough of the fight"
+    case .traitor:
+      if isHanging {
+        return "hanging and easy to punish"
+      }
+      if isPinned {
+        return "pinned and warping the position"
+      }
+      if attackerCount > defenderCount {
+        return "sitting on a square that is turning dangerous fast"
+      }
+      if let assignment,
+         assignment.influenceCount == 0 {
+        return "misplaced and making the position harder for its own side"
+      }
+      return "becoming a liability instead of a helper"
+    }
   }
 
   private func pieceVoicePositionState(_ evalAfter: Int?) -> PieceVoicePositionState {
@@ -10661,6 +10768,136 @@ private final class PiecePersonalityDirector: NSObject, ObservableObject, @preco
           [
             "I am safer when forgotten, frankly.",
             "I prefer neglect to catastrophe.",
+          ],
+          for: plan.speaker,
+          extraAvoiding: additionalLines
+        )
+      }
+    }
+
+    if context.behaviorRole == .traitor {
+      switch plan.speaker {
+      case .pawn:
+        return pickDistinctPieceVoiceOption(
+          [
+            "I may have charged somewhere stupid.",
+            "That square felt brave a moment ago.",
+            "Let us call this exposure temporary.",
+          ],
+          for: plan.speaker,
+          extraAvoiding: additionalLines
+        )
+      case .rook:
+        return pickDistinctPieceVoiceOption(
+          [
+            "That might be a problem.",
+            "I seem to have picked a bad road.",
+            "Let us pretend this square was intentional.",
+          ],
+          for: plan.speaker,
+          extraAvoiding: additionalLines
+        )
+      case .knight:
+        return pickDistinctPieceVoiceOption(
+          [
+            "I may have leapt into a problem.",
+            "This flourish has gone slightly sour.",
+            "I appear to have landed in the wrong story.",
+          ],
+          for: plan.speaker,
+          extraAvoiding: additionalLines
+        )
+      case .bishop:
+        return pickDistinctPieceVoiceOption(
+          [
+            "I may have misjudged this line.",
+            "That diagonal suddenly feels shorter.",
+            "My faith is firm. This square is not.",
+          ],
+          for: plan.speaker,
+          extraAvoiding: additionalLines
+        )
+      case .queen:
+        return pickDistinctPieceVoiceOption(
+          [
+            "I refuse to admit this is my fault.",
+            "This is beneath me and somehow still dangerous.",
+            "I would like the record to show my objections.",
+          ],
+          for: plan.speaker,
+          extraAvoiding: additionalLines
+        )
+      case .king:
+        return pickDistinctPieceVoiceOption(
+          [
+            "This reflects poorly on my entire court.",
+            "No one mention how exposed this looks.",
+            "I dislike how much blame is coming my way.",
+          ],
+          for: plan.speaker,
+          extraAvoiding: additionalLines
+        )
+      }
+    }
+
+    if context.behaviorRole == .lazy {
+      switch plan.speaker {
+      case .pawn:
+        return pickDistinctPieceVoiceOption(
+          [
+            "I am still waiting for a proper shove.",
+            "Plenty of war. Very little of it for me.",
+            "I could be useful any time now.",
+          ],
+          for: plan.speaker,
+          extraAvoiding: additionalLines
+        )
+      case .rook:
+        return pickDistinctPieceVoiceOption(
+          [
+            "Plenty of open board. None of it for me.",
+            "I was built for files, not storage.",
+            "Just say when you actually need a rook.",
+          ],
+          for: plan.speaker,
+          extraAvoiding: additionalLines
+        )
+      case .knight:
+        return pickDistinctPieceVoiceOption(
+          [
+            "I am still waiting for a square worth leaping to.",
+            "All this board and no invitation.",
+            "I remain stylishly underused.",
+          ],
+          for: plan.speaker,
+          extraAvoiding: additionalLines
+        )
+      case .bishop:
+        return pickDistinctPieceVoiceOption(
+          [
+            "My diagonals are gathering dust.",
+            "So much vision. So little demand.",
+            "I appear to be blessing the bench.",
+          ],
+          for: plan.speaker,
+          extraAvoiding: additionalLines
+        )
+      case .queen:
+        return pickDistinctPieceVoiceOption(
+          [
+            "I am somehow underbooked again.",
+            "Everyone needs me eventually. I can wait.",
+            "Wake me when this position deserves a queen.",
+          ],
+          for: plan.speaker,
+          extraAvoiding: additionalLines
+        )
+      case .king:
+        return pickDistinctPieceVoiceOption(
+          [
+            "Quiet, for once. I almost miss the panic.",
+            "I am waiting, and I do not enjoy waiting.",
+            "This calm had better lead somewhere.",
           ],
           for: plan.speaker,
           extraAvoiding: additionalLines
@@ -20698,6 +20935,19 @@ private enum PieceRoleType: String {
       return "Traitor"
     case .worker:
       return "Worker"
+    }
+  }
+}
+
+private extension PieceRoleType {
+  var pieceVoiceBehaviorRole: PieceVoiceBehaviorRole {
+    switch self {
+    case .employee, .worker:
+      return .worker
+    case .lazy:
+      return .lazy
+    case .traitor:
+      return .traitor
     }
   }
 }

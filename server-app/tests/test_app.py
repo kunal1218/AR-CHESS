@@ -21,6 +21,7 @@ from main import (  # noqa: E402
     build_narrator_prompt,
     build_narrator_turn_addon,
     build_piece_voice_line_duplicate_retry_query,
+    build_piece_voice_line_grounding_retry_query,
     build_piece_voice_line_query,
     build_piece_voice_line_retry_query,
     get_postgres_dsn,
@@ -497,6 +498,8 @@ def test_build_piece_voice_line_query_includes_personality_and_context() -> None
         fen="rnbqkbnr/pppppppp/8/8/4N3/8/PPPPPPPP/RNBQKB1R b KQkq - 1 1",
         piece_type="knight",
         piece_color="white",
+        behavior_role="worker",
+        behavior_role_reason="creating multiple threats at once",
         recent_lines=["A stylish leap was overdue."],
         from_square="g1",
         to_square="e4",
@@ -525,17 +528,27 @@ def test_build_piece_voice_line_query_includes_personality_and_context() -> None
 
     assert "Output exactly one short in-character line." in query
     assert "Focused piece personality: Knight: fancy, chivalrous" in query
+    assert "Core priority order: board relevance first, role tone second, piece personality third, variation diversity fourth." in query
+    assert "Build the line in this order: determine board intent, determine role tone, color it with piece personality, then add variation." in query
     assert "Move: g1 to e4" in query
     assert "Fork threat: yes" in query
     assert "Move quality: tactical" in query
-    assert "Minimum 3 words." in query
+    assert "Behavior role: worker" in query
+    assert "Behavior role reason: creating multiple threats at once" in query
+    assert "Board intent: multiple threats at once" in query
+    assert "Sentence form:" in query
+    assert "Tone axis:" in query
+    assert "Imagery level:" in query
+    assert "Rhythm:" in query
+    assert "Verbosity:" in query
+    assert "Preferred length: 4 to 12 words. Maximum: 14 words." in query
     assert "Return exactly one complete sentence" in query
     assert "single word, single letter" in query
     assert "Recent lines to avoid repeating:" in query
     assert "A stylish leap was overdue." in query
 
     retry_query = build_piece_voice_line_retry_query(payload, 'Knight: "Too long."')
-    assert "3 to 12 words" in retry_query
+    assert "ideally 4 to 12 words and never more than 14" in retry_query
     assert "complete sentence ending with punctuation" in retry_query
     assert "Do not reuse the previous wording." in retry_query
     assert 'Previous invalid answer: Knight: "Too long."' in retry_query
@@ -546,12 +559,19 @@ def test_build_piece_voice_line_query_includes_personality_and_context() -> None
     )
     assert "repeated recent wording" in duplicate_retry_query
     assert "noticeably different phrasing" in duplicate_retry_query
+    assert "Change the sentence form, opening words, joke shape, or rhythm" in duplicate_retry_query
 
     from main import build_piece_voice_line_repair_query
 
     repair_query = build_piece_voice_line_repair_query(payload, "By holy")
     assert "incomplete fragment" in repair_query
     assert "finished in-character sentence" in repair_query
+    assert "Prefer the clearest and most sensible line over the most exaggerated character bit." in repair_query
+
+    grounding_retry_query = build_piece_voice_line_grounding_retry_query(payload, "Fate dances in a silver corner.")
+    assert "lost touch with the board state or the current role tone" in grounding_retry_query
+    assert "stronger board grounding and clearer role-driven emotion" in grounding_retry_query
+    assert "Ungrounded answer to replace: Fate dances in a silver corner." in grounding_retry_query
 
 
 def test_build_piece_voice_line_query_supports_ambient_piece_context() -> None:
@@ -648,6 +668,11 @@ def test_build_piece_voice_line_query_uses_piece_only_dialogue_history() -> None
             line_style="taunting",
             focus_target="enemy",
             emotional_flavor="smug",
+            sentence_form="observation",
+            tone_axis="playful",
+            imagery_level="light_metaphor",
+            rhythm="flowing",
+            verbosity="short",
             avoid_direct_address=False,
             conversation_loop_detected=False,
         ),
@@ -664,6 +689,11 @@ def test_build_piece_voice_line_query_uses_piece_only_dialogue_history() -> None
     assert "Line style: taunting" in query
     assert "Focus target: enemy" in query
     assert "Emotional flavor: smug" in query
+    assert "Sentence form: observation" in query
+    assert "Tone axis: playful" in query
+    assert "Imagery level: light_metaphor" in query
+    assert "Rhythm: flowing" in query
+    assert "Verbosity: short" in query
     assert "Avoid direct address: no" in query
     assert "Conversation loop detected: no" in query
 
@@ -710,12 +740,20 @@ def test_build_piece_voice_line_query_supports_underutilized_snark_mode() -> Non
             line_style="clipped",
             focus_target="self",
             emotional_flavor="smug",
+            sentence_form="complaint",
+            tone_axis="irritated",
+            imagery_level="literal",
+            rhythm="muttered",
+            verbosity="medium",
             avoid_direct_address=False,
             conversation_loop_detected=False,
         ),
     )
 
     assert "Dialogue mode: underutilized_snark" in query
+    assert "Behavior role: lazy" in query
+    assert "Behavior role reason: stuck on the back rank with no open file" in query
+    assert "Board intent: underuse, inactivity, blocked paths, and waiting to matter" in query
     assert "least-used pieces and you are finally speaking up" in query
     assert "Do not sound like a coach" in query
     assert "Piece move count so far: 0" in query
@@ -873,6 +911,11 @@ def test_build_piece_voice_line_query_can_suppress_direct_address_loops() -> Non
             line_style="grim",
             focus_target="battle",
             emotional_flavor="solemn",
+            sentence_form="warning",
+            tone_axis="grim",
+            imagery_level="literal",
+            rhythm="formal",
+            verbosity="short",
             avoid_direct_address=True,
             conversation_loop_detected=True,
         ),
@@ -884,6 +927,11 @@ def test_build_piece_voice_line_query_can_suppress_direct_address_loops() -> Non
     assert "Line style: grim" in query
     assert "Focus target: battle" in query
     assert "Emotional flavor: solemn" in query
+    assert "Sentence form: warning" in query
+    assert "Tone axis: grim" in query
+    assert "Imagery level: literal" in query
+    assert "Rhythm: formal" in query
+    assert "Verbosity: short" in query
     assert "Avoid direct address: yes" in query
     assert "Conversation loop detected: yes" in query
 
@@ -1940,6 +1988,15 @@ def test_create_gemini_piece_voice_line_penalizes_globally_overused_lines(monkey
     assert response.status_code == 200
     assert response.json() == {"line": "Another square taken. The trench opens wider."}
     reset_piece_voice_global_memory()
+
+
+def test_is_piece_voice_line_repetitive_detects_semantic_overlap() -> None:
+    from main import is_piece_voice_line_repetitive
+
+    assert is_piece_voice_line_repetitive(
+        "Open file. Work is mine.",
+        ["The file is open, and the work is mine."],
+    )
 
 
 def test_create_gemini_piece_voice_line_retries_recent_duplicate(monkeypatch) -> None:
