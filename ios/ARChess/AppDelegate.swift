@@ -2835,6 +2835,9 @@ private final class PiperTTSService {
 
   private func resolveAudioURL(_ rawValue: String, apiBaseURL: URL) throws -> URL {
     if let directURL = URL(string: rawValue), directURL.scheme != nil {
+      if let rebasedURL = rebasePiperAudioURLIfNeeded(directURL, onto: apiBaseURL) {
+        return rebasedURL
+      }
       return directURL
     }
 
@@ -2847,6 +2850,30 @@ private final class PiperTTSService {
       code: -2005,
       userInfo: [NSLocalizedDescriptionKey: "Piper audio_url could not be resolved."]
     )
+  }
+
+  private func rebasePiperAudioURLIfNeeded(_ directURL: URL, onto apiBaseURL: URL) -> URL? {
+    guard directURL.path.contains("/v1/tts/piper/audio/") else {
+      return nil
+    }
+
+    guard let directComponents = URLComponents(url: directURL, resolvingAgainstBaseURL: false),
+          var apiComponents = URLComponents(url: apiBaseURL, resolvingAgainstBaseURL: false) else {
+      return nil
+    }
+
+    let sameOrigin =
+      directComponents.scheme == apiComponents.scheme &&
+      directComponents.host == apiComponents.host &&
+      directComponents.port == apiComponents.port
+    if sameOrigin {
+      return nil
+    }
+
+    apiComponents.path = directComponents.path
+    apiComponents.query = directComponents.query
+    apiComponents.fragment = directComponents.fragment
+    return apiComponents.url
   }
 
   private func cacheDirectory() -> URL {
@@ -2996,9 +3023,9 @@ private final class PiperAutomaticSpeaker: NSObject, AVAudioPlayerDelegate {
     }
 
     do {
-      let preparedLine = try await ttsService.synthesizeLine(
-        speakerType: request.line.speakerType,
-        text: request.line.text
+      let (preparedLine, player) = try await makePreparedAudioPlayer(
+        for: request,
+        allowsCacheRepair: true
       )
       guard !Task.isCancelled else {
         currentTask = nil
@@ -3008,7 +3035,6 @@ private final class PiperAutomaticSpeaker: NSObject, AVAudioPlayerDelegate {
       }
 
       try AudioSessionCoordinator.shared.activatePlaybackSession()
-      let player = try AVAudioPlayer(contentsOf: preparedLine.localFileURL)
       player.delegate = self
       player.prepareToPlay()
       audioPlayer = player
@@ -3048,6 +3074,35 @@ private final class PiperAutomaticSpeaker: NSObject, AVAudioPlayerDelegate {
         onLineFailure?(failedRequest, error.localizedDescription)
       }
       notifyBusyStateChange()
+    }
+  }
+
+  private func makePreparedAudioPlayer(
+    request: PlaybackRequest,
+    allowsCacheRepair: Bool
+  ) async throws -> (PiperPreparedLine, AVAudioPlayer) {
+    let preparedLine = try await ttsService.synthesizeLine(
+      speakerType: request.line.speakerType,
+      text: request.line.text
+    )
+
+    do {
+      let player = try AVAudioPlayer(contentsOf: preparedLine.localFileURL)
+      return (preparedLine, player)
+    } catch {
+      guard allowsCacheRepair else {
+        throw error
+      }
+
+      Self.logger.error(
+        "Piper cached audio could not be opened at \(preparedLine.localFileURL.path, privacy: .public). Refetching once."
+      )
+      try? FileManager.default.removeItem(at: preparedLine.localFileURL)
+
+      return try await makePreparedAudioPlayer(
+        request: request,
+        allowsCacheRepair: false
+      )
     }
   }
 
