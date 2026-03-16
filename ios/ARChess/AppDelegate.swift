@@ -5712,6 +5712,10 @@ private final class CaptureSoundEffectEngine {
   }
 
   func play(_ effect: CaptureImpactSound) {
+    guard !SoundEffectsController.shared.isMuted else {
+      return
+    }
+
     if effect == .pawnSword {
       playFileResource(named: "pawnSword", extension: "mp3", volume: 0.88)
       return
@@ -5736,6 +5740,10 @@ private final class CaptureSoundEffectEngine {
   }
 
   func playMove(for kind: ChessPieceKind) {
+    guard !SoundEffectsController.shared.isMuted else {
+      return
+    }
+
     let effect: PieceMoveSound
     switch kind {
     case .pawn:
@@ -5995,6 +6003,35 @@ private final class CaptureSoundEffectEngine {
 
   private static func clampSample(_ sample: Float) -> Float {
     min(max(sample, -1), 1)
+  }
+}
+
+private final class SoundEffectsController {
+  static let shared = SoundEffectsController()
+
+  private static let muteDefaultsKey = "SoundEffectsController.isMuted"
+  private let queue = DispatchQueue(label: "ARChess.SoundEffects")
+  private var isMutedInternal = UserDefaults.standard.bool(forKey: muteDefaultsKey)
+
+  private init() {}
+
+  var isMuted: Bool {
+    queue.sync { isMutedInternal }
+  }
+
+  func setMuted(_ muted: Bool) {
+    queue.async { [weak self] in
+      guard let self else {
+        return
+      }
+
+      guard self.isMutedInternal != muted else {
+        return
+      }
+
+      self.isMutedInternal = muted
+      UserDefaults.standard.set(muted, forKey: Self.muteDefaultsKey)
+    }
   }
 }
 
@@ -12544,6 +12581,7 @@ private struct ExperienceLoadingView: View {
 }
 
 private struct ModeSelectionView: View {
+  @AppStorage("archess.ui.hideDeveloperButtons") private var hidesDeveloperButtons = false
   @Binding var selectedNarrator: NarratorType
   @Binding var isDailyCosmeticDevModeEnabled: Bool
   let onSelect: (PlayModeChoice) -> Void
@@ -12585,6 +12623,9 @@ private struct ModeSelectionView: View {
           .frame(maxWidth: 340)
 
         DailyCosmeticDevToggleCard(isEnabled: $isDailyCosmeticDevModeEnabled)
+          .frame(maxWidth: 340)
+
+        ARDeveloperButtonsToggleCard(isEnabled: $hidesDeveloperButtons)
           .frame(maxWidth: 340)
 
         NativeActionButton(title: "Piper Voice Lab", style: .outline) {
@@ -12629,6 +12670,56 @@ private struct ModeSelectionView: View {
   }
 }
 
+private struct ARDeveloperButtonsToggleCard: View {
+  @Binding var isEnabled: Bool
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 12) {
+      HStack(alignment: .top, spacing: 14) {
+        VStack(alignment: .leading, spacing: 6) {
+          Text("Simplified AR HUD")
+            .font(.system(size: 14, weight: .black, design: .rounded))
+            .foregroundStyle(.white)
+
+          Text("Hide the developer/debug controls in AR and leave the audio settings and coach microphone visible.")
+            .font(.system(size: 12, weight: .semibold, design: .rounded))
+            .foregroundStyle(Color.white.opacity(0.72))
+            .lineSpacing(2)
+        }
+
+        Spacer(minLength: 12)
+
+        Toggle("", isOn: $isEnabled)
+          .labelsHidden()
+          .tint(Color(red: 0.95, green: 0.88, blue: 0.73))
+      }
+
+      Text(
+        isEnabled
+          ? "Simplified HUD is on. Debug buttons and dev panels stay hidden in the AR scene."
+          : "Developer controls are visible in AR."
+      )
+      .font(.system(size: 11, weight: .bold, design: .rounded))
+      .foregroundStyle(
+        isEnabled
+          ? Color(red: 0.82, green: 0.92, blue: 0.74)
+          : Color.white.opacity(0.64)
+      )
+      .lineSpacing(2)
+    }
+    .padding(.horizontal, 18)
+    .padding(.vertical, 16)
+    .background(
+      RoundedRectangle(cornerRadius: 24, style: .continuous)
+        .fill(Color.white.opacity(0.06))
+        .overlay(
+          RoundedRectangle(cornerRadius: 24, style: .continuous)
+            .stroke(Color.white.opacity(0.14), lineWidth: 1)
+        )
+    )
+  }
+}
+
 private struct DailyCosmeticDevToggleCard: View {
   @Binding var isEnabled: Bool
 
@@ -12655,7 +12746,7 @@ private struct DailyCosmeticDevToggleCard: View {
 
       Text(
         isEnabled
-          ? "Dev mode is live. Daily lockout is bypassed until the mock cosmetic pool is exhausted."
+          ? "Dev mode is live. Daily lockout is bypassed and mock cosmetics will keep cycling."
           : "Daily lockout is active. Players can claim one cosmetic per calendar day."
       )
       .font(.system(size: 11, weight: .bold, design: .rounded))
@@ -13902,8 +13993,9 @@ private final class DailyCosmeticRewardStore: ObservableObject {
     let availableRewards = PieceCosmeticReward.mockPool.filter { reward in
       !unlockedCosmeticIDs.contains(reward.id)
     }
-    guard let reward = availableRewards.randomElement() else {
-      let message = "The machine is out of mock cosmetics for now."
+    let rewardPool = availableRewards.isEmpty ? PieceCosmeticReward.mockPool : availableRewards
+    guard let reward = rewardPool.randomElement() else {
+      let message = "The machine could not find a cosmetic to dispense."
       showStatusMessage(message)
       return .unavailable(message)
     }
@@ -14248,6 +14340,7 @@ private final class UpwardFlickDetector {
 }
 
 private struct NativeARExperienceView: View {
+  @AppStorage("archess.ui.hideDeveloperButtons") private var hidesDeveloperButtons = false
   let mode: ExperienceMode
   let narrator: NarratorType
   @ObservedObject var queueMatch: QueueMatchStore
@@ -14267,7 +14360,9 @@ private struct NativeARExperienceView: View {
   @State private var isGeminiDebugVisible = false
   @State private var isVoiceStackVisible = false
   @State private var isStockfishDebugVisible = false
+  @State private var isAudioSettingsPanelVisible = false
   @State private var isMusicMuted = AmbientMusicController.shared.isMuted
+  @State private var isSoundEffectsMuted = SoundEffectsController.shared.isMuted
   @State private var notifiedCompletedLessonID: String?
 
   init(
@@ -14319,7 +14414,7 @@ private struct NativeARExperienceView: View {
       .ignoresSafeArea()
       .allowsHitTesting(false)
 
-      if gameReview.phase == .idle && !isLessonMode {
+      if gameReview.phase == .idle && !isLessonMode && !hidesDeveloperButtons {
         VStack(spacing: 16) {
           if isModePanelVisible {
             ScrollView(showsIndicators: true) {
@@ -14520,62 +14615,64 @@ private struct NativeARExperienceView: View {
           HStack(alignment: .top) {
             if !isLessonMode {
               HStack(spacing: 10) {
-                overlayToggleButton(
-                  title: isModePanelVisible ? "Hide Mode" : "Show Mode",
-                  systemImage: "rectangle.topthird.inset.filled"
-                ) {
-                  withAnimation(.spring(response: 0.30, dampingFraction: 0.86)) {
-                    isModePanelVisible.toggle()
-                  }
-                }
-
-                overlayToggleButton(
-                  title: isMatchLogVisible ? "Hide Log" : "Show Log",
-                  systemImage: "text.append"
-                ) {
-                  withAnimation(.spring(response: 0.30, dampingFraction: 0.86)) {
-                    isMatchLogVisible.toggle()
-                  }
-                }
-
-                overlayToggleButton(
-                  title: isGeminiDebugVisible ? "Hide Gemini Debug" : "Show Gemini Debug",
-                  systemImage: "sparkles.rectangle.stack"
-                ) {
-                  let nextVisible = !isGeminiDebugVisible
-                  withAnimation(.spring(response: 0.30, dampingFraction: 0.86)) {
-                    isGeminiDebugVisible = nextVisible
-                    if nextVisible {
-                      isStockfishDebugVisible = false
+                if !hidesDeveloperButtons {
+                  overlayToggleButton(
+                    title: isModePanelVisible ? "Hide Mode" : "Show Mode",
+                    systemImage: "rectangle.topthird.inset.filled"
+                  ) {
+                    withAnimation(.spring(response: 0.30, dampingFraction: 0.86)) {
+                      isModePanelVisible.toggle()
                     }
                   }
-                  syncStockfishDebugVisibility()
-                }
 
-                overlayToggleButton(
-                  title: isVoiceStackVisible ? "Hide Voices" : "Show Voices",
-                  systemImage: "text.quote"
-                ) {
-                  withAnimation(.spring(response: 0.30, dampingFraction: 0.86)) {
-                    isVoiceStackVisible.toggle()
-                  }
-                }
-
-                overlayToggleButton(
-                  title: isStockfishDebugVisible ? "Hide Stockfish Debug" : "Show Stockfish Debug",
-                  systemImage: "list.number"
-                ) {
-                  let nextVisible = !isStockfishDebugVisible
-                  withAnimation(.spring(response: 0.30, dampingFraction: 0.86)) {
-                    isStockfishDebugVisible = nextVisible
-                    if nextVisible {
-                      isGeminiDebugVisible = false
+                  overlayToggleButton(
+                    title: isMatchLogVisible ? "Hide Log" : "Show Log",
+                    systemImage: "text.append"
+                  ) {
+                    withAnimation(.spring(response: 0.30, dampingFraction: 0.86)) {
+                      isMatchLogVisible.toggle()
                     }
                   }
-                  syncStockfishDebugVisibility()
+
+                  overlayToggleButton(
+                    title: isGeminiDebugVisible ? "Hide Gemini Debug" : "Show Gemini Debug",
+                    systemImage: "sparkles.rectangle.stack"
+                  ) {
+                    let nextVisible = !isGeminiDebugVisible
+                    withAnimation(.spring(response: 0.30, dampingFraction: 0.86)) {
+                      isGeminiDebugVisible = nextVisible
+                      if nextVisible {
+                        isStockfishDebugVisible = false
+                      }
+                    }
+                    syncStockfishDebugVisibility()
+                  }
+
+                  overlayToggleButton(
+                    title: isVoiceStackVisible ? "Hide Voices" : "Show Voices",
+                    systemImage: "text.quote"
+                  ) {
+                    withAnimation(.spring(response: 0.30, dampingFraction: 0.86)) {
+                      isVoiceStackVisible.toggle()
+                    }
+                  }
+
+                  overlayToggleButton(
+                    title: isStockfishDebugVisible ? "Hide Stockfish Debug" : "Show Stockfish Debug",
+                    systemImage: "list.number"
+                  ) {
+                    let nextVisible = !isStockfishDebugVisible
+                    withAnimation(.spring(response: 0.30, dampingFraction: 0.86)) {
+                      isStockfishDebugVisible = nextVisible
+                      if nextVisible {
+                        isGeminiDebugVisible = false
+                      }
+                    }
+                    syncStockfishDebugVisibility()
+                  }
                 }
 
-                musicToggleButton
+                audioSettingsButton
 
                 if socraticCoach.isVisibleInCurrentMode {
                   overlayToggleButton(
@@ -14609,7 +14706,7 @@ private struct NativeARExperienceView: View {
               Spacer(minLength: 12)
 
               HStack(spacing: 8) {
-                if socraticCoach.isVisibleInCurrentMode {
+                if socraticCoach.isVisibleInCurrentMode && !hidesDeveloperButtons {
                   overlayToggleButton(
                     title: "Lesson Help",
                     systemImage: "questionmark.bubble.fill",
@@ -14620,7 +14717,9 @@ private struct NativeARExperienceView: View {
                   ) {
                     socraticCoach.requestStrategicBriefing()
                   }
+                }
 
+                if socraticCoach.isVisibleInCurrentMode {
                   overlayToggleButton(
                     title: socraticCoach.micState.label,
                     systemImage: socraticCoach.micState.systemImageName,
@@ -14633,7 +14732,7 @@ private struct NativeARExperienceView: View {
                   }
                 }
 
-                musicToggleButton
+                audioSettingsButton
 
                 ForEach(0..<3, id: \.self) { index in
                   lessonStrikeBadge(isUsed: index < lessonUsedStrikeCount)
@@ -14662,6 +14761,10 @@ private struct NativeARExperienceView: View {
 
           Spacer()
         }
+      }
+
+      if isAudioSettingsPanelVisible {
+        audioSettingsPanelOverlay
       }
 
       if gameReview.phase == .idle {
@@ -14738,12 +14841,7 @@ private struct NativeARExperienceView: View {
         return
       }
 
-      isModePanelVisible = false
-      isMatchLogVisible = false
-      isGeminiDebugVisible = false
-      isVoiceStackVisible = false
-      isStockfishDebugVisible = false
-      syncStockfishDebugVisibility()
+      closeDeveloperPanels()
     }
     .onChange(of: lessonStore.phase) { phase in
       guard phase == .complete,
@@ -14755,10 +14853,19 @@ private struct NativeARExperienceView: View {
       notifiedCompletedLessonID = lessonID
       markLessonComplete(lessonID)
     }
+    .onChange(of: hidesDeveloperButtons) { hidesButtons in
+      if hidesButtons {
+        closeDeveloperPanels()
+      }
+    }
     .onAppear {
-      isMusicMuted = AmbientMusicController.shared.isMuted
+      syncAudioPreferenceState()
+      if hidesDeveloperButtons {
+        closeDeveloperPanels()
+      }
     }
     .onDisappear {
+      isAudioSettingsPanelVisible = false
       gameReview.resetSession()
       lessonStore.resetSession()
       notifiedCompletedLessonID = nil
@@ -14855,19 +14962,155 @@ private struct NativeARExperienceView: View {
     .accessibilityLabel("Wanted poster for \(title)")
   }
 
-  private var musicToggleButton: some View {
+  private var audioSettingsButton: some View {
     overlayToggleButton(
-      title: isMusicMuted ? "Unmute Music" : "Mute Music",
-      systemImage: isMusicMuted ? "speaker.slash.fill" : "speaker.wave.2.fill",
+      title: "Audio Settings",
+      systemImage: audioSettingsButtonIconName,
       foregroundColor: .white,
-      backgroundColor: isMusicMuted
-        ? Color(red: 0.38, green: 0.18, blue: 0.18).opacity(0.88)
-        : Color.black.opacity(0.54)
+      backgroundColor: audioSettingsButtonBackgroundColor
     ) {
-      let nextMuted = !isMusicMuted
-      AmbientMusicController.shared.setMuted(nextMuted)
-      isMusicMuted = nextMuted
+      withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
+        isAudioSettingsPanelVisible.toggle()
+      }
     }
+  }
+
+  private var audioSettingsPanelOverlay: some View {
+    ZStack(alignment: .topTrailing) {
+      Color.black.opacity(0.001)
+        .ignoresSafeArea()
+        .contentShape(Rectangle())
+        .onTapGesture {
+          withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
+            isAudioSettingsPanelVisible = false
+          }
+        }
+
+      VStack(alignment: .trailing, spacing: 0) {
+        audioSettingsPanel
+      }
+      .padding(.top, 84)
+      .padding(.trailing, 18)
+    }
+    .transition(.move(edge: .top).combined(with: .opacity))
+  }
+
+  private var audioSettingsPanel: some View {
+    VStack(alignment: .leading, spacing: 14) {
+      Text("Audio")
+        .font(.system(size: 12, weight: .bold, design: .rounded))
+        .tracking(1.8)
+        .foregroundStyle(Color(red: 0.95, green: 0.88, blue: 0.73))
+
+      audioSettingsToggleRow(
+        title: "Music",
+        subtitle: "Background loop",
+        systemImage: "music.note",
+        isOn: Binding(
+          get: { !isMusicMuted },
+          set: { isEnabled in
+            AmbientMusicController.shared.setMuted(!isEnabled)
+            isMusicMuted = !isEnabled
+          }
+        )
+      )
+
+      audioSettingsToggleRow(
+        title: "SFX",
+        subtitle: "Moves and captures",
+        systemImage: "sparkles",
+        isOn: Binding(
+          get: { !isSoundEffectsMuted },
+          set: { isEnabled in
+            SoundEffectsController.shared.setMuted(!isEnabled)
+            isSoundEffectsMuted = !isEnabled
+          }
+        )
+      )
+    }
+    .padding(16)
+    .frame(width: 220, alignment: .leading)
+    .background(
+      RoundedRectangle(cornerRadius: 22, style: .continuous)
+        .fill(Color(red: 0.05, green: 0.08, blue: 0.12).opacity(0.94))
+        .overlay(
+          RoundedRectangle(cornerRadius: 22, style: .continuous)
+            .stroke(Color.white.opacity(0.14), lineWidth: 1)
+        )
+    )
+  }
+
+  private func audioSettingsToggleRow(
+    title: String,
+    subtitle: String,
+    systemImage: String,
+    isOn: Binding<Bool>
+  ) -> some View {
+    HStack(spacing: 12) {
+      Image(systemName: systemImage)
+        .font(.system(size: 14, weight: .bold))
+        .foregroundStyle(Color.white.opacity(0.90))
+        .frame(width: 22)
+
+      VStack(alignment: .leading, spacing: 2) {
+        Text(title)
+          .font(.system(size: 14, weight: .bold, design: .rounded))
+          .foregroundStyle(.white)
+
+        Text(subtitle)
+          .font(.system(size: 11, weight: .semibold, design: .rounded))
+          .foregroundStyle(Color.white.opacity(0.60))
+      }
+
+      Spacer(minLength: 12)
+
+      Toggle("", isOn: isOn)
+        .labelsHidden()
+        .tint(Color(red: 0.95, green: 0.88, blue: 0.73))
+    }
+  }
+
+  private var audioSettingsButtonIconName: String {
+    if isMusicMuted && isSoundEffectsMuted {
+      return "speaker.slash.fill"
+    }
+
+    if isMusicMuted || isSoundEffectsMuted {
+      return "speaker.wave.2.circle.fill"
+    }
+
+    return "speaker.wave.2.fill"
+  }
+
+  private var audioSettingsButtonBackgroundColor: Color {
+    if isAudioSettingsPanelVisible {
+      return Color(red: 0.20, green: 0.14, blue: 0.08).opacity(0.92)
+    }
+
+    if isMusicMuted && isSoundEffectsMuted {
+      return Color(red: 0.38, green: 0.18, blue: 0.18).opacity(0.88)
+    }
+
+    if isMusicMuted || isSoundEffectsMuted {
+      return Color(red: 0.32, green: 0.23, blue: 0.10).opacity(0.88)
+    }
+
+    return Color.black.opacity(0.54)
+  }
+
+  private func syncAudioPreferenceState() {
+    isMusicMuted = AmbientMusicController.shared.isMuted
+    isSoundEffectsMuted = SoundEffectsController.shared.isMuted
+  }
+
+  private func closeDeveloperPanels() {
+    isModePanelVisible = false
+    isMatchLogVisible = false
+    isGeminiDebugVisible = false
+    isVoiceStackVisible = false
+    isStockfishDebugVisible = false
+    isAudioSettingsPanelVisible = false
+    syncStockfishDebugVisibility()
   }
 
   private var reviewLoadingOverlay: some View {
@@ -14878,7 +15121,7 @@ private struct NativeARExperienceView: View {
       VStack {
         HStack {
           Spacer()
-          musicToggleButton
+          audioSettingsButton
         }
         .padding(.horizontal, 18)
         .padding(.top, 24)
@@ -14923,7 +15166,7 @@ private struct NativeARExperienceView: View {
       VStack {
         HStack {
           Spacer()
-          musicToggleButton
+          audioSettingsButton
         }
         .padding(.horizontal, 18)
         .padding(.top, 24)
@@ -15008,7 +15251,7 @@ private struct NativeARExperienceView: View {
           Spacer(minLength: 0)
 
           VStack(spacing: 10) {
-            musicToggleButton
+            audioSettingsButton
               .frame(width: 170)
 
             NativeActionButton(title: "Try again", style: .outline) {
@@ -16035,22 +16278,43 @@ private struct FishingRewardOverlay: View {
   @State private var selectedPage = 0
 
   var body: some View {
+    let noteWidth = min(UIScreen.main.bounds.width - 40, 360)
+    let noteHeight = min(UIScreen.main.bounds.height * 0.72, noteWidth * 1.42)
+
     ZStack {
       Color.black.opacity(0.56)
         .ignoresSafeArea()
         .onTapGesture(perform: onDismiss)
 
-      VStack(alignment: .leading, spacing: 16) {
-        header
-        pageViewer
+      VStack(spacing: rewardPages.count > 1 ? 14 : 0) {
+        TabView(selection: $selectedPage) {
+          ForEach(Array(rewardPages.enumerated()), id: \.element.id) { index, page in
+            FishingRewardPageCard(page: page)
+              .padding(.horizontal, 20)
+              .padding(.vertical, 22)
+              .tag(index)
+          }
+        }
+        .tabViewStyle(.page(indexDisplayMode: .never))
 
-        HStack(spacing: 12) {
-          NativeActionButton(title: "Cast again", style: .solid, action: onDismiss)
+        if rewardPages.count > 1 {
+          HStack(spacing: 8) {
+            ForEach(Array(rewardPages.enumerated()), id: \.element.id) { index, _ in
+              Capsule(style: .continuous)
+                .fill(
+                  index == selectedPage
+                    ? Color(red: 0.36, green: 0.26, blue: 0.18)
+                    : Color(red: 0.36, green: 0.26, blue: 0.18).opacity(0.22)
+                )
+                .frame(width: index == selectedPage ? 24 : 10, height: 8)
+            }
+          }
+          .padding(.bottom, 16)
         }
       }
-      .padding(24)
-      .background(cardBackground)
-      .padding(.horizontal, 24)
+      .frame(width: noteWidth, height: noteHeight)
+      .background(noteBackground)
+      .padding(.horizontal, 20)
     }
     .onAppear {
       selectedPage = 0
@@ -16058,76 +16322,6 @@ private struct FishingRewardOverlay: View {
     .onChange(of: rewardPages.count) { newCount in
       selectedPage = min(selectedPage, max(0, newCount - 1))
     }
-  }
-
-  private var header: some View {
-    HStack(alignment: .top, spacing: 12) {
-      VStack(alignment: .leading, spacing: 6) {
-        Text("Pond Reward")
-          .font(.system(size: 12, weight: .bold, design: .rounded))
-          .tracking(2.0)
-          .foregroundStyle(Color(red: 0.84, green: 0.91, blue: 0.96))
-
-        Text("Stockfish's note")
-          .font(.system(size: 28, weight: .heavy, design: .rounded))
-          .foregroundStyle(.white)
-
-        Text("Swipe through Stockfish's suggested move diagrams instead of reading a dry notation list.")
-          .font(.system(size: 15, weight: .semibold, design: .rounded))
-          .foregroundStyle(Color.white.opacity(0.78))
-          .lineSpacing(3)
-
-        if rewardPages.count > 1 {
-          Text("Page \(selectedPage + 1) of \(rewardPages.count)")
-            .font(.system(size: 11, weight: .bold, design: .rounded))
-            .tracking(1.6)
-            .foregroundStyle(Color(red: 0.92, green: 0.84, blue: 0.68))
-        }
-      }
-
-      Spacer(minLength: 12)
-
-      Button(action: onDismiss) {
-        Image(systemName: "xmark")
-          .font(.system(size: 14, weight: .bold))
-          .foregroundStyle(Color.white.opacity(0.88))
-          .frame(width: 38, height: 38)
-          .background(
-            Circle()
-              .fill(Color.white.opacity(0.08))
-          )
-      }
-      .buttonStyle(.plain)
-    }
-  }
-
-  private var pageViewer: some View {
-    VStack(spacing: 14) {
-      TabView(selection: $selectedPage) {
-        ForEach(Array(rewardPages.enumerated()), id: \.element.id) { index, page in
-          FishingRewardPageCard(page: page)
-            .padding(18)
-            .tag(index)
-        }
-      }
-      .tabViewStyle(.page(indexDisplayMode: .never))
-      .frame(height: min(UIScreen.main.bounds.height * 0.54, 430))
-
-      if rewardPages.count > 1 {
-        HStack(spacing: 8) {
-          ForEach(Array(rewardPages.enumerated()), id: \.element.id) { index, _ in
-            Capsule(style: .continuous)
-              .fill(
-                index == selectedPage
-                  ? Color(red: 0.36, green: 0.26, blue: 0.18)
-                  : Color(red: 0.36, green: 0.26, blue: 0.18).opacity(0.22)
-              )
-              .frame(width: index == selectedPage ? 26 : 10, height: 8)
-          }
-        }
-      }
-    }
-    .background(noteBackground)
   }
 
   private var noteBackground: some View {
@@ -16142,14 +16336,9 @@ private struct FishingRewardOverlay: View {
           endPoint: .bottomTrailing
         )
       )
-  }
-
-  private var cardBackground: some View {
-    RoundedRectangle(cornerRadius: 30, style: .continuous)
-      .fill(Color(red: 0.06, green: 0.11, blue: 0.15).opacity(0.94))
       .overlay(
-        RoundedRectangle(cornerRadius: 30, style: .continuous)
-          .stroke(Color.white.opacity(0.12), lineWidth: 1)
+        RoundedRectangle(cornerRadius: 26, style: .continuous)
+          .stroke(Color.white.opacity(0.18), lineWidth: 1)
       )
   }
 }
@@ -16158,45 +16347,43 @@ private struct FishingRewardPageCard: View {
   let page: FishingRewardPage
 
   var body: some View {
-    VStack(alignment: .leading, spacing: 14) {
-      VStack(alignment: .leading, spacing: 6) {
-        Text(page.title)
-          .font(.system(size: 12, weight: .bold, design: .rounded))
-          .tracking(1.8)
-          .foregroundStyle(Color(red: 0.44, green: 0.30, blue: 0.18))
-
-        Text(page.summary)
-          .font(.system(size: 20, weight: .heavy, design: .serif))
-          .foregroundStyle(Color(red: 0.16, green: 0.12, blue: 0.10))
-          .fixedSize(horizontal: false, vertical: true)
-
-        Text(page.detailText)
-          .font(.system(size: 13, weight: .semibold, design: .rounded))
-          .foregroundStyle(Color(red: 0.26, green: 0.20, blue: 0.16))
-          .lineSpacing(2)
-      }
+    VStack(spacing: 18) {
+      Text(page.summary)
+        .font(.system(size: 20, weight: .heavy, design: .serif))
+        .foregroundStyle(Color(red: 0.16, green: 0.12, blue: 0.10))
+        .multilineTextAlignment(.center)
+        .fixedSize(horizontal: false, vertical: true)
+        .frame(maxWidth: .infinity)
+        .padding(.top, 2)
 
       if let boardState = page.boardState {
+        Spacer(minLength: 0)
+
         FishingRewardBoardDiagram(
           state: boardState,
           perspective: page.perspective,
           fromSquare: page.fromSquare,
           toSquare: page.toSquare
         )
-        .frame(maxWidth: .infinity)
         .aspectRatio(1, contentMode: .fit)
-      } else {
-        FishingRewardEmptyPage(summary: page.summary, detailText: page.detailText)
-      }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
 
-      if let footerText = page.footerText {
-        Text(footerText)
-          .font(.system(size: 12, weight: .bold, design: .rounded))
-          .foregroundStyle(Color(red: 0.36, green: 0.28, blue: 0.20))
-          .lineSpacing(2)
+        Spacer(minLength: 0)
+      } else {
+        Spacer(minLength: 0)
+        FishingRewardEmptyPage(summary: page.summary)
+        Spacer(minLength: 0)
+
+        if let footerText = page.footerText {
+          Text(footerText)
+            .font(.system(size: 12, weight: .bold, design: .rounded))
+            .foregroundStyle(Color(red: 0.36, green: 0.28, blue: 0.20))
+            .lineSpacing(2)
+            .multilineTextAlignment(.center)
+        }
       }
     }
-    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
   }
 }
 
@@ -16241,6 +16428,7 @@ private struct FishingRewardBoardDiagram: View {
         .padding(14)
       }
       .frame(width: boardSize, height: boardSize)
+      .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
     }
   }
 }
@@ -16281,32 +16469,22 @@ private struct FishingRewardBoardSquare: View {
       }
 
       if let piece {
-        ZStack {
-          Circle()
-            .fill(
-              piece.color == .white
-                ? Color(red: 0.97, green: 0.95, blue: 0.89)
-                : Color(red: 0.19, green: 0.15, blue: 0.13)
-            )
-            .overlay(
-              Circle()
-                .stroke(
-                  piece.color == .white
-                    ? Color(red: 0.52, green: 0.39, blue: 0.26).opacity(0.55)
-                    : Color.white.opacity(0.12),
-                  lineWidth: max(size * 0.04, 1)
-                )
-            )
-
-          Text(fishingRewardPieceGlyph(for: piece))
-            .font(.system(size: size * 0.48, weight: .bold, design: .serif))
-            .foregroundStyle(
-              piece.color == .white
-                ? Color(red: 0.17, green: 0.13, blue: 0.11)
-                : Color(red: 0.96, green: 0.94, blue: 0.88)
-            )
-        }
-        .padding(size * 0.10)
+        Text(fishingRewardPieceGlyph(for: piece))
+          .font(.system(size: size * 0.60, weight: .regular, design: .serif))
+          .foregroundStyle(
+            piece.color == .white
+              ? Color(red: 0.95, green: 0.93, blue: 0.87)
+              : Color(red: 0.13, green: 0.10, blue: 0.09)
+          )
+          .shadow(
+            color: piece.color == .white
+              ? Color.black.opacity(0.18)
+              : Color.white.opacity(0.10),
+            radius: max(size * 0.01, 0.4),
+            x: 0,
+            y: max(size * 0.02, 0.6)
+          )
+          .frame(width: size, height: size)
       }
     }
     .frame(width: size, height: size)
@@ -16344,7 +16522,6 @@ private struct FishingRewardBoardSquare: View {
 
 private struct FishingRewardEmptyPage: View {
   let summary: String
-  let detailText: String
 
   var body: some View {
     VStack(spacing: 14) {
@@ -16356,12 +16533,6 @@ private struct FishingRewardEmptyPage: View {
         .font(.system(size: 19, weight: .heavy, design: .serif))
         .foregroundStyle(Color(red: 0.16, green: 0.12, blue: 0.10))
         .multilineTextAlignment(.center)
-
-      Text(detailText)
-        .font(.system(size: 13, weight: .semibold, design: .rounded))
-        .foregroundStyle(Color(red: 0.26, green: 0.20, blue: 0.16))
-        .multilineTextAlignment(.center)
-        .lineSpacing(2)
     }
     .frame(maxWidth: .infinity, maxHeight: .infinity)
     .padding(.horizontal, 12)
@@ -16407,74 +16578,18 @@ private struct DailyCosmeticRewardOverlay: View {
   let onDismiss: () -> Void
 
   var body: some View {
-    let modalSize = min(UIScreen.main.bounds.width - 36, 340)
+    let modalWidth = min(UIScreen.main.bounds.width - 44, 332)
+    let modalHeight = modalWidth * 1.18
 
     ZStack {
       Color.black.opacity(0.64)
         .ignoresSafeArea()
         .onTapGesture(perform: onDismiss)
 
-      VStack(spacing: 0) {
-        VStack(spacing: 14) {
-          Text("Daily Cosmetic")
-            .font(.system(size: 12, weight: .black, design: .rounded))
-            .tracking(2.0)
-            .foregroundStyle(Color(red: 0.96, green: 0.86, blue: 0.66))
-
-          CosmeticRewardPreviewTile(reward: reward)
-            .frame(width: modalSize * 0.58, height: modalSize * 0.58)
-
-          VStack(spacing: 6) {
-            Text(reward.displayName)
-              .font(.system(size: 24, weight: .heavy, design: .rounded))
-              .foregroundStyle(.white)
-              .multilineTextAlignment(.center)
-
-            Text("\(reward.targetPiece.displayName) cosmetic • \(reward.rarityLabel)")
-              .font(.system(size: 13, weight: .bold, design: .rounded))
-              .foregroundStyle(Color.white.opacity(0.76))
-
-            Text("New cosmetic unlocked!")
-              .font(.system(size: 14, weight: .black, design: .rounded))
-              .foregroundStyle(Color(red: 0.96, green: 0.86, blue: 0.66))
-
-            Text(reward.flavorText)
-              .font(.system(size: 13, weight: .semibold, design: .rounded))
-              .foregroundStyle(Color.white.opacity(0.82))
-              .multilineTextAlignment(.center)
-              .lineSpacing(2)
-              .frame(maxWidth: modalSize * 0.78)
-          }
-        }
-        .frame(maxWidth: .infinity)
-        .padding(.top, 22)
-        .padding(.horizontal, 18)
-
-        Spacer(minLength: 12)
-
-        NativeActionButton(title: "Collect", style: .solid, action: onDismiss)
-          .padding(.horizontal, 18)
-          .padding(.bottom, 18)
-      }
-      .frame(width: modalSize, height: modalSize)
-      .background(
-        RoundedRectangle(cornerRadius: 32, style: .continuous)
-          .fill(
-            LinearGradient(
-              colors: [
-                Color(red: 0.07, green: 0.11, blue: 0.15),
-                Color(red: 0.04, green: 0.06, blue: 0.09),
-              ],
-              startPoint: .topLeading,
-              endPoint: .bottomTrailing
-            )
-          )
-          .overlay(
-            RoundedRectangle(cornerRadius: 32, style: .continuous)
-              .stroke(Color.white.opacity(0.12), lineWidth: 1)
-          )
-      )
-      .padding(.horizontal, 18)
+      CosmeticRewardPreviewTile(reward: reward)
+        .frame(width: modalWidth, height: modalHeight)
+        .padding(.horizontal, 22)
+        .onTapGesture(perform: onDismiss)
     }
   }
 }
@@ -16493,9 +16608,10 @@ private struct CosmeticRewardPreviewTile: View {
           LinearGradient(
             colors: [
               background,
-              accent.opacity(0.92),
+              background.opacity(0.92),
+              accent.opacity(0.96),
             ],
-            startPoint: .topLeading,
+            startPoint: .top,
             endPoint: .bottomTrailing
           )
         )
@@ -16503,62 +16619,111 @@ private struct CosmeticRewardPreviewTile: View {
       RoundedRectangle(cornerRadius: 28, style: .continuous)
         .stroke(Color.white.opacity(0.18), lineWidth: 1)
 
-      VStack(alignment: .leading, spacing: 12) {
-        HStack(alignment: .top) {
-          Text(reward.rarityLabel.uppercased())
-            .font(.system(size: 10, weight: .black, design: .rounded))
-            .tracking(1.4)
-            .foregroundStyle(Color.white.opacity(0.88))
-            .padding(.horizontal, 10)
-            .padding(.vertical, 6)
-            .background(
-              Capsule(style: .continuous)
-                .fill(Color.black.opacity(0.18))
-            )
+      RoundedRectangle(cornerRadius: 28, style: .continuous)
+        .fill(
+          LinearGradient(
+            colors: [
+              Color.white.opacity(0.12),
+              Color.clear,
+              Color.black.opacity(0.12),
+            ],
+            startPoint: .topLeading,
+            endPoint: .bottomTrailing
+          )
+        )
 
-          Spacer(minLength: 12)
+      VStack(spacing: 18) {
+        Text("Daily Cosmetic")
+          .font(.system(size: 12, weight: .black, design: .rounded))
+          .tracking(2.2)
+          .foregroundStyle(detail.opacity(0.96))
 
-          HStack(spacing: 6) {
-            Text(cosmeticRewardTargetGlyph(for: reward.targetPiece))
-              .font(.system(size: 18, weight: .bold, design: .serif))
-            Text(reward.targetPiece.displayName)
-              .font(.system(size: 11, weight: .black, design: .rounded))
-          }
-          .foregroundStyle(detail.opacity(0.95))
-          .padding(.horizontal, 10)
-          .padding(.vertical, 6)
-          .background(
-            Capsule(style: .continuous)
-              .fill(Color.white.opacity(0.16))
+        HStack(spacing: 10) {
+          cosmeticRewardBadge(
+            title: reward.rarityLabel.uppercased(),
+            foreground: Color.white.opacity(0.96),
+            background: Color.black.opacity(0.18)
+          )
+
+          cosmeticRewardBadge(
+            title: "\(cosmeticRewardTargetGlyph(for: reward.targetPiece)) \(reward.targetPiece.displayName)",
+            foreground: detail.opacity(0.98),
+            background: Color.white.opacity(0.18)
           )
         }
 
-        Spacer(minLength: 0)
+        ZStack {
+          Circle()
+            .fill(Color.white.opacity(0.16))
+            .frame(width: 136, height: 136)
 
-        HStack {
-          Spacer(minLength: 0)
+          Circle()
+            .stroke(Color.white.opacity(0.12), lineWidth: 1)
+            .frame(width: 136, height: 136)
 
-          ZStack {
-            Circle()
-              .fill(Color.white.opacity(0.14))
-              .frame(width: 108, height: 108)
+          Text(reward.previewGlyph)
+            .font(.system(size: 72))
+        }
+        .padding(.top, 2)
 
-            Text(reward.previewGlyph)
-              .font(.system(size: 58))
-          }
+        VStack(spacing: 8) {
+          Text(reward.displayName)
+            .font(.system(size: 31, weight: .heavy, design: .rounded))
+            .foregroundStyle(.white)
+            .multilineTextAlignment(.center)
+            .minimumScaleFactor(0.74)
+            .lineLimit(2)
 
-          Spacer(minLength: 0)
+          Text("\(reward.targetPiece.displayName) cosmetic • \(reward.rarityLabel)")
+            .font(.system(size: 14, weight: .bold, design: .rounded))
+            .foregroundStyle(Color.white.opacity(0.78))
+            .multilineTextAlignment(.center)
+
+          Text("New cosmetic unlocked!")
+            .font(.system(size: 15, weight: .black, design: .rounded))
+            .foregroundStyle(detail)
+            .multilineTextAlignment(.center)
+
+          Text(reward.flavorText)
+            .font(.system(size: 14, weight: .semibold, design: .rounded))
+            .foregroundStyle(Color.white.opacity(0.84))
+            .multilineTextAlignment(.center)
+            .lineSpacing(3)
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(.top, 4)
         }
 
         Spacer(minLength: 0)
 
-        Text(reward.displayName.uppercased())
-          .font(.system(size: 15, weight: .black, design: .rounded))
-          .tracking(1.6)
-          .foregroundStyle(detail)
+        Text("Tap anywhere to continue")
+          .font(.system(size: 12, weight: .bold, design: .rounded))
+          .tracking(1.4)
+          .foregroundStyle(Color.white.opacity(0.70))
+          .multilineTextAlignment(.center)
       }
-      .padding(18)
+      .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+      .padding(.horizontal, 24)
+      .padding(.vertical, 24)
     }
+  }
+
+  private func cosmeticRewardBadge(
+    title: String,
+    foreground: Color,
+    background: Color
+  ) -> some View {
+    Text(title)
+      .font(.system(size: 11, weight: .black, design: .rounded))
+      .tracking(1.1)
+      .foregroundStyle(foreground)
+      .lineLimit(1)
+      .minimumScaleFactor(0.70)
+      .padding(.horizontal, 12)
+      .padding(.vertical, 8)
+      .background(
+        Capsule(style: .continuous)
+          .fill(background)
+      )
   }
 
   private func cosmeticRewardTargetGlyph(for piece: ChessPieceKind) -> String {
