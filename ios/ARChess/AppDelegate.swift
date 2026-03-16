@@ -418,6 +418,7 @@ private enum ExperienceMode: Hashable {
 
 private enum NativeScreen {
   case modeSelection
+  case cosmeticsCreator
   case course
   case stockfishSetup
   case landing
@@ -12312,7 +12313,12 @@ private struct ARChessRootView: View {
       case .modeSelection:
         ModeSelectionView(
           selectedNarrator: $selectedNarrator,
-          isDailyCosmeticDevModeEnabled: $isDailyCosmeticDevModeEnabled
+          isDailyCosmeticDevModeEnabled: $isDailyCosmeticDevModeEnabled,
+          openCosmeticsCreator: {
+            withAnimation(.spring(response: 0.42, dampingFraction: 0.88)) {
+              screen = .cosmeticsCreator
+            }
+          }
         ) { mode in
           withAnimation(.spring(response: 0.42, dampingFraction: 0.88)) {
             switch mode {
@@ -12325,6 +12331,12 @@ private struct ARChessRootView: View {
             case .playVsStockfish:
               screen = .stockfishSetup
             }
+          }
+        }
+      case .cosmeticsCreator:
+        CosmeticsCreatorView {
+          withAnimation(.spring(response: 0.42, dampingFraction: 0.88)) {
+            screen = .modeSelection
           }
         }
       case .course:
@@ -12584,6 +12596,7 @@ private struct ModeSelectionView: View {
   @AppStorage("archess.ui.hideDeveloperButtons") private var hidesDeveloperButtons = false
   @Binding var selectedNarrator: NarratorType
   @Binding var isDailyCosmeticDevModeEnabled: Bool
+  let openCosmeticsCreator: () -> Void
   let onSelect: (PlayModeChoice) -> Void
   @State private var isPiperAuditionPresented = false
   @State private var selectedTab: MenuSelectionTab = .play
@@ -12649,8 +12662,12 @@ private struct ModeSelectionView: View {
     HStack(spacing: 10) {
       ForEach(MenuSelectionTab.allCases) { tab in
         Button {
-          withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
-            selectedTab = tab
+          if tab == .cosmetics {
+            openCosmeticsCreator()
+          } else {
+            withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
+              selectedTab = tab
+            }
           }
         } label: {
           Text(tab.title)
@@ -13992,10 +14009,324 @@ private struct QueueMatchView: View {
   }
 }
 
+private enum PieceCosmeticCategory: String, CaseIterable, Hashable, Identifiable {
+  case hats
+  case armor
+  case face
+  case back
+
+  var id: String { rawValue }
+
+  var displayName: String {
+    switch self {
+    case .hats:
+      return "Hats"
+    case .armor:
+      return "Armor"
+    case .face:
+      return "Face"
+    case .back:
+      return "Back"
+    }
+  }
+
+  var slot: PieceCosmeticSlot {
+    switch self {
+    case .hats:
+      return .headwear
+    case .armor:
+      return .bodywear
+    case .face:
+      return .facewear
+    case .back:
+      return .backwear
+    }
+  }
+
+  var systemImageName: String {
+    switch self {
+    case .hats:
+      return "theatermasks"
+    case .armor:
+      return "shield.fill"
+    case .face:
+      return "eye"
+    case .back:
+      return "flag.fill"
+    }
+  }
+}
+
+private enum PieceCosmeticSlot: String, CaseIterable, Hashable {
+  case headwear
+  case bodywear
+  case facewear
+  case backwear
+
+  var displayName: String {
+    switch self {
+    case .headwear:
+      return "Headwear"
+    case .bodywear:
+      return "Bodywear"
+    case .facewear:
+      return "Facewear"
+    case .backwear:
+      return "Backwear"
+    }
+  }
+}
+
+private struct PieceCosmeticLoadout: Hashable {
+  var equippedIDsBySlot: [PieceCosmeticSlot: String] = [:]
+
+  static let empty = PieceCosmeticLoadout()
+
+  var signature: String {
+    equippedIDsBySlot
+      .sorted { $0.key.rawValue < $1.key.rawValue }
+      .map { "\($0.key.rawValue)=\($0.value)" }
+      .joined(separator: "|")
+  }
+
+  func equippedID(for slot: PieceCosmeticSlot) -> String? {
+    equippedIDsBySlot[slot]
+  }
+
+  func equipping(_ cosmetic: PieceCosmeticReward) -> PieceCosmeticLoadout {
+    var updated = self
+    updated.equippedIDsBySlot[cosmetic.slot] = cosmetic.id
+    return updated
+  }
+
+  func removing(slot: PieceCosmeticSlot) -> PieceCosmeticLoadout {
+    var updated = self
+    updated.equippedIDsBySlot.removeValue(forKey: slot)
+    return updated
+  }
+}
+
+private struct PieceCosmeticLoadoutKey: Hashable {
+  let pieceKind: ChessPieceKind
+  let color: ChessColor
+
+  var storageKey: String {
+    "\(pieceKind.storageKey)__\(color.storageKey)"
+  }
+
+  init(pieceKind: ChessPieceKind, color: ChessColor) {
+    self.pieceKind = pieceKind
+    self.color = color
+  }
+
+  init?(storageKey: String) {
+    let components = storageKey.components(separatedBy: "__")
+    guard components.count == 2 else {
+      return nil
+    }
+
+    guard let pieceKind = ChessPieceKind(storageKey: components[0]),
+          let color = ChessColor(storageKey: components[1]) else {
+      return nil
+    }
+
+    self.init(pieceKind: pieceKind, color: color)
+  }
+}
+
+private final class PieceCosmeticsPersistenceManager {
+  private enum Keys {
+    static let unlockedIDs = "archess.cosmetics.unlockedIDs"
+    static let legacyUnlockedIDs = "archess.dailyCosmetic.unlockedIDs"
+    static let equippedLoadouts = "archess.cosmetics.equippedLoadouts"
+    static let lastViewedPiece = "archess.cosmetics.lastViewedPiece"
+    static let lastViewedColor = "archess.cosmetics.lastViewedColor"
+  }
+
+  private let defaults = UserDefaults.standard
+
+  func loadUnlockedIDs() -> Set<String> {
+    let stored = defaults.stringArray(forKey: Keys.unlockedIDs)
+    if let stored {
+      return Set(stored)
+    }
+
+    let legacy = Set(defaults.stringArray(forKey: Keys.legacyUnlockedIDs) ?? [])
+    if !legacy.isEmpty {
+      saveUnlockedIDs(legacy)
+    }
+    return legacy
+  }
+
+  func saveUnlockedIDs(_ ids: Set<String>) {
+    defaults.set(Array(ids).sorted(), forKey: Keys.unlockedIDs)
+  }
+
+  func loadLoadouts() -> [PieceCosmeticLoadoutKey: PieceCosmeticLoadout] {
+    guard let persisted = defaults.dictionary(forKey: Keys.equippedLoadouts) as? [String: [String: String]] else {
+      return [:]
+    }
+
+    var decoded: [PieceCosmeticLoadoutKey: PieceCosmeticLoadout] = [:]
+    for (storageKey, slots) in persisted {
+      guard let key = PieceCosmeticLoadoutKey(storageKey: storageKey) else {
+        continue
+      }
+
+      var loadout = PieceCosmeticLoadout.empty
+      for (slotKey, cosmeticID) in slots {
+        guard let slot = PieceCosmeticSlot(rawValue: slotKey) else {
+          continue
+        }
+        loadout.equippedIDsBySlot[slot] = cosmeticID
+      }
+      decoded[key] = loadout
+    }
+
+    return decoded
+  }
+
+  func saveLoadouts(_ loadouts: [PieceCosmeticLoadoutKey: PieceCosmeticLoadout]) {
+    let encoded = Dictionary(
+      uniqueKeysWithValues: loadouts.map { element in
+        let key = element.key
+        let loadout = element.value
+        let slots = Dictionary(
+          uniqueKeysWithValues: loadout.equippedIDsBySlot.map { slotEntry in
+            (slotEntry.key.rawValue, slotEntry.value)
+          }
+        )
+        return (key.storageKey, slots)
+      }
+    )
+    defaults.set(encoded, forKey: Keys.equippedLoadouts)
+  }
+
+  func loadLastViewedPieceKind() -> ChessPieceKind? {
+    guard let rawValue = defaults.string(forKey: Keys.lastViewedPiece) else {
+      return nil
+    }
+    return ChessPieceKind(storageKey: rawValue)
+  }
+
+  func saveLastViewedPieceKind(_ pieceKind: ChessPieceKind) {
+    defaults.set(pieceKind.storageKey, forKey: Keys.lastViewedPiece)
+  }
+
+  func loadLastViewedColor() -> ChessColor? {
+    guard let rawValue = defaults.string(forKey: Keys.lastViewedColor) else {
+      return nil
+    }
+    return ChessColor(storageKey: rawValue)
+  }
+
+  func saveLastViewedColor(_ color: ChessColor) {
+    defaults.set(color.storageKey, forKey: Keys.lastViewedColor)
+  }
+}
+
+@MainActor
+private final class PieceCosmeticsStore: ObservableObject {
+  static let shared = PieceCosmeticsStore()
+
+  @Published private(set) var unlockedCosmeticIDs: Set<String>
+  @Published private(set) var equippedLoadouts: [PieceCosmeticLoadoutKey: PieceCosmeticLoadout]
+  @Published private(set) var lastViewedPieceKind: ChessPieceKind
+  @Published private(set) var lastViewedColor: ChessColor
+
+  private let persistence = PieceCosmeticsPersistenceManager()
+
+  private init() {
+    unlockedCosmeticIDs = persistence.loadUnlockedIDs()
+    equippedLoadouts = persistence.loadLoadouts()
+    lastViewedPieceKind = persistence.loadLastViewedPieceKind() ?? .pawn
+    lastViewedColor = persistence.loadLastViewedColor() ?? .white
+  }
+
+  var allCosmetics: [PieceCosmeticReward] {
+    PieceCosmeticReward.mockPool
+  }
+
+  func availableCategories(for pieceKind: ChessPieceKind) -> [PieceCosmeticCategory] {
+    let categories = allCosmetics
+      .filter { $0.targetPiece == pieceKind }
+      .map(\.category)
+    return PieceCosmeticCategory.allCases.filter(categories.contains)
+  }
+
+  func cosmetics(for pieceKind: ChessPieceKind, category: PieceCosmeticCategory) -> [PieceCosmeticReward] {
+    allCosmetics.filter { $0.targetPiece == pieceKind && $0.category == category }
+  }
+
+  func cosmeticDefinition(id: String) -> PieceCosmeticReward? {
+    allCosmetics.first { $0.id == id }
+  }
+
+  func isUnlocked(_ cosmetic: PieceCosmeticReward) -> Bool {
+    unlockedCosmeticIDs.contains(cosmetic.id)
+  }
+
+  func unlock(_ cosmetic: PieceCosmeticReward) {
+    guard !unlockedCosmeticIDs.contains(cosmetic.id) else {
+      return
+    }
+
+    unlockedCosmeticIDs.insert(cosmetic.id)
+    persistence.saveUnlockedIDs(unlockedCosmeticIDs)
+  }
+
+  func loadout(for pieceKind: ChessPieceKind, color: ChessColor) -> PieceCosmeticLoadout {
+    equippedLoadouts[PieceCosmeticLoadoutKey(pieceKind: pieceKind, color: color)] ?? .empty
+  }
+
+  func activeCosmetics(for pieceKind: ChessPieceKind, color: ChessColor) -> [PieceCosmeticReward] {
+    loadout(for: pieceKind, color: color)
+      .equippedIDsBySlot
+      .values
+      .compactMap { cosmeticDefinition(id: $0) }
+  }
+
+  func equip(_ cosmetic: PieceCosmeticReward, for pieceKind: ChessPieceKind, color: ChessColor) {
+    guard cosmetic.targetPiece == pieceKind else {
+      return
+    }
+
+    let key = PieceCosmeticLoadoutKey(pieceKind: pieceKind, color: color)
+    equippedLoadouts[key] = loadout(for: pieceKind, color: color).equipping(cosmetic)
+    persistence.saveLoadouts(equippedLoadouts)
+  }
+
+  func unequip(slot: PieceCosmeticSlot, for pieceKind: ChessPieceKind, color: ChessColor) {
+    let key = PieceCosmeticLoadoutKey(pieceKind: pieceKind, color: color)
+    equippedLoadouts[key] = loadout(for: pieceKind, color: color).removing(slot: slot)
+    persistence.saveLoadouts(equippedLoadouts)
+  }
+
+  func setLastViewed(pieceKind: ChessPieceKind) {
+    guard lastViewedPieceKind != pieceKind else {
+      return
+    }
+
+    lastViewedPieceKind = pieceKind
+    persistence.saveLastViewedPieceKind(pieceKind)
+  }
+
+  func setLastViewed(color: ChessColor) {
+    guard lastViewedColor != color else {
+      return
+    }
+
+    lastViewedColor = color
+    persistence.saveLastViewedColor(color)
+  }
+}
+
 private struct PieceCosmeticReward: Identifiable {
   let id: String
   let displayName: String
   let targetPiece: ChessPieceKind
+  let category: PieceCosmeticCategory
+  let slot: PieceCosmeticSlot
   let previewGlyph: String
   let flavorText: String
   let rarityLabel: String
@@ -14008,6 +14339,8 @@ private struct PieceCosmeticReward: Identifiable {
       id: "king-cowboy-hat",
       displayName: "Cowboy Hat",
       targetPiece: .king,
+      category: .hats,
+      slot: .headwear,
       previewGlyph: "🤠",
       flavorText: "The king finally looks like he runs the frontier.",
       rarityLabel: "Legendary",
@@ -14019,6 +14352,8 @@ private struct PieceCosmeticReward: Identifiable {
       id: "bishop-wizard-hat",
       displayName: "Wizard Hat",
       targetPiece: .bishop,
+      category: .hats,
+      slot: .headwear,
       previewGlyph: "🧙",
       flavorText: "A little mysticism goes a long way on diagonals.",
       rarityLabel: "Epic",
@@ -14030,6 +14365,8 @@ private struct PieceCosmeticReward: Identifiable {
       id: "knight-golden-armor",
       displayName: "Golden Armor",
       targetPiece: .knight,
+      category: .armor,
+      slot: .bodywear,
       previewGlyph: "🛡",
       flavorText: "Polished enough to blind anything it forks.",
       rarityLabel: "Rare",
@@ -14041,6 +14378,8 @@ private struct PieceCosmeticReward: Identifiable {
       id: "rook-bandit-mask",
       displayName: "Bandit Mask",
       targetPiece: .rook,
+      category: .face,
+      slot: .facewear,
       previewGlyph: "🥷",
       flavorText: "For silent file pressure and very loud captures.",
       rarityLabel: "Rare",
@@ -14052,6 +14391,8 @@ private struct PieceCosmeticReward: Identifiable {
       id: "queen-tiny-cape",
       displayName: "Tiny Cape",
       targetPiece: .queen,
+      category: .back,
+      slot: .backwear,
       previewGlyph: "🦸",
       flavorText: "Dramatic enough for the most overpowered piece on the board.",
       rarityLabel: "Epic",
@@ -14063,6 +14404,8 @@ private struct PieceCosmeticReward: Identifiable {
       id: "pawn-miner-helmet",
       displayName: "Miner Helmet",
       targetPiece: .pawn,
+      category: .hats,
+      slot: .headwear,
       previewGlyph: "⛏",
       flavorText: "Built for the pawns that keep grinding through the dirt.",
       rarityLabel: "Uncommon",
@@ -14080,24 +14423,20 @@ private enum DailyCosmeticRewardClaimOutcome {
 
 @MainActor
 private final class DailyCosmeticRewardStore: ObservableObject {
-  private static let unlockedCosmeticIDsDefaultsKey = "archess.dailyCosmetic.unlockedIDs"
   private static let lastClaimDateDefaultsKey = "archess.dailyCosmetic.lastClaimDate"
 
   @Published private(set) var presentedReward: PieceCosmeticReward?
   @Published private(set) var statusMessage: String?
-  @Published private(set) var unlockedCosmeticIDs: Set<String>
 
   private let defaults = UserDefaults.standard
   private let calendar = Calendar.autoupdatingCurrent
+  private let cosmetics = PieceCosmeticsStore.shared
   private var lastClaimDate: Date?
   private var isDevModeEnabled = false
   private var isDispenseInFlight = false
   private var statusMessageTask: Task<Void, Never>?
 
   init() {
-    unlockedCosmeticIDs = Set(
-      defaults.stringArray(forKey: Self.unlockedCosmeticIDsDefaultsKey) ?? []
-    )
     lastClaimDate = defaults.object(forKey: Self.lastClaimDateDefaultsKey) as? Date
   }
 
@@ -14125,7 +14464,7 @@ private final class DailyCosmeticRewardStore: ObservableObject {
     }
 
     let availableRewards = PieceCosmeticReward.mockPool.filter { reward in
-      !unlockedCosmeticIDs.contains(reward.id)
+      !cosmetics.isUnlocked(reward)
     }
     let rewardPool = availableRewards.isEmpty ? PieceCosmeticReward.mockPool : availableRewards
     guard let reward = rewardPool.randomElement() else {
@@ -14135,8 +14474,7 @@ private final class DailyCosmeticRewardStore: ObservableObject {
     }
 
     isDispenseInFlight = true
-    unlockedCosmeticIDs.insert(reward.id)
-    defaults.set(Array(unlockedCosmeticIDs).sorted(), forKey: Self.unlockedCosmeticIDsDefaultsKey)
+    cosmetics.unlock(reward)
     lastClaimDate = now
     defaults.set(now, forKey: Self.lastClaimDateDefaultsKey)
     clearStatusMessage()
@@ -14175,6 +14513,1442 @@ private final class DailyCosmeticRewardStore: ObservableObject {
     statusMessageTask?.cancel()
     statusMessageTask = nil
     statusMessage = nil
+  }
+}
+
+@MainActor
+private final class CosmeticsCreatorRoomStore: ObservableObject {
+  @Published var selectedPieceKind: ChessPieceKind
+  @Published var selectedColor: ChessColor
+  @Published var selectedCategory: PieceCosmeticCategory
+  @Published var previewYaw: Float
+  @Published var previewPitch: Float
+  @Published private(set) var statusText: String?
+
+  private let cosmetics: PieceCosmeticsStore
+  private let defaultYaw: Float = -.pi / 6
+  private let defaultPitch: Float = -.pi / 18
+  private var dragStartYaw: Float = 0
+  private var dragStartPitch: Float = 0
+  private var isDragging = false
+  private var statusTask: Task<Void, Never>?
+
+  init(cosmetics: PieceCosmeticsStore) {
+    self.cosmetics = cosmetics
+    let initialPiece = cosmetics.lastViewedPieceKind
+    let initialColor = cosmetics.lastViewedColor
+    let categories = cosmetics.availableCategories(for: initialPiece)
+    selectedPieceKind = initialPiece
+    selectedColor = initialColor
+    selectedCategory = categories.first ?? .hats
+    previewYaw = defaultYaw
+    previewPitch = defaultPitch
+  }
+
+  deinit {
+    statusTask?.cancel()
+  }
+
+  var availableCategories: [PieceCosmeticCategory] {
+    cosmetics.availableCategories(for: selectedPieceKind)
+  }
+
+  var visibleCosmetics: [PieceCosmeticReward] {
+    cosmetics.cosmetics(for: selectedPieceKind, category: selectedCategory)
+  }
+
+  var currentLoadout: PieceCosmeticLoadout {
+    cosmetics.loadout(for: selectedPieceKind, color: selectedColor)
+  }
+
+  var currentLoadoutSignature: String {
+    currentLoadout.signature
+  }
+
+  func setPieceKind(_ pieceKind: ChessPieceKind) {
+    guard selectedPieceKind != pieceKind else {
+      return
+    }
+
+    selectedPieceKind = pieceKind
+    cosmetics.setLastViewed(pieceKind: pieceKind)
+    ensureSelectedCategoryIsValid()
+  }
+
+  func setColor(_ color: ChessColor) {
+    guard selectedColor != color else {
+      return
+    }
+
+    selectedColor = color
+    cosmetics.setLastViewed(color: color)
+  }
+
+  func setCategory(_ category: PieceCosmeticCategory) {
+    guard selectedCategory != category else {
+      return
+    }
+
+    selectedCategory = category
+  }
+
+  func isUnlocked(_ cosmetic: PieceCosmeticReward) -> Bool {
+    cosmetics.isUnlocked(cosmetic)
+  }
+
+  func isEquipped(_ cosmetic: PieceCosmeticReward) -> Bool {
+    currentLoadout.equippedID(for: cosmetic.slot) == cosmetic.id
+  }
+
+  func equip(_ cosmetic: PieceCosmeticReward) {
+    guard cosmetic.targetPiece == selectedPieceKind else {
+      return
+    }
+
+    guard cosmetics.isUnlocked(cosmetic) else {
+      showStatus("Unlock \(cosmetic.displayName) from the vending machine first.")
+      return
+    }
+
+    cosmetics.equip(cosmetic, for: selectedPieceKind, color: selectedColor)
+    showStatus("\(cosmetic.displayName) equipped for \(selectedPieceKind.displayName) \(selectedColor.displayName.lowercased()).")
+    objectWillChange.send()
+  }
+
+  func clearSelectedCategory() {
+    cosmetics.unequip(slot: selectedCategory.slot, for: selectedPieceKind, color: selectedColor)
+    showStatus("\(selectedCategory.displayName) cleared.")
+    objectWillChange.send()
+  }
+
+  func beginRotationGestureIfNeeded() {
+    guard !isDragging else {
+      return
+    }
+
+    isDragging = true
+    dragStartYaw = previewYaw
+    dragStartPitch = previewPitch
+  }
+
+  func updateRotation(translation: CGSize) {
+    beginRotationGestureIfNeeded()
+    previewYaw = dragStartYaw + Float(translation.width) * 0.0105
+    previewPitch = clamp(
+      dragStartPitch - (Float(translation.height) * 0.0065),
+      min: -.pi / 5.2,
+      max: .pi / 8.8
+    )
+  }
+
+  func endRotationGesture() {
+    isDragging = false
+  }
+
+  func resetView() {
+    previewYaw = defaultYaw
+    previewPitch = defaultPitch
+  }
+
+  private func ensureSelectedCategoryIsValid() {
+    let categories = availableCategories
+    if !categories.contains(selectedCategory) {
+      selectedCategory = categories.first ?? .hats
+    }
+  }
+
+  private func showStatus(_ message: String) {
+    statusTask?.cancel()
+    statusText = message
+    statusTask = Task { @MainActor [weak self] in
+      try? await Task.sleep(nanoseconds: 1_800_000_000)
+      guard let self, !Task.isCancelled else {
+        return
+      }
+      self.statusText = nil
+    }
+  }
+
+  private func clamp(_ value: Float, min lower: Float, max upper: Float) -> Float {
+    Swift.max(lower, Swift.min(upper, value))
+  }
+}
+
+private enum ChessPieceVisualFactory {
+  private struct PrototypeKey: Hashable {
+    let kind: ChessPieceKind
+    let color: ChessColor
+    let isGhost: Bool
+  }
+
+  private struct AttachmentProfile {
+    let headPosition: SIMD3<Float>
+    let facePosition: SIMD3<Float>
+    let bodyPosition: SIMD3<Float>
+    let backPosition: SIMD3<Float>
+    let headScale: Float
+    let bodyScale: Float
+    let faceScale: Float
+    let backScale: Float
+  }
+
+  private static var prototypeCache: [PrototypeKey: Entity] = [:]
+
+  static func piecePrototype(
+    for kind: ChessPieceKind,
+    color: ChessColor,
+    isGhost: Bool = false
+  ) -> Entity {
+    let key = PrototypeKey(kind: kind, color: color, isGhost: isGhost)
+    if let cached = prototypeCache[key] {
+      return cached
+    }
+
+    let material = isGhost ? ghostPieceMaterial(for: color) : pieceMaterial(for: color)
+    let prototype = makePieceEntity(kind: kind, material: material)
+    if !isGhost {
+      prototype.generateCollisionShapes(recursive: true)
+    }
+    prototypeCache[key] = prototype
+    return prototype
+  }
+
+  static func makeEquippedPieceEntity(
+    kind: ChessPieceKind,
+    color: ChessColor,
+    loadout: PieceCosmeticLoadout,
+    cosmetics: PieceCosmeticsStore = .shared
+  ) -> Entity {
+    let piece = piecePrototype(for: kind, color: color).clone(recursive: true)
+    applyCosmetics(loadout, to: piece, pieceKind: kind, color: color, cosmetics: cosmetics)
+    return piece
+  }
+
+  static func applyCosmetics(
+    _ loadout: PieceCosmeticLoadout,
+    to pieceEntity: Entity,
+    pieceKind: ChessPieceKind,
+    color: ChessColor,
+    cosmetics: PieceCosmeticsStore = .shared
+  ) {
+    pieceEntity.findEntity(named: "piece_cosmetic_container")?.removeFromParent()
+
+    guard !loadout.equippedIDsBySlot.isEmpty else {
+      return
+    }
+
+    let container = Entity()
+    container.name = "piece_cosmetic_container"
+    pieceEntity.addChild(container)
+
+    let orderedSlots = PieceCosmeticSlot.allCases
+    for slot in orderedSlots {
+      guard let cosmeticID = loadout.equippedIDsBySlot[slot],
+            let cosmetic = cosmetics.cosmeticDefinition(id: cosmeticID),
+            let cosmeticEntity = cosmeticEntity(for: cosmetic, pieceKind: pieceKind, color: color) else {
+        continue
+      }
+      cosmeticEntity.name = "equipped_cosmetic_\(cosmetic.id)"
+      container.addChild(cosmeticEntity)
+    }
+  }
+
+  private static func cosmeticEntity(
+    for cosmetic: PieceCosmeticReward,
+    pieceKind: ChessPieceKind,
+    color: ChessColor
+  ) -> Entity? {
+    let profile = attachmentProfile(for: pieceKind)
+    let detailColor = cosmetic.previewDetailColor
+    let accentColor = cosmetic.previewAccentColor
+    let baseColor = cosmetic.previewBackgroundColor
+
+    let anchor = Entity()
+    switch cosmetic.id {
+    case "king-cowboy-hat":
+      anchor.position = profile.headPosition
+      anchor.scale = SIMD3<Float>(repeating: profile.headScale)
+      anchor.addChild(makeCowboyHatEntity(baseColor: baseColor, accentColor: accentColor, detailColor: detailColor))
+    case "bishop-wizard-hat":
+      anchor.position = profile.headPosition + SIMD3<Float>(0, 0.003, 0)
+      anchor.scale = SIMD3<Float>(repeating: profile.headScale * 1.04)
+      anchor.addChild(makeWizardHatEntity(baseColor: baseColor, accentColor: accentColor, detailColor: detailColor))
+    case "knight-golden-armor":
+      anchor.position = profile.bodyPosition
+      anchor.scale = SIMD3<Float>(repeating: profile.bodyScale)
+      anchor.addChild(makeGoldenArmorEntity(accentColor: accentColor, detailColor: detailColor))
+    case "rook-bandit-mask":
+      anchor.position = profile.facePosition
+      anchor.scale = SIMD3<Float>(repeating: profile.faceScale)
+      anchor.addChild(makeBanditMaskEntity(baseColor: baseColor, detailColor: detailColor, pieceColor: color))
+    case "queen-tiny-cape":
+      anchor.position = profile.backPosition
+      anchor.scale = SIMD3<Float>(repeating: profile.backScale)
+      anchor.addChild(makeCapeEntity(accentColor: accentColor, detailColor: detailColor))
+    case "pawn-miner-helmet":
+      anchor.position = profile.headPosition + SIMD3<Float>(0, 0.001, 0)
+      anchor.scale = SIMD3<Float>(repeating: profile.headScale)
+      anchor.addChild(makeMinerHelmetEntity(accentColor: accentColor, detailColor: detailColor))
+    default:
+      return nil
+    }
+
+    return anchor
+  }
+
+  private static func attachmentProfile(for kind: ChessPieceKind) -> AttachmentProfile {
+    switch kind {
+    case .pawn:
+      return AttachmentProfile(
+        headPosition: SIMD3<Float>(0, 0.042, 0),
+        facePosition: SIMD3<Float>(0, 0.031, -0.011),
+        bodyPosition: SIMD3<Float>(0, 0.020, -0.001),
+        backPosition: SIMD3<Float>(0, 0.023, 0.012),
+        headScale: 1.0,
+        bodyScale: 1.0,
+        faceScale: 1.0,
+        backScale: 1.0
+      )
+    case .rook:
+      return AttachmentProfile(
+        headPosition: SIMD3<Float>(0, 0.043, 0),
+        facePosition: SIMD3<Float>(0, 0.032, -0.012),
+        bodyPosition: SIMD3<Float>(0, 0.023, 0),
+        backPosition: SIMD3<Float>(0, 0.024, 0.013),
+        headScale: 1.02,
+        bodyScale: 1.04,
+        faceScale: 1.02,
+        backScale: 1.0
+      )
+    case .knight:
+      return AttachmentProfile(
+        headPosition: SIMD3<Float>(0, 0.047, -0.002),
+        facePosition: SIMD3<Float>(0, 0.035, -0.012),
+        bodyPosition: SIMD3<Float>(0, 0.022, -0.001),
+        backPosition: SIMD3<Float>(0, 0.024, 0.011),
+        headScale: 1.06,
+        bodyScale: 1.06,
+        faceScale: 1.04,
+        backScale: 1.02
+      )
+    case .bishop:
+      return AttachmentProfile(
+        headPosition: SIMD3<Float>(0, 0.053, 0),
+        facePosition: SIMD3<Float>(0, 0.036, -0.011),
+        bodyPosition: SIMD3<Float>(0, 0.025, 0),
+        backPosition: SIMD3<Float>(0, 0.027, 0.011),
+        headScale: 1.04,
+        bodyScale: 1.0,
+        faceScale: 1.0,
+        backScale: 1.0
+      )
+    case .queen:
+      return AttachmentProfile(
+        headPosition: SIMD3<Float>(0, 0.050, 0),
+        facePosition: SIMD3<Float>(0, 0.039, -0.011),
+        bodyPosition: SIMD3<Float>(0, 0.028, 0),
+        backPosition: SIMD3<Float>(0, 0.029, 0.012),
+        headScale: 1.06,
+        bodyScale: 1.04,
+        faceScale: 1.02,
+        backScale: 1.04
+      )
+    case .king:
+      return AttachmentProfile(
+        headPosition: SIMD3<Float>(0, 0.053, 0),
+        facePosition: SIMD3<Float>(0, 0.040, -0.011),
+        bodyPosition: SIMD3<Float>(0, 0.030, 0),
+        backPosition: SIMD3<Float>(0, 0.031, 0.012),
+        headScale: 1.08,
+        bodyScale: 1.06,
+        faceScale: 1.02,
+        backScale: 1.05
+      )
+    }
+  }
+
+  private static func makeCowboyHatEntity(
+    baseColor: UIColor,
+    accentColor: UIColor,
+    detailColor: UIColor
+  ) -> Entity {
+    let hat = Entity()
+    let brimMaterial = accessoryMaterial(color: accentColor)
+    let crownMaterial = accessoryMaterial(color: baseColor)
+    let bandMaterial = accessoryMaterial(color: detailColor, metallic: false)
+
+    let brim = ModelEntity(
+      mesh: .generateBox(size: SIMD3<Float>(0.040, 0.003, 0.030)),
+      materials: [brimMaterial]
+    )
+    hat.addChild(brim)
+
+    let crown = ModelEntity(
+      mesh: .generateBox(size: SIMD3<Float>(0.021, 0.012, 0.020)),
+      materials: [crownMaterial]
+    )
+    crown.position = SIMD3<Float>(0, 0.007, 0)
+    hat.addChild(crown)
+
+    let top = ModelEntity(
+      mesh: .generateBox(size: SIMD3<Float>(0.016, 0.005, 0.016)),
+      materials: [crownMaterial]
+    )
+    top.position = SIMD3<Float>(0, 0.014, 0)
+    hat.addChild(top)
+
+    let band = ModelEntity(
+      mesh: .generateBox(size: SIMD3<Float>(0.022, 0.0022, 0.021)),
+      materials: [bandMaterial]
+    )
+    band.position = SIMD3<Float>(0, 0.0022, 0)
+    crown.addChild(band)
+
+    return hat
+  }
+
+  private static func makeWizardHatEntity(
+    baseColor: UIColor,
+    accentColor: UIColor,
+    detailColor: UIColor
+  ) -> Entity {
+    let hat = Entity()
+    let brimMaterial = accessoryMaterial(color: accentColor)
+    let towerMaterial = accessoryMaterial(color: baseColor)
+    let trimMaterial = accessoryMaterial(color: detailColor, metallic: false)
+
+    let brim = ModelEntity(
+      mesh: .generateBox(size: SIMD3<Float>(0.036, 0.003, 0.036)),
+      materials: [brimMaterial]
+    )
+    hat.addChild(brim)
+
+    let lower = ModelEntity(
+      mesh: .generateBox(size: SIMD3<Float>(0.022, 0.010, 0.022)),
+      materials: [towerMaterial]
+    )
+    lower.position = SIMD3<Float>(0, 0.007, 0)
+    hat.addChild(lower)
+
+    let mid = ModelEntity(
+      mesh: .generateBox(size: SIMD3<Float>(0.016, 0.010, 0.016)),
+      materials: [towerMaterial]
+    )
+    mid.position = SIMD3<Float>(0, 0.014, 0)
+    hat.addChild(mid)
+
+    let tip = ModelEntity(
+      mesh: .generateBox(size: SIMD3<Float>(0.010, 0.010, 0.010)),
+      materials: [towerMaterial]
+    )
+    tip.position = SIMD3<Float>(0, 0.021, 0)
+    hat.addChild(tip)
+
+    let star = ModelEntity(mesh: .generateSphere(radius: 0.0034), materials: [trimMaterial])
+    star.position = SIMD3<Float>(0.006, 0.025, 0)
+    hat.addChild(star)
+
+    return hat
+  }
+
+  private static func makeGoldenArmorEntity(
+    accentColor: UIColor,
+    detailColor: UIColor
+  ) -> Entity {
+    let armor = Entity()
+    let shellMaterial = accessoryMaterial(color: accentColor)
+    let trimMaterial = accessoryMaterial(color: detailColor, metallic: false)
+
+    let chest = ModelEntity(
+      mesh: .generateBox(size: SIMD3<Float>(0.024, 0.018, 0.016)),
+      materials: [shellMaterial]
+    )
+    armor.addChild(chest)
+
+    let collar = ModelEntity(
+      mesh: .generateBox(size: SIMD3<Float>(0.018, 0.004, 0.018)),
+      materials: [trimMaterial]
+    )
+    collar.position = SIMD3<Float>(0, 0.011, 0)
+    armor.addChild(collar)
+
+    for side in [Float(-1), Float(1)] {
+      let shoulder = ModelEntity(
+        mesh: .generateSphere(radius: 0.0046),
+        materials: [shellMaterial]
+      )
+      shoulder.position = SIMD3<Float>(0.014 * side, 0.006, 0)
+      armor.addChild(shoulder)
+    }
+
+    let crest = ModelEntity(mesh: .generateSphere(radius: 0.0034), materials: [trimMaterial])
+    crest.position = SIMD3<Float>(0, 0.002, 0.008)
+    armor.addChild(crest)
+
+    return armor
+  }
+
+  private static func makeBanditMaskEntity(
+    baseColor: UIColor,
+    detailColor: UIColor,
+    pieceColor: ChessColor
+  ) -> Entity {
+    let mask = Entity()
+    let maskBase = accessoryMaterial(
+      color: pieceColor == .white
+        ? baseColor
+        : UIColor(red: 0.09, green: 0.09, blue: 0.10, alpha: 1),
+      metallic: false
+    )
+    let slitMaterial = accessoryMaterial(color: detailColor, metallic: false)
+
+    let band = ModelEntity(
+      mesh: .generateBox(size: SIMD3<Float>(0.028, 0.010, 0.003)),
+      materials: [maskBase]
+    )
+    mask.addChild(band)
+
+    for side in [Float(-1), Float(1)] {
+      let slit = ModelEntity(
+        mesh: .generateBox(size: SIMD3<Float>(0.006, 0.002, 0.0018)),
+        materials: [slitMaterial]
+      )
+      slit.position = SIMD3<Float>(0.006 * side, 0.001, 0.002)
+      mask.addChild(slit)
+    }
+
+    return mask
+  }
+
+  private static func makeCapeEntity(
+    accentColor: UIColor,
+    detailColor: UIColor
+  ) -> Entity {
+    let cape = Entity()
+    let clothMaterial = accessoryMaterial(color: accentColor, metallic: false)
+    let claspMaterial = accessoryMaterial(color: detailColor)
+
+    let panel = ModelEntity(
+      mesh: .generateBox(size: SIMD3<Float>(0.022, 0.028, 0.002)),
+      materials: [clothMaterial]
+    )
+    panel.position = SIMD3<Float>(0, -0.010, 0.003)
+    panel.orientation = simd_quatf(angle: .pi / 20, axis: SIMD3<Float>(1, 0, 0))
+    cape.addChild(panel)
+
+    let collar = ModelEntity(
+      mesh: .generateBox(size: SIMD3<Float>(0.018, 0.004, 0.004)),
+      materials: [claspMaterial]
+    )
+    collar.position = SIMD3<Float>(0, 0.006, 0)
+    cape.addChild(collar)
+
+    return cape
+  }
+
+  private static func makeMinerHelmetEntity(
+    accentColor: UIColor,
+    detailColor: UIColor
+  ) -> Entity {
+    let helmet = Entity()
+    let shellMaterial = accessoryMaterial(color: accentColor)
+    let lampMaterial = accessoryMaterial(color: detailColor)
+
+    let shell = ModelEntity(mesh: .generateSphere(radius: 0.012), materials: [shellMaterial])
+    shell.scale = SIMD3<Float>(1.1, 0.72, 1.0)
+    shell.position = SIMD3<Float>(0, 0.004, 0)
+    helmet.addChild(shell)
+
+    let brim = ModelEntity(
+      mesh: .generateBox(size: SIMD3<Float>(0.020, 0.0024, 0.010)),
+      materials: [shellMaterial]
+    )
+    brim.position = SIMD3<Float>(0, 0.002, -0.009)
+    helmet.addChild(brim)
+
+    let lampBase = ModelEntity(
+      mesh: .generateBox(size: SIMD3<Float>(0.010, 0.005, 0.004)),
+      materials: [lampMaterial]
+    )
+    lampBase.position = SIMD3<Float>(0, 0.005, -0.012)
+    helmet.addChild(lampBase)
+
+    let lamp = ModelEntity(mesh: .generateSphere(radius: 0.0038), materials: [lampMaterial])
+    lamp.position = SIMD3<Float>(0, 0.005, -0.010)
+    helmet.addChild(lamp)
+
+    return helmet
+  }
+
+  private static func pieceMaterial(for color: ChessColor) -> SimpleMaterial {
+    switch color {
+    case .white:
+      return SimpleMaterial(
+        color: UIColor(red: 0.96, green: 0.96, blue: 0.95, alpha: 1),
+        roughness: 0.98,
+        isMetallic: false
+      )
+    case .black:
+      return SimpleMaterial(
+        color: UIColor(red: 0.26, green: 0.27, blue: 0.30, alpha: 1),
+        roughness: 0.98,
+        isMetallic: false
+      )
+    }
+  }
+
+  private static func ghostPieceMaterial(for color: ChessColor) -> SimpleMaterial {
+    switch color {
+    case .white:
+      return SimpleMaterial(
+        color: UIColor(red: 0.96, green: 0.96, blue: 0.95, alpha: 0.34),
+        roughness: 0.98,
+        isMetallic: false
+      )
+    case .black:
+      return SimpleMaterial(
+        color: UIColor(red: 0.26, green: 0.27, blue: 0.30, alpha: 0.34),
+        roughness: 0.98,
+        isMetallic: false
+      )
+    }
+  }
+
+  private static func makeColumn(width: Float, height: Float, depth: Float, material: SimpleMaterial) -> ModelEntity {
+    ModelEntity(
+      mesh: .generateBox(size: SIMD3<Float>(width, height, depth)),
+      materials: [material]
+    )
+  }
+
+  private static func accessoryMaterial(color: UIColor, metallic: Bool = true) -> SimpleMaterial {
+    _ = metallic
+    return SimpleMaterial(color: color, roughness: 0.92, isMetallic: false)
+  }
+
+  private static func addHands(
+    to root: Entity,
+    material: SimpleMaterial,
+    leftName: String? = nil,
+    rightName: String? = nil,
+    spread: Float,
+    height: Float,
+    forward: Float
+  ) {
+    let leftHand = ModelEntity(mesh: .generateSphere(radius: 0.0048), materials: [material])
+    leftHand.name = leftName ?? "piece_hand_left"
+    leftHand.position = SIMD3<Float>(-spread, height, forward)
+    root.addChild(leftHand)
+
+    let rightHand = ModelEntity(mesh: .generateSphere(radius: 0.0048), materials: [material])
+    rightHand.name = rightName ?? "piece_hand_right"
+    rightHand.position = SIMD3<Float>(spread, height, forward)
+    root.addChild(rightHand)
+  }
+
+  private static func addSunglasses(to root: Entity, name: String? = nil, height: Float, width: Float) {
+    let glassesMaterial = accessoryMaterial(color: UIColor(white: 0.04, alpha: 0.96), metallic: true)
+    let glasses = Entity()
+    glasses.name = name ?? "piece_sunglasses"
+    glasses.position = SIMD3<Float>(0, height, -0.013)
+
+    let leftLens = ModelEntity(
+      mesh: .generateBox(size: SIMD3<Float>(width, 0.006, 0.0024)),
+      materials: [glassesMaterial]
+    )
+    leftLens.position = SIMD3<Float>(-width * 0.68, 0, 0)
+    glasses.addChild(leftLens)
+
+    let rightLens = ModelEntity(
+      mesh: .generateBox(size: SIMD3<Float>(width, 0.006, 0.0024)),
+      materials: [glassesMaterial]
+    )
+    rightLens.position = SIMD3<Float>(width * 0.68, 0, 0)
+    glasses.addChild(rightLens)
+
+    let bridge = ModelEntity(
+      mesh: .generateBox(size: SIMD3<Float>(width * 0.58, 0.0018, 0.002)),
+      materials: [glassesMaterial]
+    )
+    glasses.addChild(bridge)
+
+    root.addChild(glasses)
+  }
+
+  private static func makePieceEntity(kind: ChessPieceKind, material: SimpleMaterial) -> Entity {
+    let root = Entity()
+    let weaponMaterial = accessoryMaterial(color: UIColor(red: 0.67, green: 0.55, blue: 0.36, alpha: 1))
+    let accentMaterial = accessoryMaterial(color: UIColor(red: 0.94, green: 0.82, blue: 0.24, alpha: 1))
+
+    let base = makeColumn(width: 0.030, height: 0.006, depth: 0.030, material: material)
+    base.position.y = 0.003
+    root.addChild(base)
+
+    switch kind {
+    case .pawn:
+      let stem = makeColumn(width: 0.015, height: 0.020, depth: 0.015, material: material)
+      stem.position.y = 0.016
+      root.addChild(stem)
+
+      let head = ModelEntity(mesh: .generateSphere(radius: 0.010), materials: [material])
+      head.position.y = 0.033
+      root.addChild(head)
+
+      addHands(to: root, material: material, spread: 0.017, height: 0.020, forward: 0.002)
+      addSunglasses(to: root, height: 0.031, width: 0.007)
+
+      let knife = ModelEntity(
+        mesh: .generateBox(size: SIMD3<Float>(0.003, 0.020, 0.002)),
+        materials: [weaponMaterial]
+      )
+      knife.name = "pawn_knife"
+      knife.position = SIMD3<Float>(0.016, 0.022, 0.010)
+      knife.orientation = simd_quatf(angle: -.pi / 4.8, axis: SIMD3<Float>(1, 0, 0))
+      root.addChild(knife)
+
+    case .rook:
+      let tower = makeColumn(width: 0.020, height: 0.026, depth: 0.020, material: material)
+      tower.position.y = 0.019
+      root.addChild(tower)
+
+      let crown = ModelEntity(mesh: .generateBox(size: SIMD3<Float>(0.024, 0.007, 0.024)), materials: [material])
+      crown.position.y = 0.036
+      root.addChild(crown)
+
+      addHands(to: root, material: material, spread: 0.020, height: 0.024, forward: 0.003)
+      addSunglasses(to: root, height: 0.032, width: 0.008)
+
+      let bazookaBody = ModelEntity(
+        mesh: .generateBox(size: SIMD3<Float>(0.010, 0.034, 0.010)),
+        materials: [weaponMaterial]
+      )
+      bazookaBody.name = "rook_bazooka"
+      bazookaBody.position = SIMD3<Float>(0.020, 0.028, 0.010)
+      bazookaBody.orientation = simd_quatf(angle: -.pi / 2.8, axis: SIMD3<Float>(1, 0, 0))
+      root.addChild(bazookaBody)
+
+      let bazookaTip = ModelEntity(mesh: .generateSphere(radius: 0.005), materials: [accentMaterial])
+      bazookaTip.position = SIMD3<Float>(0, 0.018, 0)
+      bazookaBody.addChild(bazookaTip)
+
+    case .knight:
+      let body = makeColumn(width: 0.018, height: 0.018, depth: 0.018, material: material)
+      body.position.y = 0.015
+      root.addChild(body)
+
+      let neck = ModelEntity(mesh: .generateBox(size: SIMD3<Float>(0.016, 0.028, 0.010)), materials: [material])
+      neck.position = SIMD3<Float>(0, 0.034, -0.003)
+      neck.orientation = simd_quatf(angle: -.pi / 9, axis: SIMD3<Float>(1, 0, 0))
+      root.addChild(neck)
+
+      addHands(to: root, material: material, spread: 0.019, height: 0.023, forward: 0.002)
+      addSunglasses(to: root, height: 0.034, width: 0.008)
+
+    case .bishop:
+      let body = makeColumn(width: 0.018, height: 0.024, depth: 0.018, material: material)
+      body.position.y = 0.018
+      root.addChild(body)
+
+      let cap = ModelEntity(mesh: .generateSphere(radius: 0.011), materials: [material])
+      cap.position.y = 0.036
+      root.addChild(cap)
+
+      let finial = ModelEntity(mesh: .generateSphere(radius: 0.004), materials: [material])
+      finial.position.y = 0.050
+      root.addChild(finial)
+
+      addHands(to: root, material: material, spread: 0.018, height: 0.026, forward: 0.002)
+      addSunglasses(to: root, height: 0.034, width: 0.0075)
+
+      let sniperBody = ModelEntity(
+        mesh: .generateBox(size: SIMD3<Float>(0.004, 0.034, 0.004)),
+        materials: [weaponMaterial]
+      )
+      sniperBody.name = "bishop_sniper"
+      sniperBody.position = SIMD3<Float>(0.019, 0.030, 0.010)
+      sniperBody.orientation = simd_quatf(angle: -.pi / 2.9, axis: SIMD3<Float>(1, 0, 0))
+      root.addChild(sniperBody)
+
+      let sniperCrossBar = ModelEntity(
+        mesh: .generateBox(size: SIMD3<Float>(0.014, 0.003, 0.003)),
+        materials: [accentMaterial]
+      )
+      sniperCrossBar.position = SIMD3<Float>(0, 0.009, 0)
+      sniperBody.addChild(sniperCrossBar)
+
+    case .queen:
+      let body = makeColumn(width: 0.020, height: 0.030, depth: 0.020, material: material)
+      body.position.y = 0.021
+      root.addChild(body)
+
+      let crown = ModelEntity(mesh: .generateSphere(radius: 0.012), materials: [material])
+      crown.position.y = 0.044
+      root.addChild(crown)
+
+      addHands(to: root, material: material, spread: 0.020, height: 0.028, forward: 0.002)
+      addSunglasses(to: root, name: "queen_sunglasses", height: 0.039, width: 0.0084)
+
+    case .king:
+      let body = makeColumn(width: 0.020, height: 0.034, depth: 0.020, material: material)
+      body.position.y = 0.023
+      root.addChild(body)
+
+      addHands(
+        to: root,
+        material: material,
+        leftName: "king_hand_left",
+        rightName: "king_hand_right",
+        spread: 0.022,
+        height: 0.029,
+        forward: 0.001
+      )
+      addSunglasses(to: root, height: 0.040, width: 0.0084)
+
+      let crownBase = ModelEntity(
+        mesh: .generateBox(size: SIMD3<Float>(0.022, 0.005, 0.022)),
+        materials: [accentMaterial]
+      )
+      crownBase.name = "king_crown"
+      crownBase.position.y = 0.045
+      root.addChild(crownBase)
+
+      let crownGem = ModelEntity(mesh: .generateSphere(radius: 0.0055), materials: [accentMaterial])
+      crownGem.position.y = 0.010
+      crownBase.addChild(crownGem)
+
+      let tearMaterial = SimpleMaterial(
+        color: UIColor(red: 0.46, green: 0.76, blue: 0.96, alpha: 0.88),
+        roughness: 0.18,
+        isMetallic: false
+      )
+
+      let leftTear = ModelEntity(mesh: .generateSphere(radius: 0.0035), materials: [tearMaterial])
+      leftTear.name = "king_tear_left"
+      leftTear.position = SIMD3<Float>(-0.009, 0.032, -0.011)
+      leftTear.scale = SIMD3<Float>(repeating: 0.001)
+      root.addChild(leftTear)
+
+      let rightTear = ModelEntity(mesh: .generateSphere(radius: 0.0035), materials: [tearMaterial])
+      rightTear.name = "king_tear_right"
+      rightTear.position = SIMD3<Float>(0.009, 0.032, -0.011)
+      rightTear.scale = SIMD3<Float>(repeating: 0.001)
+      root.addChild(rightTear)
+    }
+
+    return root
+  }
+}
+
+private struct CosmeticsPiecePreviewView: UIViewRepresentable {
+  let pieceKind: ChessPieceKind
+  let color: ChessColor
+  let loadout: PieceCosmeticLoadout
+  let yaw: Float
+  let pitch: Float
+
+  func makeCoordinator() -> Coordinator {
+    Coordinator()
+  }
+
+  func makeUIView(context: Context) -> ARView {
+    let arView = ARView(frame: .zero, cameraMode: .nonAR, automaticallyConfigureSession: false)
+    arView.environment.background = .color(UIColor(red: 0.08, green: 0.10, blue: 0.14, alpha: 1))
+    arView.renderOptions.insert(.disableMotionBlur)
+    context.coordinator.configure(arView)
+    return arView
+  }
+
+  func updateUIView(_ uiView: ARView, context: Context) {
+    context.coordinator.update(
+      pieceKind: pieceKind,
+      color: color,
+      loadout: loadout,
+      yaw: yaw,
+      pitch: pitch
+    )
+  }
+
+  final class Coordinator {
+    private let anchor = AnchorEntity(world: .zero)
+    private let pedestalRoot = Entity()
+    private let rotationRoot = Entity()
+    private var currentSignature = ""
+    private weak var previewPiece: Entity?
+
+    func configure(_ arView: ARView) {
+      arView.scene.anchors.append(anchor)
+      anchor.addChild(pedestalRoot)
+      anchor.addChild(rotationRoot)
+
+      let pedestal = makePedestalEntity()
+      pedestalRoot.addChild(pedestal)
+
+      let keyLight = DirectionalLight()
+      keyLight.light.intensity = 16_000
+      keyLight.position = SIMD3<Float>(0.10, 0.22, 0.18)
+      keyLight.look(
+        at: SIMD3<Float>(0, 0.05, 0),
+        from: keyLight.position,
+        upVector: SIMD3<Float>(0, 1, 0),
+        relativeTo: nil
+      )
+      anchor.addChild(keyLight)
+
+      let fillLight = PointLight()
+      fillLight.light.intensity = 1_600
+      fillLight.position = SIMD3<Float>(-0.14, 0.14, 0.24)
+      anchor.addChild(fillLight)
+
+      let camera = PerspectiveCamera()
+      let cameraPosition = SIMD3<Float>(0, 0.085, 0.25)
+      camera.look(
+        at: SIMD3<Float>(0, 0.050, 0),
+        from: cameraPosition,
+        upVector: SIMD3<Float>(0, 1, 0),
+        relativeTo: nil
+      )
+      anchor.addChild(camera)
+    }
+
+    func update(
+      pieceKind: ChessPieceKind,
+      color: ChessColor,
+      loadout: PieceCosmeticLoadout,
+      yaw: Float,
+      pitch: Float
+    ) {
+      let signature = "\(pieceKind.storageKey)|\(color.storageKey)|\(loadout.signature)"
+      if signature != currentSignature {
+        previewPiece?.removeFromParent()
+        let piece = ChessPieceVisualFactory.makeEquippedPieceEntity(
+          kind: pieceKind,
+          color: color,
+          loadout: loadout
+        )
+        piece.position = SIMD3<Float>(0, 0.050, 0)
+        rotationRoot.addChild(piece)
+        previewPiece = piece
+        currentSignature = signature
+      }
+
+      let yawRotation = simd_quatf(angle: yaw, axis: SIMD3<Float>(0, 1, 0))
+      let pitchRotation = simd_quatf(angle: pitch, axis: SIMD3<Float>(1, 0, 0))
+      rotationRoot.orientation = simd_normalize(yawRotation * pitchRotation)
+    }
+
+    private func makePedestalEntity() -> Entity {
+      let pedestal = Entity()
+      let stoneMaterial = SimpleMaterial(
+        color: UIColor(red: 0.80, green: 0.76, blue: 0.68, alpha: 1),
+        roughness: 0.96,
+        isMetallic: false
+      )
+      let rimMaterial = SimpleMaterial(
+        color: UIColor(red: 0.54, green: 0.45, blue: 0.32, alpha: 1),
+        roughness: 0.90,
+        isMetallic: false
+      )
+
+      let base = ModelEntity(
+        mesh: .generateBox(size: SIMD3<Float>(0.14, 0.016, 0.14)),
+        materials: [stoneMaterial]
+      )
+      base.position = SIMD3<Float>(0, 0.008, 0)
+      pedestal.addChild(base)
+
+      let rim = ModelEntity(
+        mesh: .generateBox(size: SIMD3<Float>(0.162, 0.006, 0.162)),
+        materials: [rimMaterial]
+      )
+      rim.position = SIMD3<Float>(0, 0.0015, 0)
+      pedestal.addChild(rim)
+
+      let glow = ModelEntity(
+        mesh: .generateBox(size: SIMD3<Float>(0.104, 0.001, 0.104)),
+        materials: [
+          SimpleMaterial(
+            color: UIColor(red: 0.93, green: 0.86, blue: 0.72, alpha: 0.62),
+            roughness: 0.10,
+            isMetallic: false
+          )
+        ]
+      )
+      glow.position = SIMD3<Float>(0, 0.017, 0)
+      pedestal.addChild(glow)
+
+      return pedestal
+    }
+  }
+}
+
+private struct CosmeticsCreatorView: View {
+  @StateObject private var roomStore: CosmeticsCreatorRoomStore
+  let goBack: () -> Void
+
+  init(
+    cosmetics: PieceCosmeticsStore = .shared,
+    goBack: @escaping () -> Void
+  ) {
+    _roomStore = StateObject(wrappedValue: CosmeticsCreatorRoomStore(cosmetics: cosmetics))
+    self.goBack = goBack
+  }
+
+  var body: some View {
+    ZStack {
+      ChessboardBackdrop()
+      LinearGradient(
+        colors: [
+          Color(red: 0.02, green: 0.04, blue: 0.07).opacity(0.18),
+          Color(red: 0.04, green: 0.07, blue: 0.11).opacity(0.82),
+          Color(red: 0.04, green: 0.07, blue: 0.11).opacity(0.96),
+        ],
+        startPoint: .top,
+        endPoint: .bottom
+      )
+      .ignoresSafeArea()
+
+      ScrollView(showsIndicators: false) {
+        VStack(spacing: 18) {
+          creatorHeader
+          pieceTypeSelector
+          colorSelector
+          previewPanel
+          cosmeticsBrowserPanel
+        }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 24)
+      }
+    }
+  }
+
+  private var creatorHeader: some View {
+    HStack(alignment: .top, spacing: 12) {
+      Button(action: goBack) {
+        HStack(spacing: 8) {
+          Image(systemName: "chevron.left")
+            .font(.system(size: 14, weight: .black))
+          Text("Back")
+            .font(.system(size: 14, weight: .black, design: .rounded))
+        }
+        .foregroundStyle(Color(red: 0.09, green: 0.11, blue: 0.15))
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(
+          Capsule(style: .continuous)
+            .fill(Color(red: 0.95, green: 0.88, blue: 0.73))
+        )
+      }
+      .buttonStyle(.plain)
+
+      VStack(alignment: .leading, spacing: 6) {
+        Text("Cosmetics Creator")
+          .font(.system(size: 31, weight: .heavy, design: .rounded))
+          .foregroundStyle(.white)
+
+        Text("Build saved loadouts for each piece and preview them live before they appear in real gameplay.")
+          .font(.system(size: 14, weight: .medium, design: .rounded))
+          .foregroundStyle(Color.white.opacity(0.78))
+          .lineSpacing(3)
+      }
+
+      Spacer(minLength: 8)
+
+      VStack(alignment: .trailing, spacing: 8) {
+        if let statusText = roomStore.statusText {
+          Text(statusText)
+            .font(.system(size: 11, weight: .bold, design: .rounded))
+            .foregroundStyle(Color(red: 0.95, green: 0.88, blue: 0.73))
+            .multilineTextAlignment(.trailing)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(
+              Capsule(style: .continuous)
+                .fill(Color.white.opacity(0.08))
+            )
+        } else {
+          Text("Autosaves instantly")
+            .font(.system(size: 11, weight: .bold, design: .rounded))
+            .foregroundStyle(Color.white.opacity(0.66))
+        }
+      }
+      .frame(width: 120, alignment: .trailing)
+    }
+  }
+
+  private var pieceTypeSelector: some View {
+    creatorCard {
+      VStack(alignment: .leading, spacing: 12) {
+        creatorSectionTitle("Piece Type")
+
+        ScrollView(.horizontal, showsIndicators: false) {
+          HStack(spacing: 10) {
+            ForEach(ChessPieceKind.creatorSelectionOrder, id: \.storageKey) { kind in
+              creatorChoicePill(
+                title: kind.displayName,
+                isSelected: roomStore.selectedPieceKind == kind
+              ) {
+                roomStore.setPieceKind(kind)
+              }
+            }
+          }
+          .padding(.vertical, 2)
+        }
+      }
+    }
+  }
+
+  private var colorSelector: some View {
+    creatorCard {
+      VStack(alignment: .leading, spacing: 12) {
+        creatorSectionTitle("Side")
+
+        HStack(spacing: 10) {
+          ForEach(ChessColor.allCases, id: \.storageKey) { color in
+            creatorChoicePill(
+              title: color.displayName,
+              isSelected: roomStore.selectedColor == color
+            ) {
+              roomStore.setColor(color)
+            }
+          }
+        }
+      }
+    }
+  }
+
+  private var previewPanel: some View {
+    creatorCard {
+      VStack(alignment: .leading, spacing: 12) {
+        HStack {
+          VStack(alignment: .leading, spacing: 4) {
+            creatorSectionTitle("Live Preview")
+
+            Text("\(roomStore.selectedColor.displayName) \(roomStore.selectedPieceKind.displayName)")
+              .font(.system(size: 22, weight: .heavy, design: .rounded))
+              .foregroundStyle(.white)
+          }
+
+          Spacer(minLength: 10)
+
+          Button(action: roomStore.resetView) {
+            Label("Reset View", systemImage: "arrow.counterclockwise")
+              .font(.system(size: 12, weight: .bold, design: .rounded))
+              .foregroundStyle(Color(red: 0.08, green: 0.11, blue: 0.15))
+              .padding(.horizontal, 12)
+              .padding(.vertical, 10)
+              .background(
+                Capsule(style: .continuous)
+                  .fill(Color(red: 0.95, green: 0.88, blue: 0.73))
+              )
+          }
+          .buttonStyle(.plain)
+        }
+
+        ZStack(alignment: .bottomLeading) {
+          RoundedRectangle(cornerRadius: 28, style: .continuous)
+            .fill(
+              LinearGradient(
+                colors: [
+                  Color(red: 0.11, green: 0.16, blue: 0.22),
+                  Color(red: 0.06, green: 0.09, blue: 0.14),
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+              )
+            )
+            .overlay(
+              RoundedRectangle(cornerRadius: 28, style: .continuous)
+                .stroke(Color.white.opacity(0.12), lineWidth: 1)
+            )
+
+          CosmeticsPiecePreviewView(
+            pieceKind: roomStore.selectedPieceKind,
+            color: roomStore.selectedColor,
+            loadout: roomStore.currentLoadout,
+            yaw: roomStore.previewYaw,
+            pitch: roomStore.previewPitch
+          )
+          .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
+          .contentShape(Rectangle())
+          .gesture(
+            DragGesture(minimumDistance: 0)
+              .onChanged { value in
+                roomStore.updateRotation(translation: value.translation)
+              }
+              .onEnded { _ in
+                roomStore.endRotationGesture()
+              }
+          )
+
+          Text("Drag to rotate 360")
+            .font(.system(size: 12, weight: .bold, design: .rounded))
+            .foregroundStyle(Color.white.opacity(0.72))
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .background(
+              Capsule(style: .continuous)
+                .fill(Color.black.opacity(0.28))
+            )
+            .padding(14)
+        }
+        .frame(height: 340)
+      }
+    }
+  }
+
+  private var cosmeticsBrowserPanel: some View {
+    creatorCard {
+      VStack(alignment: .leading, spacing: 14) {
+        HStack(alignment: .top) {
+          VStack(alignment: .leading, spacing: 4) {
+            creatorSectionTitle("Cosmetics")
+            Text("Choose a category, then tap a cosmetic to equip it on the live preview.")
+              .font(.system(size: 13, weight: .medium, design: .rounded))
+              .foregroundStyle(Color.white.opacity(0.70))
+              .lineSpacing(2)
+          }
+
+          Spacer(minLength: 12)
+
+          Button(action: roomStore.clearSelectedCategory) {
+            Text("Clear \(roomStore.selectedCategory.displayName)")
+              .font(.system(size: 11, weight: .bold, design: .rounded))
+              .foregroundStyle(Color(red: 0.95, green: 0.88, blue: 0.73))
+              .padding(.horizontal, 12)
+              .padding(.vertical, 9)
+              .background(
+                Capsule(style: .continuous)
+                  .fill(Color.white.opacity(0.08))
+              )
+          }
+          .buttonStyle(.plain)
+        }
+
+        ScrollView(.horizontal, showsIndicators: false) {
+          HStack(spacing: 10) {
+            ForEach(roomStore.availableCategories) { category in
+              Button {
+                roomStore.setCategory(category)
+              } label: {
+                HStack(spacing: 8) {
+                  Image(systemName: category.systemImageName)
+                    .font(.system(size: 13, weight: .bold))
+                  Text(category.displayName)
+                    .font(.system(size: 13, weight: .black, design: .rounded))
+                }
+                .foregroundStyle(
+                  roomStore.selectedCategory == category
+                    ? Color(red: 0.08, green: 0.11, blue: 0.15)
+                    : Color.white.opacity(0.84)
+                )
+                .padding(.horizontal, 14)
+                .padding(.vertical, 11)
+                .background(
+                  Capsule(style: .continuous)
+                    .fill(
+                      roomStore.selectedCategory == category
+                        ? Color(red: 0.95, green: 0.88, blue: 0.73)
+                        : Color.white.opacity(0.06)
+                    )
+                    .overlay(
+                      Capsule(style: .continuous)
+                        .stroke(Color.white.opacity(roomStore.selectedCategory == category ? 0.0 : 0.10), lineWidth: 1)
+                    )
+                )
+              }
+              .buttonStyle(.plain)
+            }
+          }
+          .padding(.vertical, 2)
+        }
+
+        if roomStore.visibleCosmetics.isEmpty {
+          VStack(spacing: 8) {
+            Image(systemName: "square.grid.3x1.below.line.grid.1x2")
+              .font(.system(size: 26, weight: .bold))
+              .foregroundStyle(Color.white.opacity(0.46))
+
+            Text("No cosmetics are wired for \(roomStore.selectedPieceKind.displayName) \(roomStore.selectedCategory.displayName.lowercased()) yet.")
+              .font(.system(size: 14, weight: .medium, design: .rounded))
+              .foregroundStyle(Color.white.opacity(0.68))
+              .multilineTextAlignment(.center)
+              .lineSpacing(2)
+          }
+          .frame(maxWidth: .infinity)
+          .padding(.vertical, 28)
+        } else {
+          LazyVGrid(
+            columns: [GridItem(.adaptive(minimum: 128, maximum: 160), spacing: 12)],
+            spacing: 12
+          ) {
+            ForEach(roomStore.visibleCosmetics) { cosmetic in
+              CosmeticSelectionTile(
+                cosmetic: cosmetic,
+                isSelected: roomStore.isEquipped(cosmetic),
+                isUnlocked: roomStore.isUnlocked(cosmetic)
+              ) {
+                roomStore.equip(cosmetic)
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  private func creatorSectionTitle(_ title: String) -> some View {
+    Text(title)
+      .font(.system(size: 12, weight: .bold, design: .rounded))
+      .tracking(1.9)
+      .foregroundStyle(Color(red: 0.95, green: 0.88, blue: 0.73))
+  }
+
+  private func creatorChoicePill(
+    title: String,
+    isSelected: Bool,
+    action: @escaping () -> Void
+  ) -> some View {
+    Button(action: action) {
+      Text(title)
+        .font(.system(size: 14, weight: .black, design: .rounded))
+        .foregroundStyle(
+          isSelected
+            ? Color(red: 0.08, green: 0.11, blue: 0.15)
+            : Color.white.opacity(0.84)
+        )
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+        .background(
+          Capsule(style: .continuous)
+            .fill(
+              isSelected
+                ? Color(red: 0.95, green: 0.88, blue: 0.73)
+                : Color.white.opacity(0.06)
+            )
+            .overlay(
+              Capsule(style: .continuous)
+                .stroke(Color.white.opacity(isSelected ? 0.0 : 0.10), lineWidth: 1)
+            )
+        )
+    }
+    .buttonStyle(.plain)
+  }
+
+  private func creatorCard<Content: View>(
+    @ViewBuilder content: () -> Content
+  ) -> some View {
+    VStack(spacing: 0) {
+      content()
+    }
+    .padding(18)
+    .background(
+      RoundedRectangle(cornerRadius: 28, style: .continuous)
+        .fill(Color(red: 0.06, green: 0.10, blue: 0.14).opacity(0.90))
+        .overlay(
+          RoundedRectangle(cornerRadius: 28, style: .continuous)
+            .stroke(Color.white.opacity(0.12), lineWidth: 1)
+        )
+    )
+  }
+}
+
+private struct CosmeticSelectionTile: View {
+  let cosmetic: PieceCosmeticReward
+  let isSelected: Bool
+  let isUnlocked: Bool
+  let action: () -> Void
+
+  var body: some View {
+    let background = Color(uiColor: cosmetic.previewBackgroundColor)
+    let accent = Color(uiColor: cosmetic.previewAccentColor)
+    let detail = Color(uiColor: cosmetic.previewDetailColor)
+
+    Button(action: action) {
+      VStack(alignment: .leading, spacing: 10) {
+        HStack(alignment: .top) {
+          Text(cosmetic.previewGlyph)
+            .font(.system(size: 28))
+
+          Spacer(minLength: 8)
+
+          Text(cosmetic.rarityLabel.uppercased())
+            .font(.system(size: 9, weight: .black, design: .rounded))
+            .tracking(1.1)
+            .foregroundStyle(detail.opacity(0.96))
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            .background(
+              Capsule(style: .continuous)
+                .fill(Color.white.opacity(0.16))
+            )
+        }
+
+        VStack(alignment: .leading, spacing: 4) {
+          Text(cosmetic.displayName)
+            .font(.system(size: 14, weight: .black, design: .rounded))
+            .foregroundStyle(.white)
+            .lineLimit(2)
+
+          Text(cosmetic.flavorText)
+            .font(.system(size: 11, weight: .medium, design: .rounded))
+            .foregroundStyle(Color.white.opacity(0.76))
+            .lineLimit(3)
+            .lineSpacing(2)
+        }
+
+        Spacer(minLength: 0)
+
+        HStack(spacing: 8) {
+          if isUnlocked {
+            Text(isSelected ? "Equipped" : cosmetic.slot.displayName)
+              .font(.system(size: 10, weight: .bold, design: .rounded))
+              .foregroundStyle(isSelected ? Color(red: 0.09, green: 0.11, blue: 0.14) : detail.opacity(0.96))
+              .padding(.horizontal, 10)
+              .padding(.vertical, 6)
+              .background(
+                Capsule(style: .continuous)
+                  .fill(isSelected ? Color(red: 0.95, green: 0.88, blue: 0.73) : Color.white.opacity(0.14))
+              )
+          } else {
+            Label("Locked", systemImage: "lock.fill")
+              .font(.system(size: 10, weight: .bold, design: .rounded))
+              .foregroundStyle(Color.white.opacity(0.88))
+              .padding(.horizontal, 10)
+              .padding(.vertical, 6)
+              .background(
+                Capsule(style: .continuous)
+                  .fill(Color.black.opacity(0.24))
+              )
+          }
+        }
+      }
+      .frame(maxWidth: .infinity, minHeight: 170, alignment: .topLeading)
+      .padding(14)
+      .background(
+        RoundedRectangle(cornerRadius: 22, style: .continuous)
+          .fill(
+            LinearGradient(
+              colors: [
+                background,
+                accent.opacity(0.92),
+              ],
+              startPoint: .topLeading,
+              endPoint: .bottomTrailing
+            )
+          )
+          .overlay(
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+              .stroke(
+                isSelected
+                  ? Color(red: 0.95, green: 0.88, blue: 0.73)
+                  : Color.white.opacity(0.12),
+                lineWidth: isSelected ? 2 : 1
+              )
+          )
+      )
+      .opacity(isUnlocked ? 1.0 : 0.66)
+    }
+    .buttonStyle(.plain)
   }
 }
 
@@ -14470,6 +16244,10 @@ private final class UpwardFlickDetector {
     DispatchQueue.main.async { [weak self] in
       self?.onUpwardFlick?()
     }
+  }
+
+  static var creatorSelectionOrder: [ChessPieceKind] {
+    [.pawn, .knight, .bishop, .rook, .queen, .king]
   }
 }
 
@@ -16937,7 +18715,7 @@ private struct NativeActionButton: View {
   }
 }
 
-private enum ChessColor {
+private enum ChessColor: CaseIterable {
   case white
   case black
 
@@ -16979,6 +18757,26 @@ private enum ChessColor {
     }
   }
 
+  var storageKey: String {
+    switch self {
+    case .white:
+      return "white"
+    case .black:
+      return "black"
+    }
+  }
+
+  init?(storageKey: String) {
+    switch storageKey.lowercased() {
+    case "white":
+      self = .white
+    case "black":
+      self = .black
+    default:
+      return nil
+    }
+  }
+
   static func turnColor(forPly ply: Int) -> ChessColor {
     ply.isMultiple(of: 2) ? .black : .white
   }
@@ -16988,7 +18786,7 @@ private enum ChessColor {
   }
 }
 
-private enum ChessPieceKind {
+private enum ChessPieceKind: CaseIterable {
   case pawn
   case rook
   case knight
@@ -17025,6 +18823,42 @@ private enum ChessPieceKind {
       return "Queen"
     case .king:
       return "King"
+    }
+  }
+
+  var storageKey: String {
+    switch self {
+    case .pawn:
+      return "pawn"
+    case .rook:
+      return "rook"
+    case .knight:
+      return "knight"
+    case .bishop:
+      return "bishop"
+    case .queen:
+      return "queen"
+    case .king:
+      return "king"
+    }
+  }
+
+  init?(storageKey: String) {
+    switch storageKey.lowercased() {
+    case "pawn":
+      self = .pawn
+    case "rook":
+      self = .rook
+    case "knight":
+      self = .knight
+    case "bishop":
+      self = .bishop
+    case "queen":
+      self = .queen
+    case "king":
+      self = .king
+    default:
+      return nil
     }
   }
 
@@ -22886,6 +24720,7 @@ private struct NativeARView: UIViewRepresentable {
       let innerFrameHeight = innerFrameBounds.extents.y * portraitInsetScale
 
       let portraitSubject = piecePrototype(for: assignment.piece.kind, color: assignment.piece.color).clone(recursive: true)
+      applyEquippedCosmetics(to: portraitSubject, piece: assignment.piece)
       portraitSubject.orientation = simd_normalize(
         simd_quatf(angle: .pi, axis: SIMD3<Float>(0, 1, 0)) *
           simd_quatf(angle: -.pi / 18, axis: SIMD3<Float>(1, 0, 0))
@@ -24654,6 +26489,7 @@ private struct NativeARView: UIViewRepresentable {
         }
 
         let pieceEntity = piecePrototype(for: piece.kind, color: piece.color).clone(recursive: true)
+        applyEquippedCosmetics(to: pieceEntity, piece: piece)
         pieceEntity.name = pieceName(square)
         pieceEntity.position = boardPosition(square, squareSize: squareSize)
         pieceEntity.orientation = pieceFacingOrientation(for: piece.color)
@@ -24808,18 +26644,17 @@ private struct NativeARView: UIViewRepresentable {
       color: ChessColor,
       isGhost: Bool = false
     ) -> Entity {
-      let key = PiecePrototypeKey(kind: kind, color: color, isGhost: isGhost)
-      if let cached = Self.piecePrototypeCache[key] {
-        return cached
-      }
+      ChessPieceVisualFactory.piecePrototype(for: kind, color: color, isGhost: isGhost)
+    }
 
-      let material = isGhost ? ghostPieceMaterial(for: color) : pieceMaterial(for: color)
-      let prototype = makePieceEntity(kind: kind, material: material)
-      if !isGhost {
-        prototype.generateCollisionShapes(recursive: true)
-      }
-      Self.piecePrototypeCache[key] = prototype
-      return prototype
+    private func applyEquippedCosmetics(to pieceEntity: Entity, piece: ChessPieceState) {
+      let loadout = PieceCosmeticsStore.shared.loadout(for: piece.kind, color: piece.color)
+      ChessPieceVisualFactory.applyCosmetics(
+        loadout,
+        to: pieceEntity,
+        pieceKind: piece.kind,
+        color: piece.color
+      )
     }
 
     private func square(for entity: Entity, prefix: String) -> BoardSquare? {
